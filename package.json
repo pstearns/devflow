@@ -1,0 +1,39 @@
+{
+  "name": "devflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only engineering dashboard over Linear and GitHub",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build:web && npm run build:server",
+    "build:web": "vite build",
+    "build:server": "rm -rf dist-server && tsc -p tsconfig.server.json",
+    "start": "node dist-server/server/index.js",
+    "demo": "DEVFLOW_DEMO=1 node dist-server/server/index.js",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:web": "vite",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "audit": "npm audit --omit=dev"
+  },
+  "dependencies": {
+    "fastify": "^5.12.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}

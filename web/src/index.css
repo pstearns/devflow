@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --color-bg: var(--c-bg);
+  --color-panel: var(--c-panel);
+  --color-raised: var(--c-raised);
+  --color-line: var(--c-line);
+  --color-fg: var(--c-fg);
+  --color-muted: var(--c-muted);
+  --color-accent: var(--c-accent);
+  --color-ok: var(--c-ok);
+  --color-bad: var(--c-bad);
+  --color-warn: var(--c-warn);
+}
+
+:root {
+  --c-bg: #0d1117;
+  --c-panel: #131921;
+  --c-raised: #1a212b;
+  --c-line: #29323e;
+  --c-fg: #d9e0e8;
+  --c-muted: #8b97a7;
+  --c-accent: #5a9bf0;
+  --c-ok: #43b581;
+  --c-bad: #ef6a62;
+  --c-warn: #d9a93a;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --c-bg: #f6f7f9;
+  --c-panel: #ffffff;
+  --c-raised: #eef1f5;
+  --c-line: #d5dae1;
+  --c-fg: #1c2430;
+  --c-muted: #5b6676;
+  --c-accent: #1f66d1;
+  --c-ok: #1a7f4f;
+  --c-bad: #c9372c;
+  --c-warn: #8f6a00;
+  color-scheme: light;
+}
+
+html, body, #root { height: 100%; }
+body { background: var(--c-bg); color: var(--c-fg); font-family: var(--font-sans); font-size: 13px; line-height: 1.45; }
+a { color: var(--c-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 1px; }
+@layer components {
+  .mono { font-family: var(--font-mono); font-size: 12px; }
+  .tabular { font-variant-numeric: tabular-nums; }
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--c-line); border-radius: 5px; }

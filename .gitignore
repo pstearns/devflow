@@ -1,0 +1,20 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+devflow.config.json
+*.log
+coverage/
+dist-server/
+logs/
+
+# caches, runtime and OS artifacts
+.vite/
+*.tsbuildinfo
+*.pid
+.DS_Store
+Thumbs.db
+.npm/
+.eslintcache
+.cache/

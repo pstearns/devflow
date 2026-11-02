@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false, "allowImportingTsExtensions": false, "rewriteRelativeImportExtensions": true,
+    "outDir": "dist-server", "rootDir": ".", "module": "NodeNext", "moduleResolution": "NodeNext", "target": "ES2022",
+    "declaration": false, "sourceMap": false, "lib": ["ES2023"], "jsx": "preserve"
+  },
+  "include": ["server", "shared"],
+  "exclude": ["server/demo.ts.bak"]
+}

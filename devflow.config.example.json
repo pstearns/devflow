@@ -1,0 +1,27 @@
+{
+  "port": 4317,
+  "staleAfterMinutes": 5,
+  "staleDays": 5,
+  "obsidian": { "vault": "YourVaultName", "vaultPath": "/mnt/d/AI-Knowledge" },
+  "review": {
+    "checkName": "",
+    "passedLabel": "",
+    "findingsLabel": ""
+  },
+  "projects": [
+    {
+      "id": "example",
+      "name": "Example Project",
+      "linear": { "teamKey": "ABC", "projects": [] },
+      "github": { "repos": ["your-org/your-repo"] },
+      "knowledge": [
+        { "title": "Project index", "kind": "obsidian", "path": "Projects/Example/Index.md" },
+        { "title": "Repo contract", "kind": "repo", "repo": "your-org/your-repo", "path": "docs/CONTRACT.md", "ref": "main" },
+        { "title": "Runbook", "kind": "url", "url": "https://example.com/runbook" }
+      ]
+    }
+  ],
+  "prompts": {
+    "discover": "Discover {{ticket}} in {{project}}. Read the issue; list gaps and questions. Do not implement."
+  }
+}
