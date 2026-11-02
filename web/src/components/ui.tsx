@@ -70,7 +70,8 @@ export function EvidenceList({ items }: { items: Evidence[] }) {
 export const btn = 'rounded border border-line bg-raised px-2 py-1 text-[12px] hover:border-accent disabled:opacity-50';
 export const select = 'rounded border border-line bg-raised px-1.5 py-1 text-[12px] text-fg';
 
-export function Tag({ children, tone = 'muted' }: { children: ReactNode; tone?: 'muted' | 'bad' | 'warn' | 'ok' | 'accent' }) {
+/** `wrap`: long text (e.g. a list of blockers) wraps inside its container instead of overflowing it. */
+export function Tag({ children, tone = 'muted', wrap }: { children: ReactNode; tone?: 'muted' | 'bad' | 'warn' | 'ok' | 'accent'; wrap?: boolean }) {
   const c = { muted: 'text-muted border-line', bad: 'text-bad border-bad/50', warn: 'text-warn border-warn/50', ok: 'text-ok border-ok/50', accent: 'text-accent border-accent/50' }[tone];
-  return <span className={`inline-block whitespace-nowrap rounded-sm border px-1 text-[11px] leading-4 ${c}`}>{children}</span>;
+  return <span className={`inline-block rounded-sm border px-1 text-[11px] leading-4 ${wrap ? 'min-w-0 max-w-full whitespace-normal break-words' : 'whitespace-nowrap'} ${c}`}>{children}</span>;
 }

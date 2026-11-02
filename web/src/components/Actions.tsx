@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { ActionOptions, Issue, Snapshot } from '../../../shared/types.ts';
 import { api, postAction } from '../lib.ts';
 import { LabelChip } from './Labels.tsx';
@@ -19,21 +20,40 @@ export function IssueActions({ issue, snap, onResult, compact }: { issue: Issue;
   const [menu, setMenu] = useState(false);
   const [kind, setKind] = useState<Kind>();
   const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number }>();
+  const MENU_W = 256, EDGE = 8;
+  // The menu lives in a portal with fixed positioning so a scrolling/clipping column (Pipeline) can never cut it off.
+  // It opens below the button, right-aligned, and flips upward or slides in when it would leave the viewport.
+  useLayoutEffect(() => {
+    if (!menu) { setPos(undefined); return; }
+    const b = btnRef.current?.getBoundingClientRect();
+    if (!b) return;
+    const h = menuRef.current?.offsetHeight ?? 320;
+    const left = Math.max(EDGE, Math.min(b.right - MENU_W, window.innerWidth - MENU_W - EDGE));
+    const below = b.bottom + 4;
+    const top = below + h > window.innerHeight - EDGE ? b.top - 4 - h : below;
+    setPos({ left, top: Math.max(EDGE, Math.min(top, window.innerHeight - h - EDGE)) }); // always fully inside the window
+  }, [menu]);
   useEffect(() => {
     if (!menu) return;
-    const close = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setMenu(false); };
+    const close = (e: MouseEvent) => { const t = e.target as Node; if (!ref.current?.contains(t) && !menuRef.current?.contains(t)) setMenu(false); };
+    const dismiss = () => setMenu(false); // a fixed menu would drift away from its button if the page or a column scrolls
     const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(false); };
     document.addEventListener('mousedown', close); document.addEventListener('keydown', esc);
-    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', esc); };
+    window.addEventListener('scroll', dismiss, true); window.addEventListener('resize', dismiss);
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', esc); window.removeEventListener('scroll', dismiss, true); window.removeEventListener('resize', dismiss); };
   }, [menu]);
   const w = snap.write;
   return (
     <div className="relative inline-block" ref={ref}>
-      <button className={`${btn} ${compact ? 'px-1.5 py-0.5' : ''}`} aria-haspopup="menu" aria-expanded={menu} onClick={(e) => { e.stopPropagation(); setMenu(!menu); }} title="Actions in Linear">
+      <button ref={btnRef} className={`${btn} ${compact ? 'px-1.5 py-0.5' : ''}`} aria-haspopup="menu" aria-expanded={menu} onClick={(e) => { e.stopPropagation(); setMenu(!menu); }} title="Actions in Linear">
         {compact ? '⋯' : 'Actions ▾'}<span className="sr-only"> for {issue.identifier}</span>
       </button>
-      {menu && (
-        <div role="menu" className="absolute right-0 z-30 mt-1 w-64 rounded border border-line bg-panel p-1 shadow-lg">
+      {menu && createPortal(
+        <div role="menu" ref={menuRef} style={{ position: 'fixed', top: pos?.top ?? 0, left: pos?.left ?? 0, width: MENU_W, visibility: pos ? 'visible' : 'hidden' }}
+          className="z-50 max-h-[calc(100vh-16px)] overflow-y-auto rounded border border-line bg-panel p-1 shadow-lg">
           {!w.enabled && <div className="px-2 py-1 text-[11px] text-warn">{w.reason ?? 'Linear write access is not configured.'} Options below show what is available once it is.</div>}
           {w.enabled && !issue.write.allowed && <div className="px-2 py-1 text-[11px] text-warn">Read-only here: {issue.write.reason ?? 'this team/project is not enabled for writes'}. The server re-checks this for every action.</div>}
           {ITEMS.map((it) => (
@@ -43,7 +63,8 @@ export function IssueActions({ issue, snap, onResult, compact }: { issue: Issue;
             </button>
           ))}
           <div className="border-t border-line px-2 py-1 text-[11px] text-muted">Changes are made in Linear and verified by re-reading it.</div>
-        </div>
+        </div>,
+        document.body,
       )}
       {kind && <ActionDialog kind={kind} issue={issue} onClose={() => setKind(undefined)} onResult={(s, m) => { setKind(undefined); onResult(s, m); }} />}
     </div>

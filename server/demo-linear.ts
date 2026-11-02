@@ -51,7 +51,7 @@ const SEED: Record<string, IssueSpec[]> = {
     { n: 15, title: 'Plan observability roadmap', state: 'Backlog', ageH: 60, labels: ['Idea'] },
     { n: 16, title: 'Write rate-limit documentation', state: 'Todo', ms: 'm2', ageH: 20, prio: 3, labels: ['Feature'], desc: LONG },
     { n: 17, title: 'Tidy configs', state: 'Backlog', ageH: 15, desc: 'tbd' },
-    { n: 18, title: 'Backfill ingest history', state: 'Backlog', blockedBy: [3], ageH: 12, labels: ['Feature'], desc: LONG },
+    { n: 18, title: 'Backfill ingest history', state: 'Backlog', blockedBy: [3, 5, 10, 11], ageH: 12, labels: ['Feature'], desc: LONG },
     { n: 19, title: 'Add API pagination', state: 'Backlog', ms: 'm2', ageH: 11, prio: 2, labels: ['Feature'], desc: LONG },
     { n: 20, title: 'Triage inbox cleanup (no project)', state: 'Backlog', project: null, ageH: 8, labels: ['Idea'], desc: LONG },
     { n: 21, title: 'Lab prototype for streaming', state: 'Backlog', project: 'lp-ATL2', ageH: 14, labels: ['Research'], desc: LONG },

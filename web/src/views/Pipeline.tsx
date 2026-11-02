@@ -16,8 +16,8 @@ function TicketCard({ i, pr, onOpen, now, snap, onResult }: { i: Issue; pr?: Pul
       {i.labels.length > 0 && <div className="mt-1"><IssueLabels labels={i.labels} defs={snap.labels.filter((l) => l.teamKey === i.teamKey)} /></div>}
       <div className="mt-1 flex flex-wrap gap-1">
         <Tag>{i.state.name}</Tag>
-        {i.readiness === 'blocked' && <Tag tone="warn">blocked{i.openBlockers.length ? ` by ${i.openBlockers.map((b) => b.identifier).join(', ')}` : ''}</Tag>}
-        {hot && <Tag tone="bad">↺ {i.rework.join('; ')}</Tag>}
+        {i.readiness === 'blocked' && <Tag tone="warn" wrap>blocked{i.openBlockers.length ? ` by ${i.openBlockers.map((b) => b.identifier).join(', ')}` : ''}</Tag>}
+        {hot && <Tag tone="bad" wrap>↺ {i.rework.join('; ')}</Tag>}
         {i.stale && <Tag tone="warn">stale</Tag>}
         {i.awaitingHuman.length > 0 && <Tag tone="accent">awaiting you</Tag>}
       </div>
