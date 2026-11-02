@@ -72,5 +72,28 @@
   ],
   "prompts": {
     "discover": "Discover {{ticket}} in {{project}}. Read the issue; list gaps and questions. Do not implement."
-  }
+  },
+  "teams": [
+    {
+      "key": "ABC",
+      "write": false,
+      "workflow": {
+        "readyLabel": "Ready",
+        "discoveryLabels": [
+          "Discovery"
+        ],
+        "classificationLabels": [
+          "Idea",
+          "Bug"
+        ],
+        "readiness": {
+          "minDescriptionChars": 40
+        }
+      },
+      "github": {
+        "repos": []
+      },
+      "knowledge": []
+    }
+  ]
 }

@@ -51,7 +51,7 @@ describe('snapshot over synthetic API', () => {
   it('follows pagination and reports demo mode', async () => {
     const snap = await demoSnap();
     expect(snap.mode).toBe('demo');
-    expect(snap.issues.filter((i) => i.identifier.startsWith('ATL-'))).toHaveLength(19);
+    expect(snap.issues.filter((i) => i.identifier.startsWith('ATL-'))).toHaveLength(21); // every ATL issue: both projects AND unprojected
   });
   it('links PRs only on unambiguous identifier evidence', async () => {
     const snap = await demoSnap();
@@ -101,7 +101,7 @@ describe('snapshot over synthetic API', () => {
   });
   it('retrieves labels dynamically with colors, scope, groups, and flags protected/classification labels', async () => {
     const snap = await demoSnap();
-    const atl = snap.labels.filter((l) => l.projectId === 'atlas');
+    const atl = snap.labels.filter((l) => l.teamKey === 'ATL');
     expect(atl.find((l) => l.name === 'Bug')).toMatchObject({ color: '#EB5757', scope: 'workspace', classification: true, protected: false });
     expect(atl.find((l) => l.name === 'Ready')).toMatchObject({ protected: true });
     expect(atl.find((l) => l.name === 'Area')).toMatchObject({ isGroup: true });
@@ -123,7 +123,7 @@ describe('snapshot over synthetic API', () => {
   });
   it('builds Obsidian deep links and copy-path fallback from config only', async () => {
     const snap = await demoSnap();
-    const k = snap.projects[0]!.knowledge.find((x) => x.kind === 'obsidian')!;
+    const k = snap.teams.find((t) => t.key === 'ATL')!.projects.find((p) => p.name === 'Atlas')!.knowledge.find((x) => x.kind === 'obsidian')!;
     expect(k.url).toBe('obsidian://open?vault=Demo-Vault&file=Projects%2FAtlas%2FArchitecture.md');
     expect(k.copyPath).toBe('/example/vault/Projects/Atlas/Architecture.md');
   });
@@ -181,10 +181,13 @@ describe('failure handling', () => {
     await s.get(true); // still inside the reset window: no upstream calls
     expect(calls - before).toBe(0);
   });
-  it('unknown Linear team yields a clear error, not empty success', async () => {
-    const snap = await svc((async (u: RequestInfo | URL) => String(u).includes('linear') ? jsonRes({ data: { teams: { nodes: [] } } }) : jsonRes([])) as typeof fetch).get();
-    expect(snap.health.find((h) => h.id === 'linear:p')!.error).toMatch(/not found/);
+  it('a configured team that Linear does not show to this key is reported as not visible, not silently empty', async () => {
+    const snap = await svc((async (u: RequestInfo | URL) => String(u).includes('linear') ? jsonRes({ data: { teams: { nodes: [], pageInfo: { hasNextPage: false } } } }) : jsonRes([])) as typeof fetch).get();
+    const t = snap.teams.find((x) => x.key === 'ABC')!;
+    expect(t.error).toMatch(/not visible/);
+    expect(t.loaded).toBe(false);
   });
+
   it('no access to check runs: CI comes from workflow runs, details are labelled Unavailable, no permission prompt', async () => {
     const good = demoFetch(now);
     const f = (async (u: RequestInfo | URL, i?: RequestInit) => {

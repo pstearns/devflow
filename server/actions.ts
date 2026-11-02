@@ -2,7 +2,8 @@
 // READ credential, (2) validates against that live data and the project's configured policy, (3) sends only allowlisted
 // mutations with the separate WRITE credential, (4) re-reads Linear and verifies the result, (5) rolls back on failure.
 import type { ActionCheck, ActionOptions, Issue, StateType } from '../shared/types.ts';
-import { DEFAULT_WORKFLOW, type Config, type ProjectCfg, type WorkflowCfg } from './config.ts';
+import type { Config, WorkflowCfg } from './config.ts';
+import { resolveScope, type Scope } from './scope.ts';
 import { Q_LABELS, normalizeLabel, stateType, type LinearClient, type RawLabel } from './linear.ts';
 import type { LinearWriteClient } from './linear-write.ts';
 import type { SnapshotService } from './service.ts';
@@ -78,7 +79,7 @@ export function findBacklog(ctx: Ctx, wf: WorkflowCfg): StateDef | undefined {
 export const hasReady = (ctx: Ctx, wf: WorkflowCfg) => ctx.labels.some((l) => low(l.name) === low(wf.readyLabel));
 
 /** Readiness policy evaluation. Every unverifiable prerequisite is a failed check (approval refused), never a silent pass. */
-export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolean): { checks: ActionCheck[]; eligible: boolean; already: boolean } {
+export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolean, scope: Pick<Scope, 'policy' | 'explicitPolicy' | 'writeAllowed' | 'writeReason'>): { checks: ActionCheck[]; eligible: boolean; already: boolean } {
   const p = wf.readiness;
   const c: ActionCheck[] = [];
   const add = (id: string, label: string, ok: boolean, detail: string) => c.push({ id, label, ok, detail });
@@ -86,6 +87,10 @@ export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolea
   const todo = findTodo(ctx, wf);
   const already = hasReady(ctx, wf) && ctx.state.type === 'unstarted';
   add('write', 'Linear write access configured', writeEnabled, writeEnabled ? 'A separate write credential is configured' : 'LINEAR_WRITE_API_KEY is not set');
+  add('scope', `DevFlow may write to this ${ctx.project ? 'project' : 'team'}`, scope.writeAllowed, scope.writeAllowed ? `Authorized by configuration (${ctx.teamKey}${ctx.project ? ` / ${ctx.project.name}` : ''})` : (scope.writeReason ?? 'Not authorized'));
+  add('policy', 'An explicit readiness policy applies to this scope', scope.explicitPolicy,
+    scope.explicitPolicy ? `Using the ${scope.policy === 'project' ? 'project' : 'team'} policy configured for ${ctx.project && scope.policy === 'project' ? ctx.project.name : `team ${ctx.teamKey}`}`
+      : `No readiness policy is configured for ${ctx.project ? `project "${ctx.project.name}"` : `unprojected issues`} in team ${ctx.teamKey}; add a teams[] entry with a workflow. Rules from other projects are never inherited.`);
   add('state', 'Issue is not started, done or canceled', ctx.state.type === 'backlog' || ctx.state.type === 'triage' || ctx.state.type === 'unstarted',
     `Current state: ${ctx.state.name} (${ctx.state.type})${ctx.state.type === 'started' ? ' — work has already started' : ''}`);
   add('not-ready', 'Not already approved', !already, already ? `Already ${wf.readyLabel} in ${ctx.state.name}` : 'Not yet approved');
@@ -134,23 +139,25 @@ export class LinearActions {
   get enabled() { return !!this.deps.write; }
   get csrf() { return this.deps.csrf; }
 
-  private project(ctx: Ctx): ProjectCfg {
-    const p = this.deps.cfg.projects.find((x) => x.linear?.teamKey === ctx.teamKey && (!x.linear.projects.length ||
-      x.linear.projects.some((w) => ctx.project && [ctx.project.id, ctx.project.name, ctx.project.slugId].some((v) => v && low(v) === low(w)))));
-    if (!p) throw new ActionError(403, 'not-configured', `${ctx.identifier} does not belong to a project configured in DevFlow`);
-    return p;
+  /** Authorization is decided here from the issue's LIVE team/project and the server's configuration, never from the browser. */
+  private scopeOf(ctx: Ctx): Scope {
+    return resolveScope(this.deps.cfg, ctx.teamKey, ctx.project ? { id: ctx.project.id, name: ctx.project.name, slugId: ctx.project.slugId } : undefined);
+  }
+  private authorized(ctx: Ctx): Scope {
+    const sc = this.scopeOf(ctx);
+    if (!sc.writeAllowed) throw new ActionError(403, 'not-authorized', `DevFlow is not authorized to change ${ctx.identifier}: ${sc.writeReason ?? 'its team/project is not enabled for writes'}`);
+    return sc;
   }
 
   private async load(identifier: string): Promise<Ctx> {
     if (!/^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/.test(identifier)) throw new ActionError(400, 'bad-identifier', 'Invalid issue identifier');
     const data = await this.deps.read.query(Q_ACTION_ISSUE, { id: identifier.toUpperCase() });
-    const key = identifier.split('-')[0]!.toUpperCase();
-    let labels: RawLabel[] = [];
-    const ld = await this.deps.read.query(Q_LABELS, { key, after: null });
-    labels = arr(isObj(ld.issueLabels) ? ld.issueLabels.nodes : [], 200).map(normalizeLabel).filter((x): x is RawLabel => !!x);
-    const ctx = parseCtx(data, labels);
-    if (!ctx) throw new ActionError(404, 'not-found', `Issue ${identifier} was not found in Linear`);
-    return ctx;
+    const first = parseCtx(data, []);
+    if (!first) throw new ActionError(404, 'not-found', `Issue ${identifier} was not found in Linear`);
+    // The label set is the issue's OWN team's (from Linear's answer), not anything derived from the request.
+    const ld = await this.deps.read.query(Q_LABELS, { key: first.teamKey, after: null });
+    const labels = arr(isObj(ld.issueLabels) ? ld.issueLabels.nodes : [], 200).map(normalizeLabel).filter((x): x is RawLabel => !!x);
+    return { ...first, teamLabels: labels };
   }
 
   private mergedPr(identifier: string): boolean {
@@ -163,24 +170,26 @@ export class LinearActions {
   /** Live options for the action menu (reads only). */
   async options(identifier: string): Promise<ActionOptions> {
     const ctx = await this.load(identifier);
-    const proj = this.project(ctx);
-    const wf = proj.workflow;
-    const w = this.enabled;
+    const sc = this.scopeOf(ctx);
+    const wf = sc.workflow;
+    const w = this.enabled && sc.writeAllowed;
+    const whyNot = !this.enabled ? 'Linear write access is not configured' : sc.writeReason ?? 'Writes are not enabled for this team/project';
     const ready = hasReady(ctx, wf);
-    const ap = evaluateApproval(ctx, wf, w);
+    const ap = evaluateApproval(ctx, wf, this.enabled, sc);
     const labels = ctx.teamLabels.filter((l) => !l.isGroup || ctx.labels.some((x) => x.id === l.id)).map((l) => {
       const applied = ctx.labels.some((x) => x.id === l.id);
       const prot = isProtected(l.name, wf);
-      const reason = !w ? 'Linear write access is not configured' : l.isGroup ? 'Group labels cannot be applied' : prot ? `Protected: use ${applied ? 'Revoke readiness' : 'Approve for execution'}` : undefined;
+      const reason = !w ? whyNot : l.isGroup ? 'Group labels cannot be applied' : prot ? `Protected: use ${applied ? 'Revoke readiness' : 'Approve for execution'}` : undefined;
       return { id: l.id, name: l.name, color: l.color, scope: l.scope, applied, editable: reason === undefined, reason, classification: wf.classificationLabels.map(low).includes(low(l.name)), group: l.parent };
     });
     return {
-      writeEnabled: w, reason: w ? undefined : 'Linear write access is not configured', csrf: this.deps.csrf,
+      writeEnabled: w, reason: w ? undefined : whyNot, csrf: this.deps.csrf,
+      scope: { teamKey: ctx.teamKey, projectName: ctx.project?.name, policy: sc.policy, explicitPolicy: sc.explicitPolicy },
       identifier: ctx.identifier, title: ctx.title, state: ctx.state, labels,
       states: statusOptions(ctx, wf, this.mergedPr(ctx.identifier), w),
-      milestones: { current: ctx.milestone?.id, options: ctx.milestones, canChange: w && !!ctx.project, reason: !w ? 'Linear write access is not configured' : !ctx.project ? 'The issue is not in a Linear project' : undefined },
+      milestones: { current: ctx.milestone?.id, options: ctx.milestones, canChange: w && !!ctx.project, reason: !w ? whyNot : !ctx.project ? 'The issue is not in a Linear project' : undefined },
       approve: { eligible: ap.eligible, already: ap.already, checks: ap.checks, todoState: findTodo(ctx, wf)?.name },
-      revoke: { possible: w && ready && (ctx.state.type === 'unstarted'), reason: !w ? 'Linear write access is not configured' : !ready ? `Not marked ${wf.readyLabel}` : ctx.state.type !== 'unstarted' ? 'Work has started; change the state in Linear' : undefined },
+      revoke: { possible: w && ready && (ctx.state.type === 'unstarted'), reason: !w ? whyNot : !ready ? `Not marked ${wf.readyLabel}` : ctx.state.type !== 'unstarted' ? 'Work has started; change the state in Linear' : undefined },
     };
   }
 
@@ -219,7 +228,7 @@ export class LinearActions {
     return this.run('labels', identifier, async () => {
       const w = this.writer();
       const ctx = await this.load(identifier);
-      const wf = this.project(ctx).workflow;
+      const wf = this.authorized(ctx).workflow;
       const idOk = (x: unknown): x is string => typeof x === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(x);
       if (![...add, ...remove].every(idOk) || add.length + remove.length === 0 || add.length + remove.length > 20) throw new ActionError(400, 'bad-input', 'Provide 1–20 valid label ids');
       if (add.some((a) => remove.includes(a))) throw new ActionError(400, 'bad-input', 'A label cannot be both added and removed');
@@ -255,7 +264,7 @@ export class LinearActions {
       const w = this.writer();
       if (typeof stateId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(stateId)) throw new ActionError(400, 'bad-input', 'Invalid state id');
       const ctx = await this.load(identifier);
-      const wf = this.project(ctx).workflow;
+      const wf = this.authorized(ctx).workflow;
       if (ctx.states.find((s) => s.id === stateId)?.type === 'completed') await this.deps.service.getIssue(identifier, true); // fresh GitHub evidence before judging "Done"
       const opt = statusOptions(ctx, wf, this.mergedPr(ctx.identifier), true).find((s) => s.id === stateId);
       if (!opt) throw new ActionError(422, 'unknown-state', 'That state does not exist for this team');
@@ -272,7 +281,7 @@ export class LinearActions {
     return this.run('milestone', identifier, async () => {
       const w = this.writer();
       const ctx = await this.load(identifier);
-      this.project(ctx);
+      this.authorized(ctx);
       if (!ctx.project) throw new ActionError(422, 'no-project', 'The issue is not in a Linear project, so it cannot have a milestone');
       if (milestoneId !== null && (typeof milestoneId !== 'string' || !ctx.milestones.some((m) => m.id === milestoneId)))
         throw new ActionError(422, 'foreign-milestone', "That milestone does not belong to this issue's project");
@@ -290,8 +299,9 @@ export class LinearActions {
       const w = this.writer();
       if (typeof confirm !== 'string' || low(confirm.trim()) !== low(identifier)) throw new ActionError(400, 'not-confirmed', `Type the issue identifier (${identifier}) to confirm approval`);
       const ctx = await this.load(identifier);
-      const wf = this.project(ctx).workflow;
-      const ev = evaluateApproval(ctx, wf, true);
+      const sc = this.authorized(ctx);
+      const wf = sc.workflow;
+      const ev = evaluateApproval(ctx, wf, true, sc);
       if (!ev.eligible) throw new ActionError(422, 'ineligible', `Cannot approve ${ctx.identifier}: ${ev.checks.filter((c) => !c.ok).map((c) => c.label).join('; ')}`, ev.checks);
       const todo = findTodo(ctx, wf)!;
       const readyLabel = ctx.teamLabels.find((l) => low(l.name) === low(wf.readyLabel) && !l.isGroup)!;
@@ -339,7 +349,7 @@ export class LinearActions {
       const w = this.writer();
       if (typeof confirm !== 'string' || low(confirm.trim()) !== low(identifier)) throw new ActionError(400, 'not-confirmed', `Type the issue identifier (${identifier}) to confirm`);
       const ctx = await this.load(identifier);
-      const wf = this.project(ctx).workflow;
+      const wf = this.authorized(ctx).workflow;
       if (!hasReady(ctx, wf)) throw new ActionError(422, 'not-ready', `${ctx.identifier} is not marked ${wf.readyLabel}`);
       if (ctx.state.type !== 'unstarted') throw new ActionError(422, 'started', `Work on ${ctx.identifier} has started (${ctx.state.name}); change its state in Linear`);
       const readyLabel = ctx.labels.find((l) => low(l.name) === low(wf.readyLabel))!;

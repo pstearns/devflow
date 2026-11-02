@@ -49,6 +49,28 @@ Checks and reviews are treated as refreshable evidence even when the head SHA is
 DevFlow never uses the `gh` CLI or any ambient identity. Tokens stay on the server: not sent to the browser, not logged, never in error text (upstream error bodies are not forwarded). `.env` and `devflow.config.json` are git-ignored; DevFlow warns at startup if `.env` is readable by other users. `PORT`/`HOST` in `.env` are ignored.
 CI evidence comes from GitHub Actions workflow runs for the PR's head commit. Check-run details (individual checks) need a permission this token setup does not expose, so they are shown as **Unavailable**, never as Passed; DevFlow does not ask for it. If a commit has no workflow run, its CI is **Unknown**.
 
+## Teams → Projects
+
+DevFlow discovers every Linear team the read key can see (nothing is hard-coded) and shows **Team › Project** selectors in the header. *All teams* shows whatever is loaded; a team shows **all** of its issues, including ones outside any project; a project shows only its issues; *No project* shows only unprojected issues. Overview, Milestones & Tasks, Pipeline, Activity, label filters, source links and issue details are all scoped to the selection, and switching team or project discards the open ticket, panels and per-view filters.
+
+Teams named in config are read when the dashboard opens; any other accessible team is read **only when you first select it** (`GET /api/team/<KEY>`; other teams, projects and repositories are not touched). Labels are team labels plus applicable workspace labels, with Linear's own names and colors. Milestones stay per project, with a "No milestone" group per project and a separate "Not in a project" group for unprojected issues. Projects and teams without a GitHub repository are fine: they simply show no PR/CI evidence. A GitHub PR links to an issue only if **that issue's own project or team lists the PR's repository**.
+
+**Policy and write authorization are resolved by the server from the issue's live team/project and your config, never from the browser's selection:**
+
+| Issue is in… | Policy | Writes |
+|---|---|---|
+| a Linear project covered by a `projects[]` entry (it names the project, or its `linear.projects` is empty = every project of the team) | that project's `workflow` | authorized |
+| any other project, or no project | the team's `teams[]` entry if it has a `workflow` (explicit policy); otherwise none | only if `teams[].write` is `true` |
+| a team with no `teams[]` entry | none (generic defaults for display only) | refused |
+
+Approving for execution requires an **explicit** policy for the exact scope; unprojected issues never inherit a project's rules. Per-team entries look like:
+
+```json
+"teams": [{ "key": "ABC", "write": true, "workflow": { "readyLabel": "Ready", "readiness": { "minDescriptionChars": 40 } }, "github": { "repos": ["org/repo"] } }]
+```
+
+**Migrating an existing config:** nothing breaks. `projects[]` entries keep working unchanged (their issues keep their rules, repos and write access). What changes: issues **outside** the covered projects (unprojected issues, other projects) are now visible, read-only, and do not inherit the project's workflow; add a `teams[]` entry (with `write: true` and a `workflow`) to enable approval/edits for them.
+
 ## Controlled Linear actions (optional)
 
 With a separate **`LINEAR_WRITE_API_KEY`** (a different personal API key from `LINEAR_API_KEY`, permission *Write*, access limited to the configured team(s)), each issue card and the detail panel get an **Actions** menu:
@@ -61,7 +83,7 @@ With a separate **`LINEAR_WRITE_API_KEY`** (a different personal API key from `L
 | **Approve for execution** | Checks the project's readiness policy against live Linear (state, Ready label exists, description, unresolved dependencies fully verified, optional milestone/priority/classification). Needs typed confirmation. Then moves to **Todo + Ready**, records an approval comment (who/when/checks) in Linear, re-reads Linear and verifies; rolls back if any step fails or the evidence cannot be confirmed. If a prerequisite cannot be verified, approval is refused and the failed checks are shown. |
 | Revoke readiness | Removes Ready, returns an unstarted issue to Backlog, records the revocation, verifies. Started work is refused. |
 
-Without the write key every action stays visible but disabled, with the reason. DevFlow never merges PRs, deletes or bulk-edits issues, starts agents, or writes to GitHub. Every action re-reads the issue, team labels and states from live Linear before acting; it never trusts cached data or browser-supplied names.
+Without the write key, or for a team/project that config does not authorize, every action stays visible but disabled, with the reason. DevFlow never merges PRs, deletes or bulk-edits issues, starts agents, or writes to GitHub. Every action re-reads the issue, team labels and states from live Linear before acting; it never trusts cached data or browser-supplied names.
 
 **Security model:** POST is accepted only under `/api/actions/`, only from the loopback host, only with an exact same-origin `Origin`, `Sec-Fetch-Site: same-origin` (when sent), `Content-Type: application/json`, a per-process secret CSRF token, and a body under 8 KiB. The Linear write client can send exactly five fixed operations (`issueAddLabel`, `issueRemoveLabel`, `issueUpdate` limited to `stateId`/`projectMilestoneId`, `commentCreate`, `viewer`); the read key cannot write. Writes are serialized. Residual risk: any process running as a local user on this machine can reach `127.0.0.1:4317`, obtain the token and use the write capability, as with any local service; keep the write key off if that is unacceptable.
 

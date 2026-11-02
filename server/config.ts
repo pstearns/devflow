@@ -35,6 +35,15 @@ export interface ProjectCfg {
   repos: string[]; // owner/repo
   knowledge: KnowledgeCfg[];
 }
+/** Explicit team-level entry: authorizes writes for the team's issues that no config project covers, and carries the team-level policy. */
+export interface TeamCfg {
+  key: string;
+  write: boolean;
+  workflow?: WorkflowCfg; // present => an explicit team-level readiness policy exists
+  repos: string[];
+  knowledge: KnowledgeCfg[];
+}
+
 export interface Config {
   port: number;
   staleAfterMinutes: number; // data older than this is shown as stale and re-read on open/focus; never polled
@@ -44,6 +53,7 @@ export interface Config {
   /** Explicit places where independent (e.g. Codex) review results are recorded. Empty => review stays Unknown. */
   review: { checkName?: string; passedLabel?: string; findingsLabel?: string };
   projects: ProjectCfg[];
+  teams: TeamCfg[];
   prompts: PromptDef[];
 }
 
@@ -80,6 +90,32 @@ function parseWorkflow(raw: unknown, id: string): WorkflowCfg {
       requireClassificationLabel: bool(r.requireClassificationLabel, d.readiness.requireClassificationLabel), requireNoOpenBlockers: bool(r.requireNoOpenBlockers, d.readiness.requireNoOpenBlockers),
     },
   };
+}
+
+function parseKnowledge(v: unknown): KnowledgeCfg[] {
+  return arr(v, 50).flatMap((k) => {
+    if (!isObj(k)) return [];
+    const kind = k.kind === 'obsidian' || k.kind === 'repo' || k.kind === 'url' ? k.kind : undefined;
+    const title = str(k.title, 200);
+    if (!kind || !title) return [];
+    return [{ title, kind, path: str(k.path, 500), repo: str(k.repo, 200), ref: str(k.ref, 100), url: str(k.url, 2048) }];
+  });
+}
+
+function parseTeams(raw: unknown): TeamCfg[] {
+  const out: TeamCfg[] = [];
+  for (const t of arr(raw, 50)) {
+    if (!isObj(t)) throw new Error('Each teams entry must be an object');
+    const key = (str(t.key, 12) ?? '').toUpperCase();
+    if (!/^[A-Z][A-Z0-9]*$/.test(key)) throw new Error(`teams[]: key "${str(t.key, 12) ?? ''}" invalid`);
+    if (out.some((x) => x.key === key)) throw new Error(`Duplicate teams entry "${key}"`);
+    const repos = (isObj(t.github) ? arr(t.github.repos, 50) : []).map((r) => str(r, 200) ?? '').filter((r) => {
+      if (!REPO_RE.test(r)) throw new Error(`teams[${key}]: repo "${r}" must be owner/repo`);
+      return true;
+    });
+    out.push({ key, write: t.write === true, workflow: isObj(t.workflow) ? parseWorkflow(t.workflow, `team ${key}`) : undefined, repos, knowledge: parseKnowledge(t.knowledge) });
+  }
+  return out;
 }
 
 export function parseConfig(raw: unknown): Config {
@@ -128,6 +164,7 @@ export function parseConfig(raw: unknown): Config {
     obsidian: ob,
     review: { checkName: str(rv.checkName, 200), passedLabel: str(rv.passedLabel, 100), findingsLabel: str(rv.findingsLabel, 100) },
     projects,
+    teams: parseTeams(raw.teams),
     prompts,
   };
 }

@@ -1,19 +1,20 @@
 import { useMemo, useState } from 'react';
 import type { ActivityEvent, Snapshot } from '../../../shared/types.ts';
 import { Card, Empty, Ext, Pill, Tag, Time, select } from '../components/ui.tsx';
+import { eventInSel, type Sel } from '../lib.ts';
 
 const KIND: Record<ActivityEvent['kind'], string> = {
   pr_opened: 'PR opened', pr_merged: 'PR merged', pr_closed: 'PR closed', pr_updated: 'PR updated', ci_run: 'CI run', issue_changed: 'State change', issue_updated: 'Issue updated',
 };
 
-export function Activity({ snap, project, onOpen, now }: { snap: Snapshot; project: string; onOpen: (id: string) => void; now: number }) {
+export function Activity({ snap, sel, onOpen, now }: { snap: Snapshot; sel: Sel; onOpen: (id: string) => void; now: number }) {
   const [source, setSource] = useState('all');
   const [status, setStatus] = useState('all');
   const [kind, setKind] = useState('all');
   const list = useMemo(() => snap.activity.filter((a) =>
-    (project === 'all' || a.projectId === project) && (source === 'all' || a.source === source) && (kind === 'all' || a.kind === kind) &&
-    (status === 'all' || (status === 'none' ? !a.status : a.status === status))), [snap, project, source, status, kind]);
-  const pname = (id: string) => snap.projects.find((p) => p.id === id)?.name ?? id;
+    eventInSel(sel, a) && (source === 'all' || a.source === source) && (kind === 'all' || a.kind === kind) &&
+    (status === 'all' || (status === 'none' ? !a.status : a.status === status))), [snap, sel.team, sel.project, source, status, kind]);
+  const tname = (key: string) => snap.teams.find((t) => t.key === key)?.name ?? key;
   return (
     <Card
       title={`Activity (${list.length})`}
@@ -42,7 +43,7 @@ export function Activity({ snap, project, onOpen, now }: { snap: Snapshot; proje
                 <span className="ml-2 text-[12px] text-muted">{a.detail}</span>
                 {a.ticket && <button className="mono ml-2 text-accent" onClick={() => onOpen(a.ticket!)}>{a.ticket}</button>}
               </span>
-              <span className="hidden justify-self-end md:flex md:items-center md:gap-2">{a.status && <Pill value={a.status} />}<span className="text-[11px] text-muted">{project === 'all' ? pname(a.projectId) : ''}</span></span>
+              <span className="hidden justify-self-end md:flex md:items-center md:gap-2">{a.status && <Pill value={a.status} />}<span className="text-[11px] text-muted">{!sel.team ? tname(a.teamKey) : ''}</span></span>
             </li>
           ))}
         </ul>

@@ -23,7 +23,7 @@ export const Q_MILESTONES = `query Milestones($id: String!, $after: String) {
 // List queries omit `description` (the heaviest field); it is fetched per issue when someone opens it.
 const ISSUE_FIELDS = `id identifier title url priority priorityLabel createdAt updatedAt completedAt dueDate branchName
       state { name type } assignee { name } labels(first: 20) { nodes { id name color } }
-      project { id name } projectMilestone { id } parent { identifier }
+      team { key } project { id name } projectMilestone { id } parent { identifier }
       relations(first: 20) { nodes { type relatedIssue { identifier title url state { name type } } } }
       inverseRelations(first: 20) { nodes { type issue { identifier title url state { name type } } } }
       attachments(first: 10) { nodes { title url sourceType } }
@@ -99,7 +99,7 @@ function describe(v: unknown): string {
 }
 
 /** Returns a partially-derived Issue; derived fields are filled by buildSnapshot. */
-export function normalizeIssue(raw: unknown, projectId: string): Issue | undefined {
+export function normalizeIssue(raw: unknown): Issue | undefined {
   if (!isObj(raw)) return undefined;
   const identifier = str(raw.identifier, 40);
   const id = str(raw.id, 100);
@@ -109,7 +109,10 @@ export function normalizeIssue(raw: unknown, projectId: string): Issue | undefin
   const blocks = nodes(raw.relations, 50).flatMap((r) => (isObj(r) && r.type === 'blocks' ? [normalizeRef(r.relatedIssue)] : [])).filter((x): x is IssueRef => !!x);
   const priority = num(raw.priority) ?? 0;
   return {
-    id, identifier: identifier.toUpperCase(), projectId,
+    id, identifier: identifier.toUpperCase(),
+    teamKey: (isObj(raw.team) ? str(raw.team.key, 20) : undefined)?.toUpperCase() ?? identifier.split('-')[0]!.toUpperCase(),
+    linearProjectId: isObj(raw.project) ? str(raw.project.id, 100) : undefined,
+    policy: 'default', write: { allowed: false },
     title: str(raw.title, 500) ?? '(untitled)',
     description: describe(raw.description),
     url: safeUrl(raw.url),
@@ -152,14 +155,14 @@ export function normalizeLabel(raw: unknown): RawLabel | undefined {
   return { id, name, color: color(raw.color), isGroup: raw.isGroup === true, parent: isObj(raw.parent) ? str(raw.parent.name, 100) : undefined, scope: isObj(raw.team) ? 'team' : 'workspace' };
 }
 
-export interface LinearProjectData {
-  issues: Issue[];
-  labels: RawLabel[];
-  milestones: { id: string; name: string; description: string; targetDate?: string; url?: string }[];
-  projectUrl?: string;
-  documents: { title: string; url: string }[];
-  warnings: string[];
-}
+// Linear rejects queries whose nested page sizes multiply past its complexity limit (100 teams x 100 projects was refused
+// live, 50 x 50 is accepted). Keep nested page sizes small and report truncation instead of asking for more.
+export const Q_TEAMS = `query Teams($after: String) {
+  teams(first: 50, after: $after) { nodes { id key name projects(first: 50) { nodes { id name slugId url } pageInfo { hasNextPage } } }
+    pageInfo { hasNextPage endCursor } } }`;
+
+export interface ProjectRef { id: string; name: string; slugId?: string; url?: string }
+export interface TeamRef { id: string; key: string; name: string; projects: ProjectRef[] }
 
 async function paginate(
   client: LinearClient, query: string, vars: Record<string, unknown>, pick: (d: Record<string, unknown>) => unknown, warnings: string[], what: string,
@@ -179,87 +182,104 @@ async function paginate(
   return out;
 }
 
-export async function fetchLinearProject(
-  client: LinearClient, dfProjectId: string, cfg: { teamKey: string; projects: string[] },
-): Promise<LinearProjectData> {
+/** Teams (and their projects) this READ key can see. Nothing about teams is hard-coded. */
+export async function discoverTeams(client: LinearClient): Promise<{ teams: TeamRef[]; warnings: string[] }> {
   const warnings: string[] = [];
-  const data = await client.query(Q_TEAM_PROJECTS, { key: cfg.teamKey });
-  const team = isObj(data.teams) ? nodes(data.teams, 1)[0] : undefined;
-  if (!isObj(team)) throw new SourceError('not_found', `Linear team "${cfg.teamKey}" not found or not visible to this key`);
-  const all = nodes(team.projects, 100).filter(isObj);
-  const wanted = cfg.projects.map((w) => w.toLowerCase());
-  const selected = wanted.length
-    ? all.filter((p) => [str(p.id), str(p.name), str(p.slugId)].some((v) => v && wanted.includes(v.toLowerCase())))
-    : all;
-  if (wanted.length && !selected.length) warnings.push(`None of the configured Linear projects (${cfg.projects.join(', ')}) matched team ${cfg.teamKey}`);
+  const raw = await paginate(client, Q_TEAMS, {}, (d) => d.teams, warnings, 'teams');
+  const teams = raw.flatMap((t): TeamRef[] => {
+    if (!isObj(t)) return [];
+    const id = str(t.id, 100), key = str(t.key, 20)?.toUpperCase();
+    if (!id || !key || !/^[A-Z][A-Z0-9]*$/.test(key)) return [];
+    if (isObj(t.projects) && isObj(t.projects.pageInfo) && t.projects.pageInfo.hasNextPage === true) warnings.push(`Team ${key} has more than 50 projects; only the first 50 are listed`);
+    const projects = nodes(t.projects, 200).flatMap((p): ProjectRef[] => (isObj(p) && str(p.id, 100) ? [{ id: str(p.id, 100)!, name: str(p.name, 200) ?? 'Project', slugId: str(p.slugId, 100), url: safeUrl(p.url) }] : []));
+    return [{ id, key, name: str(t.name, 200) ?? key, projects }];
+  });
+  return { teams, warnings };
+}
 
-  const milestones: LinearProjectData['milestones'] = [];
-  const documents: LinearProjectData['documents'] = [];
-  for (const p of selected) {
+export interface TeamData {
+  team: TeamRef;
+  issues: Issue[]; // ALL of the team's issues, including ones not in any project
+  labels: RawLabel[]; // team labels + applicable workspace labels, with Linear's own names/colors
+  milestones: { id: string; projectId: string; name: string; description: string; targetDate?: string }[];
+  documents: { projectId: string; title: string; url: string }[];
+  warnings: string[];
+}
+
+export async function fetchTeamData(client: LinearClient, team: TeamRef): Promise<TeamData> {
+  const warnings: string[] = [];
+  const milestones: TeamData['milestones'] = [];
+  const documents: TeamData['documents'] = [];
+  const data = await client.query(Q_TEAM_PROJECTS, { key: team.key });
+  const t = isObj(data.teams) ? nodes(data.teams, 1)[0] : undefined;
+  if (!isObj(t)) throw new SourceError('not_found', `Linear team "${team.key}" not found or not visible to this key`);
+  for (const p of nodes(t.projects, 200)) {
+    if (!isObj(p)) continue;
     const pid = str(p.id, 100);
-    const purl = safeUrl(p.url);
     if (!pid) continue;
     for (const d of nodes(p.documents, 50)) {
       const url = isObj(d) ? safeUrl(d.url) : undefined;
-      if (isObj(d) && url) documents.push({ title: str(d.title, 200) ?? 'Document', url });
+      if (isObj(d) && url) documents.push({ projectId: pid, title: str(d.title, 200) ?? 'Document', url });
     }
-    const ms = await paginate(client, Q_MILESTONES, { id: pid }, (d) => (isObj(d.project) ? d.project.projectMilestones : undefined), warnings, 'milestones');
+    const ms = await paginate(client, Q_MILESTONES, { id: pid }, (d2) => (isObj(d2.project) ? d2.project.projectMilestones : undefined), warnings, 'milestones');
     for (const m of ms) {
       if (!isObj(m)) continue;
       const id = str(m.id, 100);
-      if (!id) continue;
-      milestones.push({ id, name: str(m.name, 200) ?? 'Milestone', description: str(m.description, 5000) ?? '', targetDate: dateOnly(m.targetDate), url: purl });
+      if (id) milestones.push({ id, projectId: pid, name: str(m.name, 200) ?? 'Milestone', description: str(m.description, 5000) ?? '', targetDate: dateOnly(m.targetDate) });
     }
   }
-
   // Labels are read live per team (+ workspace labels). A failure here must not hide the issues themselves.
   let labels: RawLabel[] = [];
   try {
-    const raw = await paginate(client, Q_LABELS, { key: cfg.teamKey }, (d) => d.issueLabels, warnings, 'labels');
+    const raw = await paginate(client, Q_LABELS, { key: team.key }, (d) => d.issueLabels, warnings, 'labels');
     labels = raw.map(normalizeLabel).filter((x): x is RawLabel => !!x);
   } catch (e) {
     if (e instanceof SourceError && (e.kind === 'rate_limit' || e.kind === 'network' || e.kind === 'auth')) throw e;
     warnings.push('Linear labels could not be read; label filters and editing are unavailable');
   }
-
-  const filter: Record<string, unknown> = { team: { key: { eq: cfg.teamKey } } };
-  if (wanted.length) filter.project = { id: { in: selected.map((p) => str(p.id, 100)).filter(Boolean) } };
-  const rawIssues = wanted.length && !selected.length ? [] : await paginate(client, Q_ISSUES, { filter }, (d) => d.issues, warnings, 'issues');
-  const issues = rawIssues.map((r) => normalizeIssue(r, dfProjectId)).filter((x): x is Issue => !!x);
+  const rawIssues = await paginate(client, Q_ISSUES, { filter: { team: { key: { eq: team.key } } } }, (d) => d.issues, warnings, 'issues');
+  const issues = rawIssues.map((r) => normalizeIssue(r)).filter((x): x is Issue => !!x && x.teamKey === team.key);
   if (issues.length < rawIssues.length) warnings.push(`${rawIssues.length - issues.length} malformed Linear issue(s) skipped`);
-  return {
-    issues, labels, milestones, documents, warnings,
-    projectUrl: selected.length === 1 ? safeUrl(selected[0]!.url) : undefined,
-  };
+  return { team, issues, labels, milestones, documents, warnings };
 }
 
-export function buildMilestones(dfProjectId: string, defs: LinearProjectData['milestones'], issues: Issue[], today: string): Milestone[] {
-  const mk = (id: string, name: string, description: string, targetDate: string | undefined, url: string | undefined, list: Issue[], unassigned: boolean): Milestone => {
+/**
+ * Milestones per Linear project from real data, plus: "No milestone" per project, "unreadable" for issues pointing at a
+ * milestone Linear did not return, and one team-level "No project" group for issues outside any project.
+ */
+export function buildTeamMilestones(teamKey: string, projects: ProjectRef[], defs: TeamData['milestones'], issues: Issue[], today: string): Milestone[] {
+  const mk = (id: string, kind: Milestone['kind'], name: string, description: string, linearProjectId: string | undefined, targetDate: string | undefined, url: string | undefined, list: Issue[]): Milestone => {
     const canceled = list.filter((i) => i.state.type === 'canceled').length;
     const done = list.filter((i) => i.state.type === 'completed').length;
     const countable = list.length - canceled;
     return {
-      id, projectId: dfProjectId, name, description, targetDate, url,
+      id, kind, teamKey, linearProjectId, name, description, targetDate, url,
       issueIdentifiers: list.map((i) => i.identifier), total: list.length, done, canceled,
       started: list.filter((i) => i.state.type === 'started').length,
       progress: countable > 0 ? done / countable : null,
       overdue: !!targetDate && targetDate < today && countable > 0 && done < countable,
-      isUnassigned: unassigned,
+      isUnassigned: kind !== 'milestone',
     };
   };
-  const out = defs.map((d) => mk(d.id, d.name, d.description, d.targetDate, d.url, issues.filter((i) => i.milestoneId === d.id), false));
-  const known = new Set(defs.map((d) => d.id));
-  // Issues pointing at a milestone we could not read are grouped separately, never dropped.
-  const orphan = issues.filter((i) => i.milestoneId && !known.has(i.milestoneId));
-  if (orphan.length) out.push(mk(`unknown:${dfProjectId}`, 'Milestone not readable', 'Issues reference a milestone that was not returned by Linear.', undefined, undefined, orphan, true));
-  out.push(mk(`none:${dfProjectId}`, 'No milestone', 'Tasks not assigned to any milestone.', undefined, undefined, issues.filter((i) => !i.milestoneId), true));
+  const out: Milestone[] = [];
+  for (const p of projects) {
+    const inProject = issues.filter((i) => i.linearProjectId === p.id);
+    const mine = defs.filter((d) => d.projectId === p.id);
+    for (const d of mine) out.push(mk(d.id, 'milestone', d.name, d.description, p.id, d.targetDate, p.url, inProject.filter((i) => i.milestoneId === d.id)));
+    const known = new Set(mine.map((d) => d.id));
+    const orphan = inProject.filter((i) => i.milestoneId && !known.has(i.milestoneId));
+    if (orphan.length) out.push(mk(`unknown:${p.id}`, 'unreadable', 'Milestone not readable', 'Issues reference a milestone that was not returned by Linear.', p.id, undefined, p.url, orphan));
+    out.push(mk(`none:${p.id}`, 'no-milestone', 'No milestone', 'Tasks in this project that are not assigned to any milestone.', p.id, undefined, p.url, inProject.filter((i) => !i.milestoneId)));
+  }
+  const unprojected = issues.filter((i) => !i.linearProjectId);
+  if (unprojected.length) out.push(mk(`noproject:${teamKey}`, 'no-project', 'Not in a project', 'Team issues that are not in any Linear project (milestones belong to projects, so none can be assigned).', undefined, undefined, undefined, unprojected));
   return out;
 }
 
 /** Reads ONE issue (with description). Linear accepts the human identifier (e.g. ABC-12) as the id. */
-export async function fetchLinearIssue(client: LinearClient, dfProjectId: string, identifier: string): Promise<Issue> {
+export async function fetchLinearIssue(client: LinearClient, identifier: string): Promise<Issue> {
   const data = await client.query(Q_ISSUE_DETAIL, { id: identifier });
-  const issue = normalizeIssue(data.issue, dfProjectId);
+  const issue = normalizeIssue(data.issue);
   if (!issue) throw new SourceError('not_found', `Linear issue ${identifier} not found or not readable`);
   return issue;
 }

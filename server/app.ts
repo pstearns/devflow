@@ -43,6 +43,14 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
     reply.header('cache-control', 'no-store');
     try { return await service.get((req.query as Record<string, string>).refresh === '1'); } catch (e) { return fail(reply, e); }
   });
+  // Read one accessible team on first selection. Only teams discovered from Linear can be opened; the key is validated
+  // server-side and only that team is read (not other teams, projects or repositories).
+  app.get('/api/team/:key', async (req, reply) => {
+    const key = (req.params as { key: string }).key;
+    reply.header('cache-control', 'no-store');
+    if (!/^[A-Za-z][A-Za-z0-9]{0,11}$/.test(key)) return reply.code(400).send({ error: 'invalid team key' });
+    try { return (await service.getTeam(key, (req.query as Record<string, string>).refresh === '1')) ?? reply.code(404).send({ error: 'unknown team' }); } catch (e) { return fail(reply, e); }
+  });
   // Targeted read of one issue (+ its PRs' evidence); never reloads other projects.
   app.get('/api/issue/:identifier', async (req, reply) => {
     const id = (req.params as { identifier: string }).identifier;

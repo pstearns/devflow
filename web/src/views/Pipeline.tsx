@@ -2,7 +2,7 @@ import { STAGES, type Issue, type PullRequest, type Snapshot } from '../../../sh
 import { IssueActions } from '../components/Actions.tsx';
 import { IssueLabels, LabelFilter } from '../components/Labels.tsx';
 import { Ext, Pill, Tag, Time } from '../components/ui.tsx';
-import { matchesLabels, parseLabelParam, type Route } from '../lib.ts';
+import { matchesLabels, parseLabelParam, prInSel, type Route, type Sel } from '../lib.ts';
 
 function TicketCard({ i, pr, onOpen, now, snap, onResult }: { i: Issue; pr?: PullRequest; onOpen: (id: string) => void; now: number; snap: Snapshot; onResult: (s: Snapshot, m: string) => void }) {
   const hot = i.rework.length > 0;
@@ -13,7 +13,7 @@ function TicketCard({ i, pr, onOpen, now, snap, onResult }: { i: Issue; pr?: Pul
         <span className="flex items-center gap-1.5"><Ext href={i.url} title="Open in Linear">Linear</Ext><IssueActions issue={i} snap={snap} onResult={onResult} compact /></span>
       </div>
       <button className="mt-0.5 block text-left leading-snug hover:underline" onClick={() => onOpen(i.identifier)}>{i.title}</button>
-      {i.labels.length > 0 && <div className="mt-1"><IssueLabels labels={i.labels} project={snap.projects.find((p) => p.id === i.projectId)} /></div>}
+      {i.labels.length > 0 && <div className="mt-1"><IssueLabels labels={i.labels} defs={snap.labels.filter((l) => l.teamKey === i.teamKey)} /></div>}
       <div className="mt-1 flex flex-wrap gap-1">
         <Tag>{i.state.name}</Tag>
         {i.readiness === 'blocked' && <Tag tone="warn">blocked{i.openBlockers.length ? ` by ${i.openBlockers.map((b) => b.identifier).join(', ')}` : ''}</Tag>}
@@ -32,14 +32,14 @@ function TicketCard({ i, pr, onOpen, now, snap, onResult }: { i: Issue; pr?: Pul
   );
 }
 
-export function Pipeline({ snap, issues: all, onOpen, now, route, go, project, onResult }: { snap: Snapshot; issues: Issue[]; onOpen: (id: string) => void; now: number; route: Route; go: (p: Partial<Route>) => void; project: string; onResult: (s: Snapshot, m: string) => void }) {
+export function Pipeline({ snap, issues: all, onOpen, now, route, go, sel, onResult }: { snap: Snapshot; issues: Issue[]; onOpen: (id: string) => void; now: number; route: Route; go: (p: Partial<Route>) => void; sel: Sel; onResult: (s: Snapshot, m: string) => void }) {
   const selected = parseLabelParam(route.params.labels);
   const issues = all.filter((i) => matchesLabels(i.labels, selected));
-  const labelDefs = snap.labels.filter((l) => project === 'all' || l.projectId === project);
+  const labelDefs = snap.labels.filter((l) => !sel.team || l.teamKey === sel.team);
   const prOf = (i: Issue) => snap.prs.find((p) => p.key === i.primaryPrKey);
   const canceled = issues.filter((i) => i.state.type === 'canceled').length;
   const noStage = issues.filter((i) => !i.stage && i.state.type !== 'canceled');
-  const unlinked = snap.prs.filter((p) => p.state === 'open' && p.ticket.link !== 'linked' && issues.some((i) => i.projectId === p.projectId));
+  const unlinked = snap.prs.filter((p) => p.state === 'open' && p.ticket.link !== 'linked' && prInSel(sel, p.scope));
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">

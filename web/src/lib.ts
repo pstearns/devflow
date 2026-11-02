@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Issue, PromptDef, Snapshot } from '../../shared/types.ts';
+import type { Issue, PrScope, PromptDef, Snapshot } from '../../shared/types.ts';
 
 export type View = 'overview' | 'milestones' | 'pipeline' | 'activity';
 export const VIEWS: { id: View; label: string }[] = [
@@ -9,18 +9,21 @@ export const VIEWS: { id: View; label: string }[] = [
   { id: 'activity', label: 'Activity' },
 ];
 
-export interface Route { view: View; project: string; ticket?: string; panel?: 'project'; params: Record<string, string> }
+/** Team → Project selection. team '' = all loaded teams. project: 'all' | 'none' (unprojected issues) | a Linear project id. */
+export interface Route { view: View; team: string; project: string; ticket?: string; panel?: 'project'; params: Record<string, string> }
 
 export function parseHash(h: string): Route {
   const [path = '', query = ''] = h.replace(/^#\/?/, '').split('?');
   const q = Object.fromEntries(new URLSearchParams(query));
   const view = (VIEWS.find((v) => v.id === path)?.id ?? 'overview') as View;
-  const { p, t, panel, ...params } = q;
-  return { view, project: p || 'all', ticket: t || undefined, panel: panel === 'project' ? 'project' : undefined, params };
+  const { team, p, t, panel, ...params } = q;
+  const tk = /^[A-Za-z][A-Za-z0-9]{0,11}$/.test(team ?? '') ? team!.toUpperCase() : '';
+  return { view, team: tk, project: tk ? p || 'all' : 'all', ticket: t || undefined, panel: panel === 'project' ? 'project' : undefined, params };
 }
 export function toHash(r: Route): string {
   const q = new URLSearchParams();
-  if (r.project !== 'all') q.set('p', r.project);
+  if (r.team) q.set('team', r.team);
+  if (r.team && r.project !== 'all') q.set('p', r.project);
   if (r.ticket) q.set('t', r.ticket);
   if (r.panel) q.set('panel', r.panel);
   for (const [k, v] of Object.entries(r.params)) if (v) q.set(k, v);
@@ -44,12 +47,45 @@ export function useRoute(): [Route, (patch: Partial<Route>, replaceParams?: bool
   return [route, go];
 }
 
+/** Everything that is scoped to a selection is filtered through these (the server stays the authority for writes). */
+export interface Sel { team: string; project: string }
+export const selOf = (r: Pick<Route, 'team' | 'project'>): Sel => ({ team: r.team, project: r.project });
+export function inSel(sel: Sel, e: { teamKey: string; linearProjectId?: string }): boolean {
+  if (!sel.team) return true;
+  if (e.teamKey !== sel.team) return false;
+  if (sel.project === 'all') return true;
+  if (sel.project === 'none') return !e.linearProjectId;
+  return e.linearProjectId === sel.project;
+}
+export function prInSel(sel: Sel, s: PrScope): boolean {
+  if (!sel.team) return true;
+  if (s.teamKey !== sel.team) return false;
+  if (sel.project === 'all') return true;
+  if (sel.project === 'none') return s.includeUnprojected;
+  return s.projectIds === null || s.projectIds.includes(sel.project);
+}
+export const eventInSel = (sel: Sel, e: { teamKey: string; linearProjectId?: string; scope?: PrScope }) => (e.scope ? prInSel(sel, e.scope) : inSel(sel, e));
+/** Integration-health attention (no team) is always relevant. */
+export const attentionInSel = (sel: Sel, a: { teamKey: string; linearProjectId?: string; scope?: PrScope }) => !a.teamKey || eventInSel(sel, a);
+
+/** Human label for the current selection, e.g. "CrankLogix › V2" (used by prompts and headings). */
+export function selName(snap: Snapshot | undefined, sel: Sel): string {
+  const t = snap?.teams.find((x) => x.key === sel.team);
+  if (!t) return 'All teams';
+  if (sel.project === 'all') return t.name;
+  if (sel.project === 'none') return `${t.name} › no project`;
+  return `${t.name} › ${t.projects.find((p) => p.id === sel.project)?.name ?? 'project'}`;
+}
+
 export interface Live {
   snap?: Snapshot;
   error?: string; // last fetch error (snapshot may still be shown from an earlier success)
   loading: boolean;
   refresh: () => void; // explicit user action: re-read everything
   openIssue: (identifier: string) => void; // re-read just this issue if its detail is missing/stale
+  openTeam: (key: string) => void; // read one accessible team that has not been read yet
+  teamLoading?: string;
+  teamError?: string;
   applySnapshot: (s: Snapshot) => void; // a verified action result carries the updated snapshot
   issueLoading?: string;
   issueError?: string;
@@ -71,6 +107,8 @@ export function useSnapshot(): Live {
   const [loading, setLoading] = useState(true);
   const [issueLoading, setIssueLoading] = useState<string>();
   const [issueError, setIssueError] = useState<string>();
+  const [teamLoading, setTeamLoading] = useState<string>();
+  const [teamError, setTeamError] = useState<string>();
   const snapRef = useRef<Snapshot>(undefined);
   const busy = useRef(false);
   snapRef.current = snap;
@@ -99,6 +137,17 @@ export function useSnapshot(): Live {
     } finally { setIssueLoading(undefined); }
   }, []);
 
+  const openTeam = useCallback(async (key: string) => {
+    setTeamLoading(key); setTeamError(undefined);
+    try {
+      const r = await fetch(`/api/team/${encodeURIComponent(key)}`, { cache: 'no-store' });
+      if (!r.ok) throw new Error(await readError(r));
+      setSnap((await r.json()) as Snapshot);
+    } catch (e) {
+      setTeamError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server');
+    } finally { setTeamLoading(undefined); }
+  }, []);
+
   useEffect(() => { load(false); }, [load]);
   useEffect(() => {
     const onVisible = () => {
@@ -108,7 +157,7 @@ export function useSnapshot(): Live {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [load]);
-  return { snap, error, loading, refresh: () => load(true), openIssue, applySnapshot: setSnap, issueLoading, issueError };
+  return { snap, error, loading, refresh: () => load(true), openIssue, openTeam, teamLoading, teamError, applySnapshot: setSnap, issueLoading, issueError };
 }
 
 export function relTime(iso: string | undefined, now = Date.now()): string {

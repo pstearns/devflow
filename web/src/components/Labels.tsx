@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import type { LabelDef, LabelRef, ProjectInfo } from '../../../shared/types.ts';
+import type { LabelDef, LabelRef } from '../../../shared/types.ts';
 import { matchesLabels, parseLabelParam } from '../lib.ts';
 
 const hex = (c: string) => (/^#[0-9a-fA-F]{3,8}$/.test(c) ? c : '#8b97a7');
@@ -14,15 +14,13 @@ export function LabelChip({ l, lock }: { l: LabelRef; lock?: boolean }) {
   );
 }
 
-/** Labels for one issue: classification labels first, then others; the workflow label is shown locked. */
-export function IssueLabels({ labels, project }: { labels: LabelRef[]; project?: ProjectInfo }) {
+/** Labels for one issue: classification labels first, then others; protected workflow labels are shown locked.
+ *  `defs` are the issue's own team's label definitions (from Linear), so flags never come from another team. */
+export function IssueLabels({ labels, defs }: { labels: LabelRef[]; defs?: LabelDef[] }) {
   if (!labels.length) return null;
-  const wf = project?.workflow;
-  const low = (s: string) => s.toLowerCase();
-  const prot = wf ? [wf.readyLabel, ...wf.protectedLabels].map(low) : [];
-  const cls = wf ? wf.classificationLabels.map(low) : [];
-  const sorted = [...labels].sort((a, b) => Number(cls.includes(low(b.name))) - Number(cls.includes(low(a.name))));
-  return <span className="inline-flex flex-wrap gap-1">{sorted.map((l) => <LabelChip key={l.id} l={l} lock={prot.includes(low(l.name))} />)}</span>;
+  const meta = (l: LabelRef) => defs?.find((d) => d.id === l.id) ?? defs?.find((d) => d.name.toLowerCase() === l.name.toLowerCase());
+  const sorted = [...labels].sort((a, b) => Number(!!meta(b)?.classification) - Number(!!meta(a)?.classification));
+  return <span className="inline-flex flex-wrap gap-1">{sorted.map((l) => <LabelChip key={l.id} l={l} lock={!!meta(l)?.protected} />)}</span>;
 }
 
 /** Any-of label filter built from the labels Linear returned (not a fixed list). */

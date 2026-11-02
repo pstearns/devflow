@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Lifecycle } from './components/Lifecycle.tsx';
-import { ProjectDetail, TicketDetail } from './components/Detail.tsx';
+import { ScopeDetail, TicketDetail } from './components/Detail.tsx';
 import { Time, btn, select } from './components/ui.tsx';
 import type { Snapshot } from '../../shared/types.ts';
-import { VIEWS, useRoute, useSnapshot, relTime } from './lib.ts';
+import { VIEWS, inSel, selOf, useRoute, useSnapshot, relTime } from './lib.ts';
 import { Overview } from './views/Overview.tsx';
 import { Milestones } from './views/Milestones.tsx';
 import { Pipeline } from './views/Pipeline.tsx';
@@ -35,12 +35,32 @@ export function App() {
     return () => { clearInterval(t); document.removeEventListener('visibilitychange', tick); };
   }, []);
 
-  const issues = useMemo(() => (snap ? snap.issues.filter((i) => route.project === 'all' || i.projectId === route.project) : []), [snap, route.project]);
+  const scope = selOf(route);
+  const issues = useMemo(() => (snap ? snap.issues.filter((i) => inSel(scope, i)) : []), [snap, route.team, route.project]); // eslint-disable-line react-hooks/exhaustive-deps
+  const team = snap?.teams.find((t) => t.key === route.team);
+
+  // Switching team or project discards everything that depended on the old selection: the open ticket/panel, per-view
+  // filters (labels and milestones are team/project specific) and, via `key` below, each view's local state.
+  const selectTeam = (key: string) => go({ team: key, project: 'all', ticket: undefined, panel: undefined, params: {} }, true);
+  const selectProject = (id: string) => go({ project: id, ticket: undefined, panel: undefined, params: { ...route.params, milestone: '', labels: '' } }, true);
+
+  // A team that has not been read yet is read when it is first selected (only that team).
+  const teamAttempt = useRef(new Map<string, number>());
+  useEffect(() => {
+    if (!team || team.loaded) return;
+    const last = teamAttempt.current.get(team.key) ?? 0;
+    if (Date.now() - last < 10000) return;
+    teamAttempt.current.set(team.key, Date.now());
+    live.openTeam(team.key);
+  }, [team?.key, team?.loaded]); // eslint-disable-line react-hooks/exhaustive-deps
+  // A bookmarked project that no longer exists in the team falls back to the whole team.
+  useEffect(() => {
+    if (team && route.project !== 'all' && route.project !== 'none' && !team.projects.some((p) => p.id === route.project)) go({ project: 'all' }, false);
+  }, [team?.key, route.project]); // eslint-disable-line react-hooks/exhaustive-deps
   const openTicket = (id: string) => go({ ticket: id, panel: undefined });
   const close = () => go({ ticket: undefined, panel: undefined });
   const selected = snap && route.ticket ? snap.issues.find((i) => i.identifier === route.ticket) : undefined;
-  const project = snap && route.project !== 'all' ? snap.projects.find((p) => p.id === route.project) : undefined;
-  const panelOpen = !!selected || route.panel === 'project';
+  const panelOpen = !!selected || (route.panel === 'project' && !!route.team);
   // Opening an issue fetches only that issue (and its PRs' evidence) when its detail is missing or stale.
   const attempted = useRef(new Map<string, number>());
   const sel = snap && route.ticket ? snap.issues.find((i) => i.identifier === route.ticket) : undefined;
@@ -65,7 +85,7 @@ export function App() {
       <header className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-line bg-panel px-4 py-2">
         <div className="flex items-baseline gap-2">
           <span className="text-[15px] font-semibold tracking-tight">DevFlow</span>
-          <span className="rounded-sm border border-line px-1 text-[10px] uppercase tracking-wider text-muted" title="No write endpoints; Linear and GitHub are only ever read">read-only</span>
+          <span className="rounded-sm border border-line px-1 text-[10px] uppercase tracking-wider text-muted" title={snap?.write.enabled ? 'GitHub is read-only. Linear changes only through the controlled actions menu, validated and verified against live Linear.' : 'No write access is configured: Linear and GitHub are only read'}>{snap?.write.enabled ? 'controlled writes' : 'read-only'}</span>
         </div>
         <nav className="flex gap-1" aria-label="Views">
           {VIEWS.map((v) => (
@@ -73,12 +93,18 @@ export function App() {
               className={`rounded px-2.5 py-1 ${route.view === v.id ? 'bg-raised font-semibold text-fg' : 'text-muted hover:text-fg'}`}>{v.label}</button>
           ))}
         </nav>
-        <div className="flex items-center gap-1">
-          <select aria-label="Project" className={select} value={route.project} onChange={(e) => go({ project: e.target.value, ticket: undefined, panel: undefined })}>
-            <option value="all">All projects</option>
-            {snap?.projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        <div className="flex items-center gap-1" role="group" aria-label="Team and project">
+          <select aria-label="Team" className={select} value={route.team} onChange={(e) => selectTeam(e.target.value)}>
+            <option value="">All teams</option>
+            {snap?.teams.map((t) => <option key={t.key} value={t.key}>{t.name} ({t.key}){t.loaded ? '' : ' · not read yet'}</option>)}
           </select>
-          {project && <button className={btn} onClick={() => go({ panel: 'project', ticket: undefined })}>Project info</button>}
+          <span className="text-muted" aria-hidden>›</span>
+          <select aria-label="Project" className={select} value={route.project} disabled={!team} onChange={(e) => selectProject(e.target.value)}>
+            <option value="all">Whole team (all issues)</option>
+            {team?.projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            <option value="none">No project (unprojected)</option>
+          </select>
+          {team && <button className={btn} onClick={() => go({ panel: 'project', ticket: undefined })}>Info</button>}
         </div>
         <div className="ml-auto flex items-center gap-3">
           <button className="flex items-center gap-1.5 hover:underline" onClick={() => setShowHealth((s) => !s)} aria-expanded={showHealth}>
@@ -122,21 +148,28 @@ export function App() {
         <main className="min-w-0 flex-1 overflow-auto p-4">
           {!snap ? (
             <p className="text-muted">{live.error ? 'No data yet.' : 'Loading…'}</p>
-          ) : route.view === 'overview' ? (
-            <Overview snap={snap} issues={issues} project={route.project} go={go} now={now} />
-          ) : route.view === 'milestones' ? (
-            <Milestones snap={snap} issues={issues} project={route.project} route={route} go={go} onOpen={openTicket} onResult={onResult} />
-          ) : route.view === 'pipeline' ? (
-            <Pipeline snap={snap} issues={issues} onOpen={openTicket} now={now} route={route} go={go} project={route.project} onResult={onResult} />
+          ) : route.team && !team ? (
+            <div className="rounded-md border border-line bg-panel p-4"><p>Team <span className="mono">{route.team}</span> is not visible to DevFlow's Linear key.</p><button className={`${btn} mt-2`} onClick={() => selectTeam('')}>Show all teams</button></div>
+          ) : team && !team.loaded ? (
+            <div className="rounded-md border border-line bg-panel p-4" role="status">
+              {live.teamLoading === team.key ? <p className="text-muted">Reading team {team.name} from Linear…</p>
+                : <><p className={live.teamError || team.error ? 'text-bad' : 'text-muted'}>{live.teamError ?? team.error ?? `Team ${team.name} has not been read yet.`}</p><button className={`${btn} mt-2`} onClick={() => live.openTeam(team.key)}>Read team now</button></>}
+            </div>
           ) : (
-            <Activity snap={snap} project={route.project} onOpen={openTicket} now={now} />
+            // key = selection: every view starts clean (filters, expanded rows, dialogs) when the team or project changes
+            <div key={`${route.team}|${route.project}|${route.view}`}>
+              {route.view === 'overview' ? <Overview snap={snap} issues={issues} sel={scope} go={go} now={now} />
+                : route.view === 'milestones' ? <Milestones snap={snap} issues={issues} sel={scope} route={route} go={go} onOpen={openTicket} onResult={onResult} />
+                : route.view === 'pipeline' ? <Pipeline snap={snap} issues={issues} onOpen={openTicket} now={now} route={route} go={go} sel={scope} onResult={onResult} />
+                : <Activity snap={snap} sel={scope} onOpen={openTicket} now={now} />}
+            </div>
           )}
         </main>
         {panelOpen && snap && (
           <aside className="w-full max-w-[480px] shrink-0 overflow-auto border-l border-line bg-bg p-4 max-md:fixed max-md:inset-0 max-md:z-10 max-md:max-w-none" aria-label="Details">
             <div className="mb-2 flex justify-end"><button className={btn} onClick={close}>Close ✕</button></div>
             {selected ? <TicketDetail issue={selected} snap={snap} onOpen={openTicket} loading={live.issueLoading === selected.identifier} error={live.issueError} onResult={onResult} />
-              : route.panel === 'project' && project ? <ProjectDetail project={project} snap={snap} /> : null}
+              : route.panel === 'project' && route.team ? <ScopeDetail snap={snap} sel={scope} onSelectProject={selectProject} /> : null}
           </aside>
         )}
       </div>

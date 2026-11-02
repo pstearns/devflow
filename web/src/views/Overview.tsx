@@ -1,12 +1,11 @@
 import type { Issue, Snapshot } from '../../../shared/types.ts';
 import { AttentionList } from '../components/Detail.tsx';
 import { Card, Empty, Ext, Pill, Tag, Time } from '../components/ui.tsx';
-import type { Route } from '../lib.ts';
+import { attentionInSel, eventInSel, prInSel, type Route, type Sel } from '../lib.ts';
 
-export function Overview({ snap, issues, project, go, now }: {
-  snap: Snapshot; issues: Issue[]; project: string; go: (p: Partial<Route>, replace?: boolean) => void; now: number;
+export function Overview({ snap, issues, sel, go, now }: {
+  snap: Snapshot; issues: Issue[]; sel: Sel; go: (p: Partial<Route>, replace?: boolean) => void; now: number;
 }) {
-  const inScope = (pid: string) => project === 'all' || pid === project;
   const open = (id: string) => go({ ticket: id, panel: undefined });
   const weekAgo = now - 7 * 86400000;
   const tiles: { label: string; n: number; sub?: string; params: Record<string, string>; tone?: 'bad' }[] = [
@@ -16,10 +15,16 @@ export function Overview({ snap, issues, project, go, now }: {
     { label: 'Blocked', n: issues.filter((i) => i.readiness === 'blocked').length, sub: 'unresolved blocker', params: { blocked: '1' }, tone: 'bad' },
     { label: 'Done', n: issues.filter((i) => i.stage === 'done').length, sub: `${issues.filter((i) => i.completedAt && Date.parse(i.completedAt) > weekAgo).length} in last 7d`, params: { status: 'done' } },
   ];
-  const attention = snap.attention.filter((a) => !a.projectId || inScope(a.projectId));
-  const prs = snap.prs.filter((p) => p.state === 'open' && inScope(p.projectId));
-  const activity = snap.activity.filter((a) => inScope(a.projectId)).slice(0, 14);
-  const projects = snap.projects.filter((p) => inScope(p.id));
+  const attention = snap.attention.filter((a) => attentionInSel(sel, a));
+  const prs = snap.prs.filter((p) => p.state === 'open' && prInSel(sel, p.scope));
+  const activity = snap.activity.filter((a) => eventInSel(sel, a)).slice(0, 14);
+  // "Go to source": only what is configured for the teams/projects in the current selection
+  const sources = snap.teams.filter((t) => t.loaded && (!sel.team || t.key === sel.team)).flatMap((t) => {
+    const projs = t.projects.filter((p) => sel.project === 'all' || sel.project === p.id);
+    const rows = projs.map((p) => ({ key: `${t.key}:${p.id}`, title: `${t.name} › ${p.name}`, url: p.url, repos: p.repos, knowledge: p.knowledge }));
+    if (sel.project === 'all' || sel.project === 'none') rows.push({ key: `${t.key}:team`, title: `${t.name} (team level / unprojected)`, url: undefined, repos: t.teamLevel.repos, knowledge: t.teamLevel.knowledge });
+    return rows;
+  });
   const ticketName = (id?: string) => id && issues.find((i) => i.identifier === id);
 
   return (
@@ -66,16 +71,17 @@ export function Overview({ snap, issues, project, go, now }: {
       <div className="min-w-0 space-y-3">
         <Card title="Go to source">
           <div className="divide-y divide-line">
-            {projects.map((p) => (
-              <div key={p.id} className="space-y-0.5 px-3 py-2">
-                <button className="font-medium hover:underline" onClick={() => go({ project: p.id, panel: 'project', ticket: undefined })} title="Open project panel">{p.name}</button>
+            {sources.map((p) => (
+              <div key={p.key} className="space-y-0.5 px-3 py-2">
+                <div className="font-medium">{p.title}</div>
                 <div className="flex flex-wrap gap-x-3">
-                  <Ext href={p.linearUrl}>Linear</Ext>
-                  {p.repos.map((r) => <span key={r.repo} className="text-[12px]">{r.repo.split('/')[1]}: <Ext href={r.url}>repo</Ext> · <Ext href={`${r.url}/pulls`}>PRs</Ext> · <Ext href={r.actionsUrl}>Actions</Ext></span>)}
+                  {p.url ? <Ext href={p.url}>Linear</Ext> : null}
+                  {p.repos.length ? p.repos.map((r) => <span key={r.repo} className="text-[12px]">{r.repo.split('/')[1]}: <Ext href={r.url}>repo</Ext> · <Ext href={`${r.url}/pulls`}>PRs</Ext> · <Ext href={r.actionsUrl}>Actions</Ext></span>) : <span className="text-[12px] text-muted">no GitHub repository configured</span>}
                 </div>
-                {p.knowledge.length > 0 && <div className="flex flex-wrap gap-x-3 text-[12px]">{p.knowledge.slice(0, 4).map((k, i) => <Ext key={i} href={k.url}>{k.title}</Ext>)}{p.knowledge.length > 4 && <button className="text-muted underline" onClick={() => go({ project: p.id, panel: 'project', ticket: undefined })}>+{p.knowledge.length - 4} more</button>}</div>}
+                {p.knowledge.length > 0 && <div className="flex flex-wrap gap-x-3 text-[12px]">{p.knowledge.slice(0, 4).map((k, i) => <Ext key={i} href={k.url}>{k.title}</Ext>)}{p.knowledge.length > 4 && sel.team && <button className="text-muted underline" onClick={() => go({ panel: 'project', ticket: undefined })}>+{p.knowledge.length - 4} more</button>}</div>}
               </div>
             ))}
+            {!sources.length && <Empty>Nothing to link for this selection.</Empty>}
           </div>
         </Card>
         <Card title="Recent activity" right={<button className="text-[11px] text-accent" onClick={() => go({ view: 'activity' })}>all →</button>}>

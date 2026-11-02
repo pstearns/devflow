@@ -43,7 +43,7 @@ export interface IssueRef {
 export interface LabelRef { id: string; name: string; color: string }
 
 export interface LabelDef extends LabelRef {
-  projectId: string; // DevFlow project the label was retrieved for
+  teamKey: string; // team the label set was retrieved for (team labels + applicable workspace labels)
   isGroup: boolean; // group labels cannot be applied to issues
   parent?: string;
   scope: 'team' | 'workspace';
@@ -51,10 +51,17 @@ export interface LabelDef extends LabelRef {
   classification: boolean; // issue classification (Bug, Idea, …), separate from lifecycle stages
 }
 
+/** Where an issue's workflow/readiness policy comes from. Never inherited across projects or teams. */
+export type PolicySource = 'project' | 'team' | 'default';
+
 export interface Issue {
   id: string;
   identifier: string;
-  projectId: string; // DevFlow project id (from config)
+  teamKey: string; // Linear team the issue really belongs to (from Linear, never from the browser)
+  linearProjectId?: string; // undefined = not in any Linear project ("unprojected")
+  configProjectId?: string; // DevFlow config project that covers it, if any
+  policy: PolicySource; // which readiness policy applies to this issue
+  write: { allowed: boolean; reason?: string }; // config authorization for DevFlow writes to THIS issue's team/project (server re-checks)
   title: string;
   description: string;
   url?: string;
@@ -94,7 +101,9 @@ export interface Issue {
 
 export interface Milestone {
   id: string;
-  projectId: string;
+  teamKey: string;
+  linearProjectId?: string; // undefined for the team-level "no project" group
+  kind: 'milestone' | 'no-milestone' | 'no-project' | 'unreadable';
   name: string;
   description: string;
   targetDate?: string;
@@ -133,10 +142,12 @@ export interface RunItem {
   sha: string; url?: string; at?: string; event?: string;
 }
 
+export interface PrScope { teamKey: string; projectIds: string[] | null; includeUnprojected: boolean } // projectIds null = every project of the team
+
 export interface PullRequest {
   key: string; // owner/repo#123
   repo: string;
-  projectId: string;
+  scope: PrScope; // which team/projects this PR may be shown under (derived from the repo's configuration)
   number: number;
   title: string;
   url?: string;
@@ -167,7 +178,9 @@ export interface ActivityEvent {
   ts: string;
   source: 'github' | 'linear';
   kind: 'pr_opened' | 'pr_merged' | 'pr_closed' | 'pr_updated' | 'ci_run' | 'issue_changed' | 'issue_updated';
-  projectId: string;
+  teamKey: string;
+  linearProjectId?: string;
+  scope?: PrScope; // set for GitHub events that are not tied to one issue
   title: string;
   detail?: string;
   status?: Tri;
@@ -181,7 +194,9 @@ export interface AttentionItem {
   severity: 'high' | 'medium' | 'low';
   /** true = backed by explicit source evidence; false = an inference/suggestion by DevFlow */
   actionable: boolean;
-  projectId: string;
+  teamKey: string; // '' = global (integration health)
+  linearProjectId?: string;
+  scope?: PrScope;
   title: string;
   cause: string;
   evidence: Evidence[];
@@ -209,13 +224,32 @@ export interface KnowledgeLink {
   source: string;
 }
 
-export interface ProjectInfo {
+export interface WorkflowInfo { readyLabel: string; discoveryLabels: string[]; classificationLabels: string[]; protectedLabels: string[] }
+
+/** A Linear project inside a team, enriched with whatever DevFlow is configured to know about it. */
+export interface TeamProjectInfo {
+  id: string; // Linear project id
+  name: string;
+  slugId?: string;
+  url?: string; // API-provided
+  configId?: string; // config project covering it
+  repos: { repo: string; url: string; actionsUrl: string }[]; // only repos configured for THIS project
+  knowledge: KnowledgeLink[];
+  policy: PolicySource;
+  write: { allowed: boolean; reason?: string };
+  workflow: WorkflowInfo;
+}
+
+export interface TeamInfo {
+  key: string;
   id: string;
   name: string;
-  workflow: { readyLabel: string; discoveryLabels: string[]; classificationLabels: string[]; protectedLabels: string[] };
-  linearUrl?: string;
-  repos: { repo: string; url: string; actionsUrl: string }[];
-  knowledge: KnowledgeLink[];
+  loaded: boolean; // issues/labels/milestones read yet (unloaded teams are read when first selected)
+  configured: boolean;
+  projects: TeamProjectInfo[];
+  /** Applies to the team's unprojected issues. */
+  teamLevel: { policy: PolicySource; write: { allowed: boolean; reason?: string }; repos: { repo: string; url: string; actionsUrl: string }[]; knowledge: KnowledgeLink[]; workflow: WorkflowInfo };
+  error?: string;
 }
 
 export interface PromptDef { id: string; label: string; template: string }
@@ -226,7 +260,7 @@ export interface Snapshot {
   mode: 'live' | 'demo';
   staleAfterSeconds: number;
   staleDays: number;
-  projects: ProjectInfo[];
+  teams: TeamInfo[]; // discovered dynamically from Linear
   issues: Issue[];
   milestones: Milestone[];
   prs: PullRequest[];
@@ -245,6 +279,7 @@ export interface ActionOptions {
   writeEnabled: boolean;
   reason?: string; // why writes are disabled
   csrf: string;
+  scope: { teamKey: string; projectName?: string; policy: PolicySource; explicitPolicy: boolean }; // resolved server-side from the issue's live team/project
   identifier: string;
   title: string;
   state: { id: string; name: string; type: StateType };

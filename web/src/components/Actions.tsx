@@ -35,6 +35,7 @@ export function IssueActions({ issue, snap, onResult, compact }: { issue: Issue;
       {menu && (
         <div role="menu" className="absolute right-0 z-30 mt-1 w-64 rounded border border-line bg-panel p-1 shadow-lg">
           {!w.enabled && <div className="px-2 py-1 text-[11px] text-warn">{w.reason ?? 'Linear write access is not configured.'} Options below show what is available once it is.</div>}
+          {w.enabled && !issue.write.allowed && <div className="px-2 py-1 text-[11px] text-warn">Read-only here: {issue.write.reason ?? 'this team/project is not enabled for writes'}. The server re-checks this for every action.</div>}
           {ITEMS.map((it) => (
             <button key={it.kind} role="menuitem" className="block w-full rounded px-2 py-1 text-left hover:bg-raised" title={it.hint}
               onClick={() => { setMenu(false); setKind(it.kind); }}>

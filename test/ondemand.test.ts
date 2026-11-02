@@ -337,6 +337,6 @@ describe('source-specific backoff on issue reads', () => {
     expect(ghCalls).toBeGreaterThan(0); // GitHub still read
     expect(linCalls).toBe(0); // Linear paused until its reset
     expect(snap.health.find((h) => h.id.startsWith('github:'))!.state).toBe('ok');
-    expect(snap.health.find((h) => h.id === 'linear:atlas')!.state).toBe('stale');
+    expect(snap.health.find((h) => h.id === 'linear:team:ATL')!.state).toBe('stale');
   });
 });

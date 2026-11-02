@@ -23,6 +23,7 @@ async function setup(opts: FakeLinearOpts = {}, writeEnabled = true) {
   return { f, service, actions, spec, ops, logs, cfg };
 }
 const fail = async (p: Promise<unknown>) => (await p.then(() => { throw new Error('expected rejection'); }, (e) => e)) as ActionError;
+const OK_SCOPE = { policy: 'project' as const, explicitPolicy: true, writeAllowed: true };
 const LBL = { ready: 'lbl-ready', security: 'lbl-security', feature: 'lbl-feature', bug: 'lbl-bug', area: 'lbl-area', design: 'lbl-newcustom', idea: 'lbl-idea' };
 
 describe('credential separation', () => {
@@ -102,12 +103,12 @@ describe('approval eligibility (pure policy)', () => {
     const base = { id: 'u', identifier: 'ABC-1', title: 't', description: 'x'.repeat(60), priority: 0, state: { id: 's1', name: 'Backlog', type: 'backlog' as const }, teamKey: 'ABC',
       states: [{ id: 's1', name: 'Backlog', type: 'backlog' as const, position: 0 }, { id: 's2', name: 'Todo', type: 'unstarted' as const, position: 1 }],
       labels: [], milestones: [], openBlockers: [], depsVerifiable: true, comments: [], teamLabels: [{ id: 'r', name: 'Ready', color: '#fff', isGroup: false, scope: 'team' as const }] };
-    expect(evaluateApproval(base, DEFAULT_WORKFLOW, true).eligible).toBe(true);
+    expect(evaluateApproval(base, DEFAULT_WORKFLOW, true, OK_SCOPE).eligible).toBe(true);
     const strict = { ...DEFAULT_WORKFLOW, readiness: { ...DEFAULT_WORKFLOW.readiness, requireMilestone: true, requirePriority: true, requireClassificationLabel: true } };
-    expect(evaluateApproval(base, strict, true).checks.filter((c) => !c.ok).map((c) => c.id).sort()).toEqual(['classification', 'milestone', 'priority']);
-    expect(evaluateApproval({ ...base, teamLabels: [] }, DEFAULT_WORKFLOW, true).checks.find((c) => c.id === 'ready-label')!.ok).toBe(false); // label missing: DevFlow does not create labels
-    expect(evaluateApproval({ ...base, depsVerifiable: false }, DEFAULT_WORKFLOW, true).eligible).toBe(false); // cannot verify dependencies
-    expect(evaluateApproval({ ...base, states: [base.states[0]!] }, DEFAULT_WORKFLOW, true).checks.find((c) => c.id === 'todo-state')!.ok).toBe(false);
+    expect(evaluateApproval(base, strict, true, OK_SCOPE).checks.filter((c) => !c.ok).map((c) => c.id).sort()).toEqual(['classification', 'milestone', 'priority']);
+    expect(evaluateApproval({ ...base, teamLabels: [] }, DEFAULT_WORKFLOW, true, OK_SCOPE).checks.find((c) => c.id === 'ready-label')!.ok).toBe(false); // label missing: DevFlow does not create labels
+    expect(evaluateApproval({ ...base, depsVerifiable: false }, DEFAULT_WORKFLOW, true, OK_SCOPE).eligible).toBe(false); // cannot verify dependencies
+    expect(evaluateApproval({ ...base, states: [base.states[0]!] }, DEFAULT_WORKFLOW, true, OK_SCOPE).checks.find((c) => c.id === 'todo-state')!.ok).toBe(false);
     expect(parseCtx({ issue: { id: 'x' } }, [])).toBeUndefined(); // malformed live data is not trusted
   });
 });

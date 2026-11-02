@@ -11,13 +11,17 @@ export function demoConfig(): Config {
     obsidian: { vault: 'Demo-Vault', vaultPath: '/example/vault' },
     review: { checkName: 'independent-review', passedLabel: 'review:passed', findingsLabel: 'review:findings' },
     projects: [
-      { id: 'atlas', name: 'Atlas Platform (demo)', linear: { teamKey: 'ATL', projects: [] }, github: { repos: ['demo-org/atlas'] },
+      // names ONE Linear project of team ATL: "Atlas Labs" and unprojected ATL issues are NOT covered by it
+      { id: 'atlas', name: 'Atlas Platform (demo)', linear: { teamKey: 'ATL', projects: ['Atlas'] }, github: { repos: ['demo-org/atlas'] },
         knowledge: [
           { title: 'Atlas architecture', kind: 'obsidian', path: 'Projects/Atlas/Architecture.md' },
           { title: 'Repo contract', kind: 'repo', repo: 'demo-org/atlas', path: 'docs/CONTRACT.md', ref: 'main' },
         ] },
+      // legacy whole-team style entry: covers every PROJECT of team BCN (but not its unprojected issues)
       { id: 'beacon', name: 'Beacon Mobile (demo)', linear: { teamKey: 'BCN', projects: [] }, github: { repos: ['demo-org/beacon'] }, knowledge: [] },
     ],
+    // explicit team-level entry: its own vocabulary, write allowed, NO GitHub repository
+    teams: [{ key: 'ZED', write: true, workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'], classificationLabels: ['Chore'], readiness: { minDescriptionChars: 10 } } }],
   });
 }
 
@@ -40,6 +44,10 @@ const PRS: PrSpec[] = [
   { n: 15, repo: 'demo-org/atlas', branch: 'chore/bump-deps', title: 'Bump dependencies', state: 'open', checks: [OK], ageH: 12 },
   { n: 16, repo: 'demo-org/atlas', branch: 'atl-9-cron', title: 'ATL-9 migrate cron (abandoned)', state: 'closed', checks: [], ageH: 280 },
   { n: 2, repo: 'demo-org/beacon', branch: 'bcn-2-push', title: 'BCN-2 push notifications', state: 'open', draft: true, checks: [], ageH: 2 },
+  // scope traps: each mentions a ticket whose project/team is NOT served by this repository, so it must stay unlinked
+  { n: 7, repo: 'demo-org/beacon', branch: 'atl-3-from-beacon', title: 'ATL-3 mention from the wrong repository', state: 'open', checks: [OK], ageH: 4 },
+  { n: 20, repo: 'demo-org/atlas', branch: 'atl-20-inbox', title: 'ATL-20 unprojected issue (atlas repo is project-scoped)', state: 'open', checks: [OK], ageH: 5 },
+  { n: 21, repo: 'demo-org/atlas', branch: 'atl-21-lab-prototype', title: 'ATL-21 lab prototype (project Atlas Labs)', state: 'open', checks: [OK], ageH: 6 },
 ];
 const sha = (repoIdx: number, n: number) => (`${repoIdx}${n.toString(16)}`.padEnd(7, 'a') + 'b'.repeat(33)).slice(0, 40);
 
