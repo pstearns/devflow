@@ -1,8 +1,8 @@
 // Combines Linear + GitHub data into one derived, read-only Snapshot.
 import type {
-  ActivityEvent, AttentionItem, Evidence, Issue, KnowledgeLink, PullRequest, ProjectInfo, SourceHealth, Snapshot, Stage, Tri,
+  ActivityEvent, AttentionItem, Evidence, Issue, KnowledgeLink, LabelDef, PullRequest, ProjectInfo, SourceHealth, Snapshot, Stage, Tri,
 } from '../shared/types.ts';
-import type { Config, ProjectCfg } from './config.ts';
+import { DEFAULT_WORKFLOW, type Config, type ProjectCfg } from './config.ts';
 import { buildMilestones, type LinearProjectData } from './linear.ts';
 import type { RepoData } from './github.ts';
 import { matchPrs } from './match.ts';
@@ -17,6 +17,7 @@ export interface BuildInput {
   github: Map<string, RepoData>; // by owner/repo
   health: SourceHealth[];
   dataAt?: string;
+  write?: { enabled: boolean; reason?: string };
 }
 
 const DAY = 86400000;
@@ -59,11 +60,13 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], cfg: Config, now: 
   const t = issue.state.type;
   const resolved = t === 'completed' || t === 'canceled';
   const marker = !resolved && issue.openBlockers.length === 0
-    ? (/blocked/i.test(issue.state.name) ? `Linear state "${issue.state.name}"` : issue.labels.find((l) => /^blocked$/i.test(l)) ? 'Linear label "blocked"' : undefined)
+    ? (/blocked/i.test(issue.state.name) ? `Linear state "${issue.state.name}"` : issue.labels.find((l) => /^blocked$/i.test(l.name)) ? 'Linear label "blocked"' : undefined)
     : undefined;
   issue.blockedMarker = marker;
-  issue.readiness = resolved ? 'na' : issue.openBlockers.length || marker ? 'blocked' : t === 'unstarted' ? 'ready' : t === 'backlog' || t === 'triage' ? 'not-ready' : 'na';
+  issue.readiness = 'na'; // set below, once the stage is known
 
+  const wf = cfg.projects.find((p) => p.id === issue.projectId)?.workflow ?? DEFAULT_WORKFLOW;
+  const hasLabel = (name: string) => issue.labels.some((l) => l.name.toLowerCase() === name.toLowerCase());
   const primary = pickPrimary(prs);
   issue.primaryPrKey = primary?.key;
   const lv = (label: string): Evidence => ({ source: 'Linear state', label, url: issue.url });
@@ -95,12 +98,21 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], cfg: Config, now: 
   } else if (t === 'started') {
     stage = /review/i.test(issue.state.name) ? 'review' : 'implementation';
     issue.stageEvidence.push(lv(`State: ${issue.state.name}${stage === 'review' ? ' (no PR evidence)' : ''}`));
-  } else if (t === 'unstarted') { stage = 'ready'; issue.stageEvidence.push(lv(`State: ${issue.state.name}`)); }
-  else if (t === 'backlog' || t === 'triage') { stage = 'discovery'; issue.stageEvidence.push(lv(`State: ${issue.state.name}`)); }
+  } else if (t === 'unstarted' || t === 'backlog' || t === 'triage') {
+    // Ready is an authorization: it needs BOTH an unstarted (Todo) state and the Ready label.
+    if (hasLabel(wf.readyLabel) && t === 'unstarted') { stage = 'ready'; issue.stageEvidence.push(lv(`State: ${issue.state.name} + label "${wf.readyLabel}"`)); }
+    else {
+      const disc = wf.discoveryLabels.find(hasLabel);
+      stage = disc ? 'discovery' : 'backlog';
+      issue.stageEvidence.push(lv(disc ? `Label "${disc}" (state ${issue.state.name})` : `State: ${issue.state.name}${t === 'unstarted' ? ` — not authorized (no "${wf.readyLabel}" label)` : ''}`));
+      if (hasLabel(wf.readyLabel)) issue.stageEvidence.push(lv(`Label "${wf.readyLabel}" is present but the state is ${issue.state.name}, not an unstarted state; not treated as Ready`));
+    }
+  }
   issue.stage = stage;
+  issue.readiness = resolved ? 'na' : issue.openBlockers.length || marker ? 'blocked' : stage === 'ready' ? 'ready' : stage === 'backlog' || stage === 'discovery' ? 'not-ready' : 'na';
 
   const noPr = (): ReturnType<typeof status> =>
-    t === 'canceled' || !stage || stage === 'discovery' || stage === 'ready'
+    t === 'canceled' || !stage || stage === 'backlog' || stage === 'discovery' || stage === 'ready'
       ? status('na', 'Work has not reached this gate')
       : status('unknown', 'No linked PR evidence');
   issue.gates = {
@@ -125,15 +137,20 @@ export function buildSnapshot(inp: BuildInput): Snapshot {
   const prs: PullRequest[] = [];
   const milestones = [] as Snapshot['milestones'];
   const projects: ProjectInfo[] = [];
+  const labels: LabelDef[] = [];
 
   for (const p of cfg.projects) {
     const ld = inp.linear.get(p.id);
     projects.push({
       id: p.id, name: p.name, linearUrl: ld?.projectUrl,
+      workflow: { readyLabel: p.workflow.readyLabel, discoveryLabels: p.workflow.discoveryLabels, classificationLabels: p.workflow.classificationLabels, protectedLabels: p.workflow.protectedLabels },
       repos: p.repos.map((r) => ({ repo: r, url: `https://github.com/${r}`, actionsUrl: `https://github.com/${r}/actions` })),
       knowledge: knowledgeFor(p, cfg, ld?.documents ?? []),
     });
     if (ld) {
+      const low = (x: string) => x.toLowerCase();
+      const prot = [p.workflow.readyLabel, ...p.workflow.protectedLabels].map(low);
+      for (const l of ld.labels) labels.push({ ...l, projectId: p.id, protected: prot.includes(low(l.name)), classification: p.workflow.classificationLabels.map(low).includes(low(l.name)) });
       for (const i of ld.issues) i.childIdentifiers = []; // cached issue objects are reused across builds
       const byId = new Map(ld.issues.map((i) => [i.identifier, i]));
       for (const i of ld.issues) if (i.parentIdentifier) byId.get(i.parentIdentifier)?.childIdentifiers.push(i.identifier);
@@ -168,7 +185,7 @@ export function buildSnapshot(inp: BuildInput): Snapshot {
   const attention = buildAttention(issues, prs, milestones, inp.health, cfg, nowMs);
   return {
     generatedAt: now.toISOString(), dataAt: inp.dataAt ?? now.toISOString(), mode, staleAfterSeconds: cfg.staleAfterMinutes * 60, staleDays: cfg.staleDays,
-    projects, issues, milestones, prs, activity, attention, health: inp.health, prompts: cfg.prompts,
+    projects, issues, milestones, prs, activity, attention, health: inp.health, prompts: cfg.prompts, labels, write: inp.write ?? { enabled: false },
   };
 }
 

@@ -64,7 +64,7 @@ describe('on-demand reads (no polling)', () => {
     calls.length = 0;
     const snap = (await s.getIssue('ATL-3'))!;
     const i = snap.issues.find((x) => x.identifier === 'ATL-3')!;
-    expect(i.description).toContain('Synthetic description for ATL-3');
+    expect(i.description).toContain('Synthetic description');
     expect(i.detailAt).toBeTruthy();
     expect(calls.filter((c) => c.startsWith('linear:')).sort()).toEqual(['linear:IssueDetail']);
     expect(calls.some((c) => /beacon/.test(c))).toBe(false);

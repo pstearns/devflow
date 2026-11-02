@@ -5,6 +5,11 @@ import { loadConfig, loadEnvFile, type Config } from './config.ts';
 import { demoConfig, demoFetch } from './demo.ts';
 import { buildApp } from './app.ts';
 import { SnapshotService } from './service.ts';
+import { LinearClient } from './linear.ts';
+import { LinearWriteClient } from './linear-write.ts';
+import { LinearActions } from './actions.ts';
+import { DEMO_READ_KEY, DEMO_WRITE_KEY } from './demo-linear.ts';
+import { randomBytes } from 'node:crypto';
 
 const here = dirname(fileURLToPath(import.meta.url));
 // Works from source (server/) and from the compiled build (dist-server/server/).
@@ -34,13 +39,26 @@ cfg = cfg!;
 
 let lastRequest = Date.now();
 const accessLog = process.env.DEVFLOW_ACCESS_LOG === '1'; // opt-in diagnostics: method + path only
+const demoFetchImpl = demo ? demoFetch() : undefined;
 const service = new SnapshotService(
   cfg,
   demo
-    ? { linearKey: 'demo', githubToken: 'demo', fetchImpl: demoFetch(), mode: 'demo' }
+    ? { linearKey: 'demo', githubToken: 'demo', fetchImpl: demoFetchImpl, mode: 'demo' }
     : { linearKey: process.env.LINEAR_API_KEY?.trim() || undefined, githubToken: process.env.GITHUB_TOKEN?.trim() || undefined },
 );
-const app = await buildApp(service, { distDir: distDir!, onRequest: (m, u) => { lastRequest = Date.now(); if (accessLog) console.log(`${new Date().toISOString()} ${m} ${u.split('?')[0]}`); } });
+// Controlled Linear actions need their OWN credential. It must differ from the read key, so the read key can never write.
+const readKey = demo ? DEMO_READ_KEY : process.env.LINEAR_API_KEY?.trim();
+const writeKey = demo ? DEMO_WRITE_KEY : process.env.LINEAR_WRITE_API_KEY?.trim();
+let actions: LinearActions | undefined;
+if (readKey) {
+  const fetchImpl = demo ? demoFetchImpl : undefined;
+  const write = writeKey && writeKey !== readKey ? new LinearWriteClient(writeKey, fetchImpl) : undefined;
+  if (writeKey && writeKey === readKey) console.warn('DevFlow warning: LINEAR_WRITE_API_KEY equals LINEAR_API_KEY; write access stays disabled (use a separate key).');
+  service.setWriteInfo(write ? { enabled: true } : { enabled: false, reason: 'Linear write access is not configured: set LINEAR_WRITE_API_KEY to a separate Linear personal API key with Write permission limited to the configured team(s).' });
+  actions = new LinearActions({ cfg, read: new LinearClient(readKey, fetchImpl), write, service, csrf: randomBytes(24).toString('hex'), log: (l) => console.log(`DevFlow ${l}`) });
+}
+const app = await buildApp(service, {
+  actions, distDir: distDir!, onRequest: (m, u) => { lastRequest = Date.now(); if (accessLog) console.log(`${new Date().toISOString()} ${m} ${u.split('?')[0]}`); } });
 
 const HOST = '127.0.0.1'; // loopback only; never exposed to the LAN
 const PORT = Number(process.env.DEVFLOW_PORT) || cfg.port; // exactly one port: no scanning, no silent drift

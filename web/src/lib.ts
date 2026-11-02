@@ -50,6 +50,7 @@ export interface Live {
   loading: boolean;
   refresh: () => void; // explicit user action: re-read everything
   openIssue: (identifier: string) => void; // re-read just this issue if its detail is missing/stale
+  applySnapshot: (s: Snapshot) => void; // a verified action result carries the updated snapshot
   issueLoading?: string;
   issueError?: string;
 }
@@ -107,7 +108,7 @@ export function useSnapshot(): Live {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [load]);
-  return { snap, error, loading, refresh: () => load(true), openIssue, issueLoading, issueError };
+  return { snap, error, loading, refresh: () => load(true), openIssue, applySnapshot: setSnap, issueLoading, issueError };
 }
 
 export function relTime(iso: string | undefined, now = Date.now()): string {
@@ -120,9 +121,9 @@ export function relTime(iso: string | undefined, now = Date.now()): string {
 }
 export const fullTime = (iso?: string) => (iso ? new Date(iso).toLocaleString() : '');
 
-export type Bucket = 'backlog' | 'ready' | 'progress' | 'review' | 'done' | 'canceled' | 'other';
+export type Bucket = 'backlog' | 'discovery' | 'ready' | 'progress' | 'review' | 'done' | 'canceled' | 'other';
 export const BUCKETS: { id: Bucket; label: string }[] = [
-  { id: 'backlog', label: 'Backlog / discovery' }, { id: 'ready', label: 'Ready' }, { id: 'progress', label: 'In progress' },
+  { id: 'backlog', label: 'Backlog' }, { id: 'discovery', label: 'Discovery' }, { id: 'ready', label: 'Ready' }, { id: 'progress', label: 'In progress' },
   { id: 'review', label: 'In review' }, { id: 'done', label: 'Done' }, { id: 'canceled', label: 'Canceled' },
 ];
 export function bucketOf(i: Issue): Bucket {
@@ -132,7 +133,8 @@ export function bucketOf(i: Issue): Bucket {
     case 'review': case 'merge': return 'review';
     case 'implementation': case 'ci': return 'progress';
     case 'ready': return 'ready';
-    case 'discovery': return 'backlog';
+    case 'backlog': return 'backlog';
+    case 'discovery': return 'discovery';
     default: return 'other';
   }
 }
@@ -157,3 +159,18 @@ export async function copyText(text: string): Promise<boolean> {
 }
 
 export const PRIORITIES = [{ v: 1, l: 'Urgent' }, { v: 2, l: 'High' }, { v: 3, l: 'Medium' }, { v: 4, l: 'Low' }, { v: 0, l: 'No priority' }];
+
+/** Selected label names (any-of) live in the URL so filtered views are linkable. */
+export const parseLabelParam = (v: string | undefined): string[] => (v ? v.split(',').map((x) => x.trim()).filter(Boolean) : []);
+export const matchesLabels = (labels: { name: string }[], selected: string[]) =>
+  selected.length === 0 || labels.some((l) => selected.some((s) => s.toLowerCase() === l.name.toLowerCase()));
+
+/** POST to a controlled Linear action. The CSRF token came from a same-origin GET; the browser adds the Origin header. */
+export async function postAction(kind: string, csrf: string, body: Record<string, unknown>): Promise<{ ok: true; message: string; snapshot: Snapshot } | { ok: false; error: string; checks?: { id: string; label: string; ok: boolean; detail: string }[] }> {
+  try {
+    const r = await fetch(`/api/actions/${kind}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-devflow-csrf': csrf }, body: JSON.stringify(body) });
+    const j = (await r.json()) as { ok?: boolean; error?: string; message?: string; snapshot?: Snapshot; checks?: never };
+    if (r.ok && j.ok && j.snapshot) return { ok: true, message: j.message ?? 'Done', snapshot: j.snapshot };
+    return { ok: false, error: j.error ?? `Request failed (HTTP ${r.status})`, checks: j.checks };
+  } catch { return { ok: false, error: 'Cannot reach the DevFlow server' }; }
+}

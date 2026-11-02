@@ -1,4 +1,6 @@
 import type { AttentionItem, Issue, IssueRef, KnowledgeLink, ProjectInfo, PullRequest, Snapshot } from '../../../shared/types.ts';
+import { IssueActions } from './Actions.tsx';
+import { IssueLabels } from './Labels.tsx';
 import { Lifecycle } from './Lifecycle.tsx';
 import { Prompts } from './Prompts.tsx';
 import { Card, EvidenceList, Ext, Pill, Tag, Time, btn } from './ui.tsx';
@@ -99,7 +101,7 @@ function PrBlock({ pr }: { pr: PullRequest }) {
   );
 }
 
-export function TicketDetail({ issue, snap, onOpen, loading, error }: { issue: Issue; snap: Snapshot; onOpen: (id: string) => void; loading?: boolean; error?: string }) {
+export function TicketDetail({ issue, snap, onOpen, loading, error, onResult }: { issue: Issue; snap: Snapshot; onOpen: (id: string) => void; loading?: boolean; error?: string; onResult: (s: Snapshot, message: string) => void }) {
   const project = snap.projects.find((p) => p.id === issue.projectId);
   const ms = snap.milestones.find((m) => m.id === issue.milestoneId);
   const prs = issue.prKeys.map((k) => snap.prs.find((p) => p.key === k)).filter((p): p is PullRequest => !!p);
@@ -115,8 +117,10 @@ export function TicketDetail({ issue, snap, onOpen, loading, error }: { issue: I
           {issue.rework.length > 0 && <Tag tone="bad">rework</Tag>}
           {issue.readiness === 'blocked' && <Tag tone="bad">blocked</Tag>}
           {issue.stale && <Tag tone="warn">stale</Tag>}
+          <span className="ml-auto"><IssueActions issue={issue} snap={snap} onResult={onResult} /></span>
         </div>
         <h3 className="mt-0.5 text-[15px] font-semibold leading-snug">{issue.title}</h3>
+        {issue.labels.length > 0 && <div className="mt-1"><IssueLabels labels={issue.labels} project={project} /></div>}
         <div className="text-[12px] text-muted">{project?.name} · opens in Linear for editing; DevFlow is read-only</div>
       </div>
 
@@ -139,7 +143,7 @@ export function TicketDetail({ issue, snap, onOpen, loading, error }: { issue: I
           <Row k="Priority">{issue.priorityLabel}</Row>
           <Row k="Assignee">{issue.assignee ?? <span className="text-muted">unassigned</span>}</Row>
           <Row k="Milestone">{ms && !ms.isUnassigned ? <><Ext href={ms.url}>{ms.name}</Ext> {ms.targetDate && <span className="text-muted">target {ms.targetDate}</span>}</> : <span className="text-muted">none</span>}</Row>
-          <Row k="Labels">{issue.labels.length ? issue.labels.map((l) => <Tag key={l}>{l}</Tag>) : <span className="text-muted">none</span>}</Row>
+          <Row k="Labels">{issue.labels.length ? <IssueLabels labels={issue.labels} project={project} /> : <span className="text-muted">none</span>}</Row>
           <Row k="Parent">{issue.parentIdentifier ? <button className="mono text-accent" onClick={() => onOpen(issue.parentIdentifier!)}>{issue.parentIdentifier}</button> : <span className="text-muted">none</span>}</Row>
           <Row k="Sub-tasks">{children.length ? children.map((c) => <div key={c.id}><button className="mono text-accent" onClick={() => onOpen(c.identifier)}>{c.identifier}</button> {c.title} <Tag>{c.state.name}</Tag></div>) : <span className="text-muted">none</span>}</Row>
           <Row k="Blocked by"><RefList refs={issue.blockedBy} empty="nothing" /></Row>

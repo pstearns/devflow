@@ -8,12 +8,12 @@ describe('Linear normalization', () => {
   it('rejects malformed issues and survives hostile fields', () => {
     expect(normalizeIssue(null, 'p')).toBeUndefined();
     expect(normalizeIssue({ id: 'x', identifier: 'not an id' }, 'p')).toBeUndefined();
-    const i = normalizeIssue({ id: 'u', identifier: 'cra-61', title: 42, state: 'weird', url: 'javascript:alert(1)', priority: 'high', labels: { nodes: [1, { name: 'ok' }] }, relations: 'x' }, 'p')!;
+    const i = normalizeIssue({ id: 'u', identifier: 'cra-61', title: 42, state: 'weird', url: 'javascript:alert(1)', priority: 'high', labels: { nodes: [1, { name: 'no id' }, { id: 'l1', name: 'ok', color: 'javascript:alert(1)' }] }, relations: 'x' }, 'p')!;
     expect(i.identifier).toBe('CRA-61');
     expect(i.title).toBe('(untitled)');
     expect(i.url).toBeUndefined();
     expect(i.state.type).toBe('unknown');
-    expect(i.labels).toEqual(['ok']);
+    expect(i.labels).toEqual([{ id: 'l1', name: 'ok', color: '#8b97a7' }]); // bad color never reaches a style
     expect(i.priority).toBe(0);
   });
   it('maps blocking relations in the right direction and ignores other relation types', () => {
@@ -103,6 +103,19 @@ describe('read-only guards', () => {
 });
 
 describe('config', () => {
+  it('the shipped example config parses and carries the workflow policy', async () => {
+    const { readFileSync } = await import('node:fs');
+    const c = parseConfig(JSON.parse(readFileSync(new URL('../devflow.config.example.json', import.meta.url), 'utf8')));
+    expect(c.projects[0]!.workflow).toMatchObject({ readyLabel: 'Ready', todoState: 'Todo', backlogState: 'Backlog' });
+    expect(c.projects[0]!.workflow.readiness.requireNoOpenBlockers).toBe(true);
+  });
+  it('workflow settings are per project, validated, and have generic defaults (nothing project-specific built in)', () => {
+    const c = parseConfig({ projects: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B', workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'], readiness: { minDescriptionChars: 5, requireMilestone: true } } }] });
+    expect(c.projects[0]!.workflow.readyLabel).toBe('Ready');
+    expect(c.projects[1]!.workflow).toMatchObject({ readyLabel: 'Go', discoveryLabels: ['Spike'] });
+    expect(c.projects[1]!.workflow.readiness).toMatchObject({ minDescriptionChars: 5, requireMilestone: true, requireDescription: true });
+    expect(() => parseConfig({ projects: [{ id: 'a', name: 'A', workflow: { readyLabel: '  ' } }] })).toThrow(/readyLabel/);
+  });
   it('never exits on idle by default (opt-in only)', () => {
     expect(parseConfig({ projects: [] }).idleExitMinutes).toBe(0);
     expect(parseConfig({ projects: [], idleExitMinutes: 30 }).idleExitMinutes).toBe(30);

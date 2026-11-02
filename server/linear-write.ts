@@ -1,0 +1,44 @@
+// The ONLY place that can change anything in Linear. It uses its own credential (LINEAR_WRITE_API_KEY), never the
+// read key, and can send exactly the operations below. There is no generic "send this GraphQL" method, so API-supplied
+// or browser-supplied text can never become an operation. Not available: delete, archive, bulk update, team/project edits.
+import { linearSend } from './linear.ts';
+import { Limiter, SourceError, isObj } from './util.ts';
+
+const OPS = {
+  IssueAddLabel: 'mutation IssueAddLabel($id: String!, $labelId: String!) { issueAddLabel(id: $id, labelId: $labelId) { success } }',
+  IssueRemoveLabel: 'mutation IssueRemoveLabel($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }',
+  IssueUpdate: 'mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',
+  CommentCreate: 'mutation CommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success } }',
+  Viewer: 'query Viewer { viewer { name } }',
+} as const;
+type OpName = keyof typeof OPS;
+
+const ID_RE = /^[A-Za-z0-9_-]{1,100}$/; // Linear UUIDs / our synthetic ids
+
+export class LinearWriteClient {
+  private limit = new Limiter(1); // writes are strictly serialized
+  constructor(private token: string, private fetchImpl: typeof fetch = fetch) {}
+
+  private async run(op: OpName, variables: Record<string, unknown>, field?: string): Promise<Record<string, unknown>> {
+    const data = await this.limit.run(() => linearSend(this.fetchImpl, this.token, OPS[op], variables));
+    if (field) {
+      const r = data[field];
+      if (!isObj(r) || r.success !== true) throw new SourceError('http', `Linear did not confirm ${op}`);
+    }
+    return data;
+  }
+  private id(v: string) { if (!ID_RE.test(v)) throw new Error('invalid id'); return v; }
+
+  async addLabel(issueId: string, labelId: string) { return this.run('IssueAddLabel', { id: this.id(issueId), labelId: this.id(labelId) }, 'issueAddLabel'); }
+  async removeLabel(issueId: string, labelId: string) { return this.run('IssueRemoveLabel', { id: this.id(issueId), labelId: this.id(labelId) }, 'issueRemoveLabel'); }
+  async setState(issueId: string, stateId: string) { return this.run('IssueUpdate', { id: this.id(issueId), input: { stateId: this.id(stateId) } }, 'issueUpdate'); }
+  async setMilestone(issueId: string, milestoneId: string | null) { return this.run('IssueUpdate', { id: this.id(issueId), input: { projectMilestoneId: milestoneId === null ? null : this.id(milestoneId) } }, 'issueUpdate'); }
+  async comment(issueId: string, body: string) {
+    if (!body.trim() || body.length > 4000) throw new Error('invalid comment');
+    return this.run('CommentCreate', { input: { issueId: this.id(issueId), body } }, 'commentCreate');
+  }
+  async viewerName(): Promise<string> {
+    const d = await this.run('Viewer', {});
+    return isObj(d.viewer) && typeof d.viewer.name === 'string' ? d.viewer.name.slice(0, 100) : 'unknown user';
+  }
+}

@@ -3,6 +3,8 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
 import type { SnapshotService } from './service.ts';
 import { SourceError } from './util.ts';
+import { timingSafeEqual } from 'node:crypto';
+import { ActionError, type LinearActions } from './actions.ts';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
@@ -11,15 +13,16 @@ const MIME: Record<string, string> = {
 const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
 const READY_REFRESH_LIMIT_MS = 120_000;
 
-export interface AppOptions { distDir: string; onRequest?: (method: string, url: string) => void }
+export interface AppOptions { distDir: string; onRequest?: (method: string, url: string) => void; actions?: LinearActions }
 
 export async function buildApp(service: SnapshotService, opts: AppOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   const webReady = existsSync(`${opts.distDir}/index.html`);
 
   app.addHook('onRequest', async (req, reply) => {
-    // Read-only server: nothing but GET/HEAD is ever accepted.
-    if (req.method !== 'GET' && req.method !== 'HEAD') return reply.code(405).header('allow', 'GET, HEAD').send({ error: 'read-only' });
+    // Only GET/HEAD are accepted, except POST under /api/actions/ (the controlled Linear actions, see below).
+    const isAction = req.method === 'POST' && (req.url.split('?')[0] ?? '').startsWith('/api/actions/');
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !isAction) return reply.code(405).header('allow', 'GET, HEAD').send({ error: 'read-only' });
     // Defend against DNS rebinding: only answer for loopback host names.
     if (!LOCAL_HOST.test(req.headers.host ?? '')) return reply.code(403).send({ error: 'forbidden host' });
     opts.onRequest?.(req.method, req.url);
@@ -47,6 +50,51 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
     if (!/^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/.test(id)) return reply.code(400).send({ error: 'invalid identifier' });
     try { return (await service.getIssue(id)) ?? reply.code(404).send({ error: 'unknown issue' }); } catch (e) { return fail(reply, e); }
   });
+  // ---- controlled Linear actions -------------------------------------------------------------------------------
+  const actions = opts.actions;
+  const csrfOk = (given: unknown) => {
+    if (!actions || typeof given !== 'string') return false;
+    const a = Buffer.from(given), b = Buffer.from(actions.csrf);
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
+  // Live action options (reads only). Also hands the same-origin page its CSRF token (cross-origin pages cannot read it).
+  app.get('/api/issue-actions/:identifier', async (req, reply) => {
+    reply.header('cache-control', 'no-store');
+    if (!actions) return reply.code(404).send({ error: 'actions unavailable' });
+    try { return await actions.options((req.params as { identifier: string }).identifier); } catch (e) { return actionFail(reply, e); }
+  });
+  const actionFail = (reply: import('fastify').FastifyReply, e: unknown) => {
+    if (e instanceof ActionError) return reply.code(e.status).send({ ok: false, code: e.code, error: e.message, checks: e.checks });
+    return fail(reply, e);
+  };
+  app.post('/api/actions/:kind', { bodyLimit: 8 * 1024 }, async (req, reply) => {
+    reply.header('cache-control', 'no-store');
+    if (!actions) return reply.code(404).send({ ok: false, code: 'disabled', error: 'actions unavailable' });
+    const host = req.headers.host ?? '';
+    const origin = req.headers.origin;
+    // CSRF defence in depth: exact same-origin, fetch-metadata (when sent), JSON-only (not a "simple" form post), secret token.
+    if (origin !== `http://${host}`) return reply.code(403).send({ ok: false, code: 'bad-origin', error: 'Cross-origin requests are refused' });
+    const site = req.headers['sec-fetch-site'];
+    if (site !== undefined && site !== 'same-origin') return reply.code(403).send({ ok: false, code: 'bad-origin', error: 'Cross-origin requests are refused' });
+    if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return reply.code(415).send({ ok: false, code: 'bad-content-type', error: 'JSON required' });
+    if (!csrfOk(req.headers['x-devflow-csrf'])) return reply.code(403).send({ ok: false, code: 'bad-csrf', error: 'Missing or invalid CSRF token; reload DevFlow' });
+    const b = req.body;
+    if (typeof b !== 'object' || b === null || Array.isArray(b)) return reply.code(400).send({ ok: false, code: 'bad-input', error: 'JSON object required' });
+    const body = b as Record<string, unknown>;
+    const identifier = typeof body.identifier === 'string' ? body.identifier : '';
+    const ids = (v: unknown) => (Array.isArray(v) ? v : []).slice(0, 30);
+    try {
+      switch ((req.params as { kind: string }).kind) {
+        case 'labels': return await actions.labels(identifier, ids(body.add) as string[], ids(body.remove) as string[]);
+        case 'status': return await actions.status(identifier, body.stateId as string);
+        case 'milestone': return await actions.milestone(identifier, body.milestoneId === null ? null : (body.milestoneId as string));
+        case 'approve': return await actions.approve(identifier, body.confirm);
+        case 'revoke': return await actions.revoke(identifier, body.confirm, body.reason);
+        default: return reply.code(404).send({ ok: false, code: 'unknown-action', error: 'Unknown action' });
+      }
+    } catch (e) { return actionFail(reply, e); }
+  });
+
   // Liveness: process answers. Readiness: web build present and no refresh stuck. Neither calls Linear/GitHub.
   app.get('/api/healthz', async () => ({ ok: true }));
   app.get('/api/readyz', async (_req, reply) => {

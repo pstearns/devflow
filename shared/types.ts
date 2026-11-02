@@ -16,8 +16,9 @@ export interface Status {
   evidence: Evidence[];
 }
 
-export type Stage = 'discovery' | 'ready' | 'implementation' | 'ci' | 'review' | 'merge' | 'done';
+export type Stage = 'backlog' | 'discovery' | 'ready' | 'implementation' | 'ci' | 'review' | 'merge' | 'done';
 export const STAGES: { id: Stage; label: string }[] = [
+  { id: 'backlog', label: 'Backlog' },
   { id: 'discovery', label: 'Discovery' },
   { id: 'ready', label: 'Ready' },
   { id: 'implementation', label: 'Implementation' },
@@ -38,6 +39,18 @@ export interface IssueRef {
   resolved: boolean; // completed or canceled
 }
 
+/** A Linear label as returned by Linear (id, name and color are never invented). */
+export interface LabelRef { id: string; name: string; color: string }
+
+export interface LabelDef extends LabelRef {
+  projectId: string; // DevFlow project the label was retrieved for
+  isGroup: boolean; // group labels cannot be applied to issues
+  parent?: string;
+  scope: 'team' | 'workspace';
+  protected: boolean; // lifecycle authorization labels (e.g. Ready): never editable through the ordinary label menu
+  classification: boolean; // issue classification (Bug, Idea, …), separate from lifecycle stages
+}
+
 export interface Issue {
   id: string;
   identifier: string;
@@ -49,7 +62,7 @@ export interface Issue {
   priorityLabel: string;
   state: { name: string; type: StateType };
   assignee?: string;
-  labels: string[];
+  labels: LabelRef[];
   milestoneId?: string; // Linear milestone id, undefined = no milestone
   linearProjectName?: string;
   parentIdentifier?: string;
@@ -199,6 +212,7 @@ export interface KnowledgeLink {
 export interface ProjectInfo {
   id: string;
   name: string;
+  workflow: { readyLabel: string; discoveryLabels: string[]; classificationLabels: string[]; protectedLabels: string[] };
   linearUrl?: string;
   repos: { repo: string; url: string; actionsUrl: string }[];
   knowledge: KnowledgeLink[];
@@ -220,4 +234,26 @@ export interface Snapshot {
   attention: AttentionItem[];
   health: SourceHealth[];
   prompts: PromptDef[];
+  labels: LabelDef[]; // retrieved from Linear for the configured teams (live), not hard-coded
+  write: { enabled: boolean; reason?: string }; // Linear write credential configured? (GitHub is always read-only)
 }
+
+// ---- controlled Linear actions (the only write surface; GitHub is never written) ----
+export interface ActionCheck { id: string; label: string; ok: boolean; detail: string }
+
+export interface ActionOptions {
+  writeEnabled: boolean;
+  reason?: string; // why writes are disabled
+  csrf: string;
+  identifier: string;
+  title: string;
+  state: { id: string; name: string; type: StateType };
+  labels: { id: string; name: string; color: string; scope: 'team' | 'workspace'; applied: boolean; editable: boolean; reason?: string; classification: boolean; group?: string }[];
+  states: { id: string; name: string; type: StateType; current: boolean; allowed: boolean; reason?: string }[];
+  milestones: { current?: string; options: { id: string; name: string }[]; canChange: boolean; reason?: string };
+  approve: { eligible: boolean; already: boolean; checks: ActionCheck[]; todoState?: string };
+  revoke: { possible: boolean; reason?: string };
+}
+
+export interface ActionResult { ok: true; verified: true; message: string; snapshot: Snapshot }
+export interface ActionFailure { ok: false; code: string; error: string; checks?: ActionCheck[] }

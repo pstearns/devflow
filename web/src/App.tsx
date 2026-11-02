@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Lifecycle } from './components/Lifecycle.tsx';
 import { ProjectDetail, TicketDetail } from './components/Detail.tsx';
 import { Time, btn, select } from './components/ui.tsx';
+import type { Snapshot } from '../../shared/types.ts';
 import { VIEWS, useRoute, useSnapshot, relTime } from './lib.ts';
 import { Overview } from './views/Overview.tsx';
 import { Milestones } from './views/Milestones.tsx';
@@ -24,6 +25,8 @@ export function App() {
   const [theme, toggleTheme] = useTheme();
   const [now, setNow] = useState(Date.now());
   const [showHealth, setShowHealth] = useState(false);
+  const [notice, setNotice] = useState<string>();
+  const onResult = (s: Snapshot, message: string) => { live.applySnapshot(s); setNotice(message); setTimeout(() => setNotice(undefined), 6000); };
   // Only re-renders relative-time labels; makes no request and stops while the tab is hidden.
   useEffect(() => {
     const tick = () => { if (document.visibilityState === 'visible') setNow(Date.now()); };
@@ -90,6 +93,7 @@ export function App() {
         </div>
       </header>
 
+      {notice && <div role="status" className="border-b border-ok/50 bg-ok/10 px-4 py-1 text-ok">{notice}</div>}
       {snap?.mode === 'demo' && <div className="border-b border-warn/50 bg-warn/10 px-4 py-1 text-warn">DEMO MODE — all data is synthetic test fixtures. Nothing here comes from Linear or GitHub.</div>}
       {live.error && <div className="border-b border-bad/50 bg-bad/10 px-4 py-1 text-bad">{live.error}. {snap ? `Showing data read ${relTime(snap.dataAt, now)}. Press Refresh to retry.` : 'Is the DevFlow server running? (It exits after being idle; relaunch it.)'}</div>}
 
@@ -121,9 +125,9 @@ export function App() {
           ) : route.view === 'overview' ? (
             <Overview snap={snap} issues={issues} project={route.project} go={go} now={now} />
           ) : route.view === 'milestones' ? (
-            <Milestones snap={snap} issues={issues} project={route.project} route={route} go={go} onOpen={openTicket} />
+            <Milestones snap={snap} issues={issues} project={route.project} route={route} go={go} onOpen={openTicket} onResult={onResult} />
           ) : route.view === 'pipeline' ? (
-            <Pipeline snap={snap} issues={issues} onOpen={openTicket} now={now} />
+            <Pipeline snap={snap} issues={issues} onOpen={openTicket} now={now} route={route} go={go} project={route.project} onResult={onResult} />
           ) : (
             <Activity snap={snap} project={route.project} onOpen={openTicket} now={now} />
           )}
@@ -131,7 +135,7 @@ export function App() {
         {panelOpen && snap && (
           <aside className="w-full max-w-[480px] shrink-0 overflow-auto border-l border-line bg-bg p-4 max-md:fixed max-md:inset-0 max-md:z-10 max-md:max-w-none" aria-label="Details">
             <div className="mb-2 flex justify-end"><button className={btn} onClick={close}>Close ✕</button></div>
-            {selected ? <TicketDetail issue={selected} snap={snap} onOpen={openTicket} loading={live.issueLoading === selected.identifier} error={live.issueError} />
+            {selected ? <TicketDetail issue={selected} snap={snap} onOpen={openTicket} loading={live.issueLoading === selected.identifier} error={live.issueError} onResult={onResult} />
               : route.panel === 'project' && project ? <ProjectDetail project={project} snap={snap} /> : null}
           </aside>
         )}

@@ -1,6 +1,6 @@
 # DevFlow
 
-Read-only, local-first dashboard over **Linear** (GraphQL) and **GitHub** (REST): pipeline, milestones & tasks, PRs/CI/review evidence, activity, attention queue, prompt library, project knowledge links.
+Local-first dashboard over **Linear** (GraphQL) and **GitHub** (REST). **GitHub is strictly read-only. Linear is read-only unless you add a separate write key**, which enables a small set of controlled actions (see *Controlled Linear actions*). pipeline, milestones & tasks, PRs/CI/review evidence, activity, attention queue, prompt library, project knowledge links.
 
 React + Vite + Tailwind frontend, Fastify backend, no database. **No polling:** data is read only when you open the dashboard, press **Refresh**, or open an issue. With no browser connected, DevFlow makes zero Linear/GitHub requests. It binds to `127.0.0.1:4317` only.
 
@@ -43,14 +43,35 @@ Checks and reviews are treated as refreshable evidence even when the head SHA is
 | Variable | Minimum access |
 |---|---|
 | `LINEAR_API_KEY` | Personal API key, permission **Read** |
+| `LINEAR_WRITE_API_KEY` (optional) | A *separate* Linear personal API key, permission **Write**, limited to the configured team(s). Enables the action menu. Must differ from `LINEAR_API_KEY` or write stays disabled. |
 | `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions (and Commit statuses if available) |
 
 DevFlow never uses the `gh` CLI or any ambient identity. Tokens stay on the server: not sent to the browser, not logged, never in error text (upstream error bodies are not forwarded). `.env` and `devflow.config.json` are git-ignored; DevFlow warns at startup if `.env` is readable by other users. `PORT`/`HOST` in `.env` are ignored.
 CI evidence comes from GitHub Actions workflow runs for the PR's head commit. Check-run details (individual checks) need a permission this token setup does not expose, so they are shown as **Unavailable**, never as Passed; DevFlow does not ask for it. If a commit has no workflow run, its CI is **Unknown**.
 
+## Controlled Linear actions (optional)
+
+With a separate **`LINEAR_WRITE_API_KEY`** (a different personal API key from `LINEAR_API_KEY`, permission *Write*, access limited to the configured team(s)), each issue card and the detail panel get an **Actions** menu:
+
+| Action | Rules |
+|---|---|
+| Edit labels | Add/remove ordinary labels (atomic add/remove: other labels are never replaced). Group labels and **protected workflow labels (the Ready label)** cannot be edited here. |
+| Change status | Only allowed transitions: starting work needs approval; **Done needs a merged linked PR** (verified from GitHub); cancel and reopening are done in Linear; a Ready issue cannot be dropped to Backlog without revoking readiness. |
+| Set milestone | Only milestones of the issue's own Linear project; can be removed. |
+| **Approve for execution** | Checks the project's readiness policy against live Linear (state, Ready label exists, description, unresolved dependencies fully verified, optional milestone/priority/classification). Needs typed confirmation. Then moves to **Todo + Ready**, records an approval comment (who/when/checks) in Linear, re-reads Linear and verifies; rolls back if any step fails or the evidence cannot be confirmed. If a prerequisite cannot be verified, approval is refused and the failed checks are shown. |
+| Revoke readiness | Removes Ready, returns an unstarted issue to Backlog, records the revocation, verifies. Started work is refused. |
+
+Without the write key every action stays visible but disabled, with the reason. DevFlow never merges PRs, deletes or bulk-edits issues, starts agents, or writes to GitHub. Every action re-reads the issue, team labels and states from live Linear before acting; it never trusts cached data or browser-supplied names.
+
+**Security model:** POST is accepted only under `/api/actions/`, only from the loopback host, only with an exact same-origin `Origin`, `Sec-Fetch-Site: same-origin` (when sent), `Content-Type: application/json`, a per-process secret CSRF token, and a body under 8 KiB. The Linear write client can send exactly five fixed operations (`issueAddLabel`, `issueRemoveLabel`, `issueUpdate` limited to `stateId`/`projectMilestoneId`, `commentCreate`, `viewer`); the read key cannot write. Writes are serialized. Residual risk: any process running as a local user on this machine can reach `127.0.0.1:4317`, obtain the token and use the write capability, as with any local service; keep the write key off if that is unacceptable.
+
+## Lifecycle stages
+
+**Backlog → Discovery → Ready → Implementation → CI → Independent Review → Human Merge → Done**, derived from real Linear state and labels plus verified GitHub evidence. *Discovery* = a backlog/triage/Todo issue carrying one of the project's `discoveryLabels`; plain backlog issues are **Backlog**, not Discovery. *Ready* requires **both** an unstarted (Todo) state **and** the Ready label (a Todo issue without the label is "not authorized" and stays in Backlog). Classification labels (Idea, Bug, Security, Feature, Research, Tech Debt…) are shown as labels and filterable but are never stages. All label/state names are per-project configuration (`workflow` below), not code.
+
 ## Configuration (`devflow.config.json`)
 
-See `devflow.config.example.json`. Per project: `linear.teamKey` (+ optional `linear.projects`), `github.repos`, `knowledge` (Obsidian path, repo file, or URL). Top level: `staleAfterMinutes`, `staleDays`, `idleExitMinutes`, `obsidian.vault`/`vaultPath`, `prompts` (`{{project}}`, `{{ticket}}`, `{{milestone}}`), `review`.
+See `devflow.config.example.json`. Per project: `linear.teamKey` (+ optional `linear.projects`), `github.repos`, `knowledge` (Obsidian path, repo file, or URL). Per project `workflow` (all optional; defaults shown in the example): `readyLabel`, `discoveryLabels`, `classificationLabels`, `protectedLabels`, `todoState`, `backlogState`, and the `readiness` policy used by *Approve for execution*. Top level: `staleAfterMinutes`, `staleDays`, `idleExitMinutes`, `obsidian.vault`/`vaultPath`, `prompts` (`{{project}}`, `{{ticket}}`, `{{milestone}}`), `review`.
 
 **Independent review (Codex) evidence** is never assumed: it is *Passed* only if you configure where it is recorded (`review.checkName`, `review.passedLabel`, `review.findingsLabel`); otherwise *Unknown*.
 
@@ -68,6 +89,7 @@ Only `GET`/`HEAD` are served (others → 405); non-loopback `Host` headers are r
 
 ## Limitations
 
+- The action menu was tested against an in-memory fake Linear and against live Linear's read-only schema/queries; **no write has been sent to real Linear** (write key not configured).
 - Linear exposes no milestone URL; "Edit in Linear" opens the project.
 - GitHub: newest 100 PRs per repo; full evidence for open PRs and PRs updated in the last 14 days (max 30), up to 300 items per resource.
 - Descriptions over 10,000 characters are cut and marked as truncated.

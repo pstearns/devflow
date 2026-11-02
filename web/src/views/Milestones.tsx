@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react';
 import type { Issue, Milestone, Snapshot } from '../../../shared/types.ts';
+import { IssueActions } from '../components/Actions.tsx';
+import { IssueLabels, LabelFilter } from '../components/Labels.tsx';
 import { Prompts } from '../components/Prompts.tsx';
 import { Card, Empty, Ext, Pill, Tag, select } from '../components/ui.tsx';
-import { BUCKETS, PRIORITIES, bucketOf, type Route } from '../lib.ts';
+import { BUCKETS, PRIORITIES, bucketOf, matchesLabels, parseLabelParam, type Route } from '../lib.ts';
 
 function Progress({ m }: { m: Milestone }) {
   if (m.progress === null) return <span className="text-muted">no countable tasks</span>;
@@ -18,7 +20,7 @@ function Progress({ m }: { m: Milestone }) {
   );
 }
 
-function TaskRow({ i, depth, snap, onOpen, parentNote }: { i: Issue; depth: number; snap: Snapshot; onOpen: (id: string) => void; parentNote?: string }) {
+function TaskRow({ i, depth, snap, onOpen, parentNote, onResult }: { i: Issue; depth: number; snap: Snapshot; onOpen: (id: string) => void; parentNote?: string; onResult: (s: Snapshot, m: string) => void }) {
   const pr = snap.prs.find((p) => p.key === i.primaryPrKey);
   return (
     <tr className="align-top hover:bg-raised/50">
@@ -29,6 +31,7 @@ function TaskRow({ i, depth, snap, onOpen, parentNote }: { i: Issue; depth: numb
       <td className="max-w-[360px] py-1.5">
         <button className="text-left hover:underline" onClick={() => onOpen(i.identifier)}>{i.title}</button>
         {parentNote && <div className="text-[11px] text-muted">sub-task of {parentNote}</div>}
+        {i.labels.length > 0 && <div className="mt-0.5"><IssueLabels labels={i.labels} project={snap.projects.find((p) => p.id === i.projectId)} /></div>}
       </td>
       <td className="whitespace-nowrap"><Tag>{i.state.name}</Tag></td>
       <td className="whitespace-nowrap text-muted">{i.priorityLabel}</td>
@@ -38,13 +41,13 @@ function TaskRow({ i, depth, snap, onOpen, parentNote }: { i: Issue; depth: numb
       </td>
       <td className="whitespace-nowrap">{pr ? <><Ext href={pr.url} className="mono">#{pr.number}</Ext> <Pill status={pr.ci} compact /></> : <span className="text-muted">{i.stage && !['discovery', 'ready', 'done'].includes(i.stage) ? 'no PR evidence' : '—'}</span>}</td>
       <td className="whitespace-nowrap pr-3">{i.awaitingHuman.length ? <Tag tone="accent">{i.awaitingHuman[0]}</Tag> : i.rework.length ? <Tag tone="bad">↺ {i.rework[0]}</Tag> : i.stale ? <Tag tone="warn">stale</Tag> : ''}</td>
-      <td className="whitespace-nowrap pr-3"><Ext href={i.url} title="Open in Linear to edit">Linear</Ext></td>
+      <td className="whitespace-nowrap pr-3"><span className="flex items-center gap-2"><Ext href={i.url} title="Open in Linear to edit">Linear</Ext><IssueActions issue={i} snap={snap} onResult={onResult} compact /></span></td>
     </tr>
   );
 }
 
-export function Milestones({ snap, issues, project, route, go, onOpen }: {
-  snap: Snapshot; issues: Issue[]; project: string; route: Route; go: (p: Partial<Route>) => void; onOpen: (id: string) => void;
+export function Milestones({ snap, issues, project, route, go, onOpen, onResult }: {
+  snap: Snapshot; issues: Issue[]; project: string; route: Route; go: (p: Partial<Route>) => void; onOpen: (id: string) => void; onResult: (s: Snapshot, m: string) => void;
 }) {
   const f = route.params;
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -52,10 +55,11 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
   const set = (k: string, v: string) => go({ params: { [k]: v } });
 
   const issueBy = useMemo(() => new Map(snap.issues.map((i) => [i.identifier, i])), [snap]);
+  const selectedLabels = parseLabelParam(f.labels);
   const match = (i: Issue) =>
-    (!f.status || bucketOf(i) === f.status) && (!f.priority || String(i.priority) === f.priority) && (f.blocked !== '1' || i.readiness === 'blocked') &&
+    matchesLabels(i.labels, selectedLabels) && (!f.status || bucketOf(i) === f.status) && (!f.priority || String(i.priority) === f.priority) && (f.blocked !== '1' || i.readiness === 'blocked') &&
     (f.human !== '1' || i.awaitingHuman.length > 0) && (!q || `${i.identifier} ${i.title}`.toLowerCase().includes(q.toLowerCase()));
-  const filtering = !!(f.status || f.priority || f.blocked === '1' || f.human === '1' || q);
+  const filtering = !!(f.labels || f.status || f.priority || f.blocked === '1' || f.human === '1' || q);
 
   const milestones = snap.milestones
     .filter((m) => (project === 'all' || m.projectId === project) && (!f.milestone || m.id === f.milestone))
@@ -90,6 +94,7 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
         <select aria-label="Priority" className={select} value={f.priority ?? ''} onChange={(e) => set('priority', e.target.value)}>
           <option value="">Any priority</option>{PRIORITIES.map((p) => <option key={p.v} value={p.v}>{p.l}</option>)}
         </select>
+        <LabelFilter labels={snap.labels.filter((l) => project === 'all' || l.projectId === project)} selected={selectedLabels} onChange={(n) => set('labels', n.join(','))} />
         <label className="flex items-center gap-1"><input type="checkbox" checked={f.blocked === '1'} onChange={(e) => set('blocked', e.target.checked ? '1' : '')} /> Blocked only</label>
         <label className="flex items-center gap-1"><input type="checkbox" checked={f.human === '1'} onChange={(e) => set('human', e.target.checked ? '1' : '')} /> Awaiting me</label>
         <input aria-label="Search" placeholder="Search id or title" className={`${select} w-44`} value={q} onChange={(e) => setQ(e.target.value)} />
@@ -132,7 +137,7 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
                         <tr><th className="py-1 pl-3 font-medium">Task</th><th className="font-medium">Title</th><th className="font-medium">State</th><th className="font-medium">Priority</th><th className="font-medium">Readiness</th><th className="font-medium">PR / CI</th><th className="font-medium">Needs</th><th /></tr>
                       </thead>
                       <tbody className="divide-y divide-line">
-                        {out.map((r) => <TaskRow key={r.i.id} i={r.i} depth={r.depth} snap={snap} onOpen={onOpen} parentNote={r.note} />)}
+                        {out.map((r) => <TaskRow key={r.i.id} i={r.i} depth={r.depth} snap={snap} onOpen={onOpen} parentNote={r.note} onResult={onResult} />)}
                       </tbody>
                     </table>
                   </div>

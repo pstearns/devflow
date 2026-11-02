@@ -51,7 +51,7 @@ describe('snapshot over synthetic API', () => {
   it('follows pagination and reports demo mode', async () => {
     const snap = await demoSnap();
     expect(snap.mode).toBe('demo');
-    expect(snap.issues.filter((i) => i.identifier.startsWith('ATL-'))).toHaveLength(14);
+    expect(snap.issues.filter((i) => i.identifier.startsWith('ATL-'))).toHaveLength(19);
   });
   it('links PRs only on unambiguous identifier evidence', async () => {
     const snap = await demoSnap();
@@ -74,6 +74,38 @@ describe('snapshot over synthetic API', () => {
     expect(i('ATL-1').stage).toBe('done');
     expect(i('ATL-12').stage).toBeUndefined();
     expect(i('ATL-8').gates.ci.value).toBe('na');
+  });
+  it('classifies Backlog, Discovery and Ready from real Linear state + labels (not every backlog issue is Discovery)', async () => {
+    const snap = await demoSnap();
+    const i = (id: string) => snap.issues.find((x) => x.identifier === id)!;
+    expect(i('ATL-8').stage).toBe('discovery'); // Backlog state + Discovery label
+    expect(i('ATL-15').stage).toBe('backlog'); // Backlog state, no Discovery label
+    expect(i('ATL-7').stage).toBe('ready'); // Todo + Ready label
+    expect(i('ATL-16').stage).toBe('backlog'); // Todo but NOT authorized: no Ready label
+    expect(i('ATL-16').stageEvidence[0]!.label).toMatch(/not authorized/);
+    expect(i('ATL-6').stage).toBe('ready');
+    expect(i('ATL-6').readiness).toBe('blocked'); // Ready but an open blocker
+    expect(i('ATL-7').readiness).toBe('ready');
+    expect(i('ATL-15').readiness).toBe('not-ready');
+    // classification labels stay labels, never stages
+    expect(i('ATL-11').labels.map((l) => l.name)).toEqual(['Bug']);
+    expect(i('ATL-11').stage).toBe('implementation');
+  });
+  it('Ready requires BOTH the label and an unstarted state', async () => {
+    const f = demoFetch(now);
+    f.store.issues.ATL!.find((x) => x.n === 15)!.labels = ['Ready']; // Ready label on a Backlog-state issue
+    const snap = await new SnapshotService(demoConfig(), { linearKey: 'k', githubToken: 't', fetchImpl: f, mode: 'demo' }, () => now).get();
+    const i = snap.issues.find((x) => x.identifier === 'ATL-15')!;
+    expect(i.stage).toBe('backlog');
+    expect(i.stageEvidence.map((e) => e.label).join(' ')).toMatch(/not treated as Ready/);
+  });
+  it('retrieves labels dynamically with colors, scope, groups, and flags protected/classification labels', async () => {
+    const snap = await demoSnap();
+    const atl = snap.labels.filter((l) => l.projectId === 'atlas');
+    expect(atl.find((l) => l.name === 'Bug')).toMatchObject({ color: '#EB5757', scope: 'workspace', classification: true, protected: false });
+    expect(atl.find((l) => l.name === 'Ready')).toMatchObject({ protected: true });
+    expect(atl.find((l) => l.name === 'Area')).toMatchObject({ isGroup: true });
+    expect(atl.find((l) => l.name === 'Needs Design')).toMatchObject({ classification: false, protected: false }); // unknown label: works without code changes
   });
   it('flags blockers, stale work and overdue milestones as attention, labelled actionable vs suggestion', async () => {
     const snap = await demoSnap();

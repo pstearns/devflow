@@ -49,6 +49,11 @@ export class SnapshotService {
       this.backoff.set(cred, clampResume(this.clock(), e.resetAt ? Date.parse(e.resetAt) : undefined));
   }
 
+  /** Overridden when the write feature is attached (see actions.ts). */
+  writeStatus(): { enabled: boolean; reason?: string } { return this.writeInfo; }
+  private writeInfo: { enabled: boolean; reason?: string } = { enabled: false, reason: 'Linear write access is not configured' };
+  setWriteInfo(i: { enabled: boolean; reason?: string }) { this.writeInfo = i; }
+
   private get staleMs() { return this.cfg.staleAfterMinutes * 60_000; }
 
   /** Dashboard open / Refresh. Cached data younger than the stale threshold is reused; `force` re-reads (min 5 s apart). */
@@ -76,11 +81,14 @@ export class SnapshotService {
   }
 
   /** Opening one issue: re-read only that issue (and its PRs' evidence), and only if its detail is missing or stale. */
-  async getIssue(identifier: string): Promise<Snapshot | undefined> {
+  /** Latest assembled snapshot without any I/O. */
+  peek(): Snapshot | undefined { return this.last?.snap; }
+
+  async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {
     const base = this.last?.snap ?? (await this.get());
     const issue = base.issues.find((i) => i.identifier === identifier.toUpperCase());
     if (!issue) return undefined;
-    if (issue.detailAt && this.clock() - Date.parse(issue.detailAt) < this.staleMs) return this.last!.snap;
+    if (!force && issue.detailAt && this.clock() - Date.parse(issue.detailAt) < this.staleMs) return this.last!.snap;
     const key = issue.identifier;
     let p = this.issueInflight.get(key);
     if (!p) {
@@ -195,7 +203,7 @@ export class SnapshotService {
       for (const repo of p.repos) { const g = this.ghCache.get(`github:${repo}`); if (g) github.set(repo, g.data); }
     }
     const times = this.health.map((h) => h.lastSuccess).filter((t): t is string => !!t).sort();
-    const snap = buildSnapshot({ cfg: this.cfg, now: new Date(this.clock()), mode: this.mode, linear, github, health: this.health, dataAt: times[0] });
+    const snap = buildSnapshot({ cfg: this.cfg, now: new Date(this.clock()), mode: this.mode, linear, github, health: this.health, dataAt: times[0], write: this.writeStatus() });
     this.last = { snap, at: this.last?.at ?? this.clock() };
     if (times.length) this.last.at = Math.max(...this.health.map((h) => Date.parse(h.lastAttempt ?? '') || 0), 0) || this.clock();
     return snap;
