@@ -77,6 +77,79 @@ export function selName(snap: Snapshot | undefined, sel: Sel): string {
   return `${t.name} › ${t.projects.find((p) => p.id === sel.project)?.name ?? 'project'}`;
 }
 
+// ---- authenticated API access ------------------------------------------------------------------------------------
+// The server decides when a session expires. Requests must say whether they come from a real user action ('user') or are
+// automatic ('passive'); only 'user' requests move the 30-minute inactivity window.
+let csrfToken: string | undefined;
+let redirecting = false;
+
+export function redirectToLogin(expired: boolean) {
+  if (redirecting) return;
+  redirecting = true;
+  const next = /^#\/[\w\-./?=&,%:~]*$/.test(location.hash) ? location.hash : '';
+  const q = [expired ? 'expired=1' : '', next ? `next=${encodeURIComponent(next)}` : ''].filter(Boolean).join('&');
+  location.replace(`/login${q ? `?${q}` : ''}`);
+}
+
+export interface ApiOptions { interaction: 'user' | 'passive'; method?: 'GET' | 'POST'; body?: unknown }
+
+export async function api(url: string, o: ApiOptions): Promise<Response> {
+  const headers: Record<string, string> = { 'x-devflow-interaction': o.interaction };
+  if (o.method === 'POST') {
+    headers['content-type'] = 'application/json';
+    headers['x-devflow-csrf'] = csrfToken ?? (await loadSession());
+  }
+  const r = await fetch(url, { method: o.method ?? 'GET', headers, body: o.method === 'POST' ? JSON.stringify(o.body ?? {}) : undefined, cache: 'no-store', credentials: 'same-origin' });
+  if (r.status === 401) { redirectToLogin(true); throw new Error('Session expired'); }
+  return r;
+}
+
+export async function loadSession(): Promise<string> {
+  const r = await api('/api/auth/session', { interaction: 'user' });
+  const j = (await r.json()) as { csrf: string; idleSeconds: number };
+  csrfToken = j.csrf;
+  idleSecondsKnown = j.idleSeconds;
+  return j.csrf;
+}
+let idleSecondsKnown = 1800;
+export const idleSeconds = () => idleSecondsKnown;
+
+export async function logout(): Promise<void> {
+  try { await api('/api/auth/logout', { interaction: 'user', method: 'POST' }); } catch { /* the session may already be gone */ }
+  csrfToken = undefined;
+  location.replace('/login');
+}
+
+/**
+ * Keeps the server session in step with REAL user activity and notices expiry without polling:
+ *  - trusted pointer/keyboard input (throttled to one request per minute) tells the server the user is active;
+ *  - one idle timer, re-armed by that input, asks the (non-extending) state endpoint when it fires and redirects if the
+ *    server says the session is gone. The server remains the authority on expiry.
+ */
+export function useSessionGuard() {
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let lastTouch = Date.now();
+    const arm = () => { clearTimeout(timer); timer = setTimeout(check, idleSeconds() * 1000 + 1000); };
+    const check = async () => {
+      try {
+        const st = (await (await fetch('/api/auth/state', { cache: 'no-store', credentials: 'same-origin' })).json()) as { authenticated: boolean };
+        if (!st.authenticated) redirectToLogin(true); else arm();
+      } catch { arm(); }
+    };
+    const onInput = (e: Event) => {
+      if (!e.isTrusted) return; // scripts cannot keep a session alive by synthesizing events
+      arm();
+      const n = Date.now();
+      if (n - lastTouch > 60_000) { lastTouch = n; api('/api/auth/touch', { interaction: 'user', method: 'POST' }).catch(() => {}); }
+    };
+    loadSession().then(arm).catch(() => {});
+    addEventListener('pointerdown', onInput, true);
+    addEventListener('keydown', onInput, true);
+    return () => { clearTimeout(timer); removeEventListener('pointerdown', onInput, true); removeEventListener('keydown', onInput, true); };
+  }, []);
+}
+
 export interface Live {
   snap?: Snapshot;
   error?: string; // last fetch error (snapshot may still be shown from an earlier success)
@@ -113,12 +186,12 @@ export function useSnapshot(): Live {
   const busy = useRef(false);
   snapRef.current = snap;
 
-  const load = useCallback(async (force: boolean) => {
+  const load = useCallback(async (force: boolean, interaction: 'user' | 'passive' = 'user') => {
     if (busy.current) return;
     busy.current = true;
     setLoading(true);
     try {
-      const r = await fetch(`/api/snapshot${force ? '?refresh=1' : ''}`, { cache: 'no-store' });
+      const r = await api(`/api/snapshot${force ? '?refresh=1' : ''}`, { interaction });
       if (!r.ok) throw new Error(await readError(r));
       setSnap((await r.json()) as Snapshot); setError(undefined);
     } catch (e) {
@@ -129,7 +202,7 @@ export function useSnapshot(): Live {
   const openIssue = useCallback(async (identifier: string) => {
     setIssueLoading(identifier); setIssueError(undefined);
     try {
-      const r = await fetch(`/api/issue/${encodeURIComponent(identifier)}`, { cache: 'no-store' });
+      const r = await api(`/api/issue/${encodeURIComponent(identifier)}`, { interaction: 'user' });
       if (!r.ok) throw new Error(await readError(r));
       setSnap((await r.json()) as Snapshot);
     } catch (e) {
@@ -140,7 +213,7 @@ export function useSnapshot(): Live {
   const openTeam = useCallback(async (key: string) => {
     setTeamLoading(key); setTeamError(undefined);
     try {
-      const r = await fetch(`/api/team/${encodeURIComponent(key)}`, { cache: 'no-store' });
+      const r = await api(`/api/team/${encodeURIComponent(key)}`, { interaction: 'user' });
       if (!r.ok) throw new Error(await readError(r));
       setSnap((await r.json()) as Snapshot);
     } catch (e) {
@@ -152,7 +225,7 @@ export function useSnapshot(): Live {
   useEffect(() => {
     const onVisible = () => {
       const s = snapRef.current;
-      if (document.visibilityState === 'visible' && s && Date.now() - Date.parse(s.dataAt) > s.staleAfterSeconds * 1000) load(false);
+      if (document.visibilityState === 'visible' && s && Date.now() - Date.parse(s.dataAt) > s.staleAfterSeconds * 1000) load(false, 'passive'); // returning to a tab is not a user interaction
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
@@ -214,12 +287,12 @@ export const parseLabelParam = (v: string | undefined): string[] => (v ? v.split
 export const matchesLabels = (labels: { name: string }[], selected: string[]) =>
   selected.length === 0 || labels.some((l) => selected.some((s) => s.toLowerCase() === l.name.toLowerCase()));
 
-/** POST to a controlled Linear action. The CSRF token came from a same-origin GET; the browser adds the Origin header. */
-export async function postAction(kind: string, csrf: string, body: Record<string, unknown>): Promise<{ ok: true; message: string; snapshot: Snapshot } | { ok: false; error: string; checks?: { id: string; label: string; ok: boolean; detail: string }[] }> {
+/** POST to a controlled Linear action (session cookie + same-origin + the session-bound CSRF token). */
+export async function postAction(kind: string, body: Record<string, unknown>): Promise<{ ok: true; message: string; snapshot: Snapshot } | { ok: false; error: string; checks?: { id: string; label: string; ok: boolean; detail: string }[] }> {
   try {
-    const r = await fetch(`/api/actions/${kind}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-devflow-csrf': csrf }, body: JSON.stringify(body) });
+    const r = await api(`/api/actions/${kind}`, { interaction: 'user', method: 'POST', body });
     const j = (await r.json()) as { ok?: boolean; error?: string; message?: string; snapshot?: Snapshot; checks?: never };
     if (r.ok && j.ok && j.snapshot) return { ok: true, message: j.message ?? 'Done', snapshot: j.snapshot };
     return { ok: false, error: j.error ?? `Request failed (HTTP ${r.status})`, checks: j.checks };
-  } catch { return { ok: false, error: 'Cannot reach the DevFlow server' }; }
+  } catch (e) { return { ok: false, error: e instanceof Error && e.message === 'Session expired' ? 'Your session expired' : 'Cannot reach the DevFlow server' }; }
 }

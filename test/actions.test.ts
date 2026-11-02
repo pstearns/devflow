@@ -7,6 +7,7 @@ import { LinearWriteClient } from '../server/linear-write.ts';
 import { ActionError, LinearActions, evaluateApproval, parseCtx, statusOptions } from '../server/actions.ts';
 import { buildApp } from '../server/app.ts';
 import { DEFAULT_WORKFLOW } from '../server/config.ts';
+import { jsonHeaders, makeAuth, signIn } from './helpers.ts';
 
 const now = Date.parse('2026-06-01T12:00:00Z');
 
@@ -17,7 +18,7 @@ async function setup(opts: FakeLinearOpts = {}, writeEnabled = true) {
   service.setWriteInfo(writeEnabled ? { enabled: true } : { enabled: false, reason: 'Linear write access is not configured' });
   await service.get();
   const logs: string[] = [];
-  const actions = new LinearActions({ cfg, read: new LinearClient(DEMO_READ_KEY, f), write: writeEnabled ? new LinearWriteClient(DEMO_WRITE_KEY, f) : undefined, service, csrf: 'csrf-token-1', log: (l) => logs.push(l), clock: () => now });
+  const actions = new LinearActions({ cfg, read: new LinearClient(DEMO_READ_KEY, f), write: writeEnabled ? new LinearWriteClient(DEMO_WRITE_KEY, f) : undefined, service, log: (l) => logs.push(l), clock: () => now });
   const spec = (id: string) => { const [t, n] = id.split('-') as [string, string]; return f.store.issues[t!]!.find((x) => x.n === Number(n))!; };
   const ops = () => f.store.mutations.map((m) => m.op);
   return { f, service, actions, spec, ops, logs, cfg };
@@ -272,15 +273,17 @@ describe('failures and bad input', () => {
   });
 });
 
-describe('HTTP security boundary', () => {
+describe('HTTP security boundary (behind authentication)', () => {
   async function web() {
     const s = await setup();
-    const app = await buildApp(s.service, { distDir: '/none', actions: s.actions });
-    const good = { host: 'localhost:4317', origin: 'http://localhost:4317', 'content-type': 'application/json', 'x-devflow-csrf': 'csrf-token-1', 'sec-fetch-site': 'same-origin' };
+    const { auth, password } = await makeAuth();
+    const app = await buildApp(s.service, { distDir: '/none', actions: s.actions, auth });
+    const sess = await signIn(app, password);
+    const good = jsonHeaders({ cookie: sess.cookie, 'x-devflow-csrf': sess.csrf, 'x-devflow-interaction': 'user' });
     const post = (kind: string, body: unknown, headers: Record<string, string> = good) => app.inject({ method: 'POST', url: `/api/actions/${kind}`, headers, payload: JSON.stringify(body) });
-    return { ...s, app, good, post };
+    return { ...s, app, good, post, sess };
   }
-  it('accepts a same-origin JSON request with the CSRF token', async () => {
+  it('accepts a same-origin JSON request with the session CSRF token', async () => {
     const { post, spec } = await web();
     const r = await post('labels', { identifier: 'ATL-3', add: [LBL.security], remove: [] });
     expect(r.statusCode).toBe(200);
@@ -306,7 +309,7 @@ describe('HTTP security boundary', () => {
     expect((await app.inject({ method: 'POST', url: '/api/actions/labels', headers: good, payload: '{bad json' })).statusCode).toBe(400);
     expect(ops()).toEqual([]);
   });
-  it('POST is accepted only under /api/actions; other verbs and unknown actions are refused', async () => {
+  it('POST is accepted only under /api/actions and /api/auth; other verbs and unknown actions are refused', async () => {
     const { app, good, post } = await web();
     for (const url of ['/api/snapshot', '/api/issue/ATL-3', '/api/issue-actions/ATL-3', '/', '/api/actions']) expect((await app.inject({ method: 'POST', url, headers: good, payload: '{}' })).statusCode, url).toBe(405);
     for (const method of ['PUT', 'DELETE', 'PATCH'] as const) expect((await app.inject({ method, url: '/api/actions/labels', headers: good, payload: '{}' })).statusCode).toBe(405);
@@ -315,13 +318,14 @@ describe('HTTP security boundary', () => {
     expect((await app.inject({ method: 'GET', url: '/api/actions/labels', headers: good })).statusCode).toBe(404);
   });
   it('surfaces controlled refusals as JSON with the failed checks', async () => {
-    const { post } = await web();
-    const r = await post('approve', { identifier: 'ATL-17', confirm: 'ATL-17' });
+    const w = await web();
+    const r = await w.post('approve', { identifier: 'ATL-17', confirm: 'ATL-17' });
     expect(r.statusCode).toBe(422);
     const j = r.json();
     expect([j.ok, j.code]).toEqual([false, 'ineligible']);
     expect(j.checks.some((c: { ok: boolean }) => !c.ok)).toBe(true);
-    const o = await (await web()).app.inject({ url: '/api/issue-actions/ATL-16', headers: { host: 'localhost' } });
-    expect(o.json()).toMatchObject({ writeEnabled: true, csrf: 'csrf-token-1' });
+    const o = await w.sess.get('/api/issue-actions/ATL-16');
+    expect(o.json()).toMatchObject({ writeEnabled: true });
+    expect(JSON.stringify(o.json())).not.toMatch(/csrf/i); // the CSRF token comes from the session endpoint only
   });
 });

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ActionOptions, Issue, Snapshot } from '../../../shared/types.ts';
-import { postAction } from '../lib.ts';
+import { api, postAction } from '../lib.ts';
 import { LabelChip } from './Labels.tsx';
 import { btn, select } from './ui.tsx';
 
@@ -67,7 +67,7 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
     let live = true;
     (async () => {
       try {
-        const r = await fetch(`/api/issue-actions/${encodeURIComponent(issue.identifier)}`, { cache: 'no-store' });
+        const r = await api(`/api/issue-actions/${encodeURIComponent(issue.identifier)}`, { interaction: 'user' });
         const j = await r.json();
         if (!live) return;
         if (!r.ok) throw new Error(typeof j.error === 'string' ? j.error : `HTTP ${r.status}`);
@@ -85,7 +85,7 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
   const submit = async (k: string, body: Record<string, unknown>) => {
     if (!opts) return;
     setBusy(true); setErr(undefined);
-    const r = await postAction(k, opts.csrf, { identifier: issue.identifier, ...body });
+    const r = await postAction(k, { identifier: issue.identifier, ...body });
     setBusy(false);
     if (r.ok) onResult(r.snapshot, r.message); else { setErr(r.error); setChecks(r.checks); }
   };

@@ -8,7 +8,8 @@ cd "$(dirname "$(readlink -f "$0")")/.."
 
 PORT="${DEVFLOW_PORT:-4317}"
 URL="http://localhost:${PORT}"
-ready() { curl -fsS --max-time 2 "${URL}/api/readyz" >/dev/null 2>&1; }
+# /api/* now requires a session, so "is DevFlow up?" is answered by the public sign-in page
+ready() { curl -fsS --max-time 2 "${URL}/login" 2>/dev/null | grep -q "DevFlow"; }
 
 open_browser() {
   [ "${DEVFLOW_NO_BROWSER:-0}" = "1" ] && return 0

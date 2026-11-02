@@ -278,7 +278,6 @@ export interface ActionCheck { id: string; label: string; ok: boolean; detail: s
 export interface ActionOptions {
   writeEnabled: boolean;
   reason?: string; // why writes are disabled
-  csrf: string;
   scope: { teamKey: string; projectName?: string; policy: PolicySource; explicitPolicy: boolean }; // resolved server-side from the issue's live team/project
   identifier: string;
   title: string;

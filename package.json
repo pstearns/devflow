@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Read-only engineering dashboard over Linear and GitHub",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.7"
   },
   "scripts": {
     "build": "npm run build:web && npm run build:server",
@@ -17,7 +17,10 @@
     "dev:web": "vite",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "audit": "npm audit --omit=dev"
+    "audit": "npm audit --omit=dev",
+    "auth:setup": "node dist-server/server/auth-cli.js setup",
+    "auth:reset": "node dist-server/server/auth-cli.js reset",
+    "auth:status": "node dist-server/server/auth-cli.js status"
   },
   "dependencies": {
     "fastify": "^5.12.7"

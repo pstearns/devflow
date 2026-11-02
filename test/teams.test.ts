@@ -7,6 +7,7 @@ import { LinearWriteClient } from '../server/linear-write.ts';
 import { ActionError, LinearActions } from '../server/actions.ts';
 import { buildApp } from '../server/app.ts';
 import { parseConfig } from '../server/config.ts';
+import { makeAuth, signIn } from './helpers.ts';
 import { resolveScope } from '../server/scope.ts';
 
 const now = Date.parse('2026-06-01T12:00:00Z');
@@ -23,7 +24,7 @@ async function setup(opts: FakeLinearOpts = {}) {
   const service = new SnapshotService(cfg, { linearKey: DEMO_READ_KEY, githubToken: 't', fetchImpl: f, mode: 'demo' }, () => now);
   service.setWriteInfo({ enabled: true });
   const snap = await service.get();
-  const actions = new LinearActions({ cfg, read: new LinearClient(DEMO_READ_KEY, f), write: new LinearWriteClient(DEMO_WRITE_KEY, f), service, csrf: 'tok', clock: () => now });
+  const actions = new LinearActions({ cfg, read: new LinearClient(DEMO_READ_KEY, f), write: new LinearWriteClient(DEMO_WRITE_KEY, f), service, clock: () => now });
   const spec = (id: string) => { const [t, n] = id.split('-') as [string, string]; return f.store.issues[t!]!.find((x) => x.n === Number(n))!; };
   return { f, service, snap, actions, cfg, calls, spec, ops: () => f.store.mutations.map((m) => m.op) };
 }
@@ -75,12 +76,14 @@ describe('on-demand team loading', () => {
   });
   it('the HTTP endpoint validates the key server-side', async () => {
     const { service } = await setup();
-    const app = await buildApp(service, { distDir: '/none' });
-    const get = (url: string) => app.inject({ url, headers: { host: 'localhost' } });
+    const { auth, password } = await makeAuth();
+    const app = await buildApp(service, { distDir: '/none', auth });
+    const sess = await signIn(app, password);
+    const get = (url: string) => app.inject({ url, headers: { host: 'localhost', cookie: sess.cookie } });
     expect((await get('/api/team/QAT')).json().teams.find((t: { key: string }) => t.key === 'QAT').loaded).toBe(true);
     expect((await get('/api/team/NOPE')).statusCode).toBe(404);
     expect((await get('/api/team/a%20b')).statusCode).toBe(400);
-    expect((await app.inject({ method: 'POST', url: '/api/team/QAT', headers: { host: 'localhost' } })).statusCode).toBe(405);
+    expect((await app.inject({ method: 'POST', url: '/api/team/QAT', headers: { host: 'localhost', cookie: sess.cookie } })).statusCode).toBe(405);
   });
 });
 
@@ -204,9 +207,10 @@ describe('server-side write authorization (never the browser selection)', () => 
   });
   it('the authorization comes from the issue\'s live team/project; extra "team" fields in a request change nothing', async () => {
     const { service, actions, ops } = await setup();
-    const app = await buildApp(service, { distDir: '/none', actions });
-    const h = { host: 'localhost:4317', origin: 'http://localhost:4317', 'content-type': 'application/json', 'x-devflow-csrf': 'tok', 'sec-fetch-site': 'same-origin' };
-    const r = await app.inject({ method: 'POST', url: '/api/actions/labels', headers: h, payload: JSON.stringify({ identifier: 'ATL-20', team: 'ZED', teamKey: 'ZED', project: 'lp-ZED', add: ['lbl-bug'], remove: [] }) });
+    const { auth, password } = await makeAuth();
+    const app = await buildApp(service, { distDir: '/none', actions, auth });
+    const sess = await signIn(app, password);
+    const r = await sess.post('/api/actions/labels', { identifier: 'ATL-20', team: 'ZED', teamKey: 'ZED', project: 'lp-ZED', add: ['lbl-bug'], remove: [] });
     expect([r.statusCode, r.json().code]).toEqual([403, 'not-authorized']);
     expect(ops()).toEqual([]);
   });

@@ -8,10 +8,11 @@ React + Vite + Tailwind frontend, Fastify backend, no database. **No polling:** 
 
 ```bash
 npm install
-cp .env.example .env && chmod 600 .env                 # add the two read-only credentials
+cp .env.example .env && chmod 600 .env                 # add the Linear/GitHub credentials
 cp devflow.config.example.json devflow.config.json     # describe your projects
 npm run build                                          # web + compiled server (one time, and after code changes)
-npm start                                              # plain Node, no build step, no tsx: http://localhost:4317
+npm run auth:setup                                     # ONE-TIME, interactive: create the single local admin password
+npm start                                              # plain Node (24.7+), no build step, no tsx: http://localhost:4317 -> sign in
 ```
 
 - `npm run demo` – clearly labelled **synthetic** data (fake `fetch`, no network, no credentials).
@@ -46,8 +47,21 @@ Checks and reviews are treated as refreshable evidence even when the head SHA is
 | `LINEAR_WRITE_API_KEY` (optional) | A *separate* Linear personal API key, permission **Write**, limited to the configured team(s). Enables the action menu. Must differ from `LINEAR_API_KEY` or write stays disabled. |
 | `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions (and Commit statuses if available) |
 
-DevFlow never uses the `gh` CLI or any ambient identity. Tokens stay on the server: not sent to the browser, not logged, never in error text (upstream error bodies are not forwarded). `.env` and `devflow.config.json` are git-ignored; DevFlow warns at startup if `.env` is readable by other users. `PORT`/`HOST` in `.env` are ignored.
+DevFlow never uses the `gh` CLI or any ambient identity. These keys are **not** the sign-in password; sign-in uses the local admin account above. Tokens stay on the server: not sent to the browser, not logged, never in error text (upstream error bodies are not forwarded). `.env` and `devflow.config.json` are git-ignored; DevFlow warns at startup if `.env` is readable by other users. `PORT`/`HOST` in `.env` are ignored.
 CI evidence comes from GitHub Actions workflow runs for the PR's head commit. Check-run details (individual checks) need a permission this token setup does not expose, so they are shown as **Unavailable**, never as Passed; DevFlow does not ask for it. If a commit has no workflow run, its CI is **Unknown**.
+
+## Authentication (single local admin)
+
+DevFlow has exactly one administrator and no registration, OAuth or external identity provider. **Everything** (the app, all `/api/*` endpoints, every Linear action) requires a session; the only unauthenticated paths are the sign-in page, its static build assets, `GET /api/auth/state` and `POST /api/auth/login`. It still binds to `127.0.0.1` only.
+
+- **Create the account** once, in a terminal: `npm run auth:setup` (hidden prompt, entered twice, minimum 15 characters). The password is never read from arguments, pipes, `.env` or the environment, and is never stored or logged. `npm run auth:reset` changes it (type `RESET` to confirm; ends every session); `npm run auth:status` prints non-secret status. **Starting the server never creates or resets the account.** Until it exists, everything is locked and the sign-in page says how to set it up.
+- **Storage:** SQLite at `~/.local/share/devflow/auth.sqlite` (override with `DEVFLOW_AUTH_DB`), outside the repository; the directory is `0700` and the file `0600` (tightened if found looser, refused if it is a symlink or owned by someone else). It holds only the **Argon2id** hash (64 MiB, 3 passes, 1 lane; OWASP's minimum is 19 MiB / 2 / 1, via Node's built-in OpenSSL implementation, no native dependency), account metadata, session verifiers and failed-login timestamps.
+- **Sessions:** a 256-bit random opaque token in an `HttpOnly; SameSite=Strict` cookie. Only its SHA-256 verifier is stored, so the database cannot be replayed as a login. Logout deletes the session server-side. A new login replaces the session presented. At most 10 live sessions.
+- **30-minute sliding inactivity timeout, enforced server-side** to the millisecond. The window moves only for real user interactions: requests sent by the app with an explicit user-interaction header (opening, Refresh, selecting, actions) and a throttled `touch` sent from trusted pointer/keyboard input. Health checks, readiness, the auth-state endpoint, the automatic refresh when a hidden tab returns, static files and page loads never extend it. When it expires the next request gets `401`, and the app (which also arms one idle timer, not polling) redirects to the sign-in page.
+- **Login throttling:** after 5 failed attempts the account is locked for 30 s, doubling per further failure up to 15 min; a locked account rejects even the right password. Every credential failure returns the same message.
+- **CSRF:** every state-changing request must be same-origin (`Origin` equal to the host, `Sec-Fetch-Site: same-origin` when sent), `application/json`, and carry the **session-bound CSRF token** (an HMAC of the session verifier, obtained from the authenticated `GET /api/auth/session`). Ordinary actions (Ready approval, labels, status…) do **not** ask for the password again.
+- **`DEVFLOW_ADMIN`:** a password in `.env` is not a supported mechanism. If the variable is set, DevFlow warns, deletes it from its environment and ignores it. Remove the line.
+- Not part of this feature: HTTPS (the service is loopback-only, so cookies are not marked `Secure`), MFA, password-reset by e-mail, multiple users.
 
 ## Teams → Projects
 
@@ -117,3 +131,5 @@ Only `GET`/`HEAD` are served (others → 405); non-loopback `Host` headers are r
 - Descriptions over 10,000 characters are cut and marked as truncated.
 - Linear history shows state transitions only (last 5 per issue).
 - Closing the browser tab does not stop the server; close the launcher window or run `scripts/devflow-stop.sh`.
+- Authentication: `crypto.argon2` and `node:sqlite` require Node 24.7+ (`node:sqlite` is still flagged "release candidate" by Node). Any local process running as your user that can read `~/.local/share/devflow/auth.sqlite` can read the verifiers but not replay them; it could still guess the password offline against the Argon2id hash, hence the 15-character minimum.
+- `npm run dev:web` (Vite) serves the app without the sign-in page; use the built server (`npm start`) to exercise authentication.

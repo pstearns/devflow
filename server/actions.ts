@@ -133,11 +133,10 @@ type Log = (line: string) => void;
 export class LinearActions {
   private chain: Promise<unknown> = Promise.resolve();
   constructor(
-    private deps: { cfg: Config; read: LinearClient; write?: LinearWriteClient; service: SnapshotService; csrf: string; log?: Log; clock?: () => number },
+    private deps: { cfg: Config; read: LinearClient; write?: LinearWriteClient; service: SnapshotService; log?: Log; clock?: () => number },
   ) {}
 
   get enabled() { return !!this.deps.write; }
-  get csrf() { return this.deps.csrf; }
 
   /** Authorization is decided here from the issue's LIVE team/project and the server's configuration, never from the browser. */
   private scopeOf(ctx: Ctx): Scope {
@@ -183,7 +182,7 @@ export class LinearActions {
       return { id: l.id, name: l.name, color: l.color, scope: l.scope, applied, editable: reason === undefined, reason, classification: wf.classificationLabels.map(low).includes(low(l.name)), group: l.parent };
     });
     return {
-      writeEnabled: w, reason: w ? undefined : whyNot, csrf: this.deps.csrf,
+      writeEnabled: w, reason: w ? undefined : whyNot,
       scope: { teamKey: ctx.teamKey, projectName: ctx.project?.name, policy: sc.policy, explicitPolicy: sc.explicitPolicy },
       identifier: ctx.identifier, title: ctx.title, state: ctx.state, labels,
       states: statusOptions(ctx, wf, this.mergedPr(ctx.identifier), w),

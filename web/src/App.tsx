@@ -3,7 +3,7 @@ import { Lifecycle } from './components/Lifecycle.tsx';
 import { ScopeDetail, TicketDetail } from './components/Detail.tsx';
 import { Time, btn, select } from './components/ui.tsx';
 import type { Snapshot } from '../../shared/types.ts';
-import { VIEWS, inSel, selOf, useRoute, useSnapshot, relTime } from './lib.ts';
+import { VIEWS, inSel, logout, selOf, useRoute, useSessionGuard, useSnapshot, relTime } from './lib.ts';
 import { Overview } from './views/Overview.tsx';
 import { Milestones } from './views/Milestones.tsx';
 import { Pipeline } from './views/Pipeline.tsx';
@@ -20,6 +20,7 @@ function useTheme(): [string, () => void] {
 
 export function App() {
   const live = useSnapshot();
+  useSessionGuard();
   const { snap } = live;
   const [route, go] = useRoute();
   const [theme, toggleTheme] = useTheme();
@@ -116,6 +117,7 @@ export function App() {
           </button>
           <button className={btn} onClick={live.refresh} disabled={live.loading}>{live.loading ? 'Refreshing…' : 'Refresh'}</button>
           <button className={btn} onClick={toggleTheme} aria-label="Toggle theme">{theme === 'dark' ? 'Light' : 'Dark'}</button>
+          <button className={btn} onClick={logout} title="End this session on the server and return to the sign-in page">Log out</button>
         </div>
       </header>
 
