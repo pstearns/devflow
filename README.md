@@ -43,10 +43,10 @@ Checks and reviews are treated as refreshable evidence even when the head SHA is
 | Variable | Minimum access |
 |---|---|
 | `LINEAR_API_KEY` | Personal API key, permission **Read** |
-| `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions, **Checks**, **Commit statuses** |
+| `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions (and Commit statuses if available) |
 
 DevFlow never uses the `gh` CLI or any ambient identity. Tokens stay on the server: not sent to the browser, not logged, never in error text (upstream error bodies are not forwarded). `.env` and `devflow.config.json` are git-ignored; DevFlow warns at startup if `.env` is readable by other users. `PORT`/`HOST` in `.env` are ignored.
-Without Checks/Commit-statuses permission DevFlow still works: it names the missing permission in *Integration health* and uses Actions workflow runs as labelled fallback CI evidence.
+CI evidence comes from GitHub Actions workflow runs for the PR's head commit. Check-run details (individual checks) need a permission this token setup does not expose, so they are shown as **Unavailable**, never as Passed; DevFlow does not ask for it. If a commit has no workflow run, its CI is **Unknown**.
 
 ## Configuration (`devflow.config.json`)
 

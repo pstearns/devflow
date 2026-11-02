@@ -147,7 +147,7 @@ export function buildSnapshot(inp: BuildInput): Snapshot {
           ...r, key: `${repo}#${r.number}`, repo, projectId: p.id,
           ticket: { link: 'unlinked', candidates: [], via: '' },
           runs: [],
-          ci: ciStatus(r.checks, r.detail.checksOk, r.detail.checksPartial),
+          ci: ciStatus(r.checks, r.detail.checksOk, r.detail.checksPartial, r.detail.checkRunsUnavailable),
           humanReview: humanReviewStatus(r.reviews, r.detail.reviewsOk, r.state, r.detail.reviewsPartial),
           independentReview: independentReviewStatus({ labels: r.labels, checks: r.checks, state: r.state, detailOk: r.detail.checksOk }, cfg.review),
         };

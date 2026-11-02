@@ -137,6 +137,7 @@ export interface PrEvidenceState {
   ok: boolean; checksOk: boolean; reviewsOk: boolean; error?: string;
   checksPartial?: string; // CI evidence readable but incomplete (never reported as Passed)
   noFallback?: boolean; // check-runs response was malformed: do not substitute workflow runs
+  checkRunsUnavailable?: boolean; // token cannot read check runs: CI comes from Actions workflow runs; check-run details are Unavailable
   reviewsPartial?: string;
 }
 
@@ -194,12 +195,19 @@ export async function fetchPrDetail(client: GithubClient, repo: string, p: RawPr
     }
   };
   let malformedChecks = false;
+  let unavailableChecks = false;
   const [runs, statuses, reviews, commits] = await Promise.all([
     settle('check runs', client.cached(`${repo}:checks:${p.headSha}`, checksTtl, () =>
       readPages(client, `${base}/commits/${p.headSha}/check-runs`, (r) => ({ items: shaped(r, 'check_runs', 'check runs'), total: isObj(r) ? num(r.total_count) : undefined })), force)
-      .catch((e) => { if (e instanceof SourceError && e.kind === 'invalid') malformedChecks = true; throw e; })),
+      .catch((e) => {
+        if (e instanceof SourceError && e.kind === 'invalid') malformedChecks = true;
+        // No access to check runs is an expected, labelled condition (not a warning and not a prompt): see ciStatus().
+        if (e instanceof SourceError && e.kind === 'auth') { unavailableChecks = true; return undefined; }
+        throw e;
+      })),
     settle('commit statuses', client.cached(`${repo}:status:${p.headSha}`, statusTtl, () =>
-      readPages(client, `${base}/commits/${p.headSha}/status`, (r) => ({ items: shaped(r, 'statuses', 'commit statuses'), total: isObj(r) ? num(r.total_count) : undefined, extra: { state: isObj(r) ? r.state : undefined } })), force)),
+      readPages(client, `${base}/commits/${p.headSha}/status`, (r) => ({ items: shaped(r, 'statuses', 'commit statuses'), total: isObj(r) ? num(r.total_count) : undefined, extra: { state: isObj(r) ? r.state : undefined } })), force)
+      .catch((e) => { if (e instanceof SourceError && e.kind === 'auth') return undefined; throw e; })), // quiet: handled via checksPartial/Unavailable
     settle('reviews', client.cached(`${repo}:reviews:${p.number}:${p.updatedAt}`, SETTLED_TTL, () =>
       readPages(client, `${base}/pulls/${p.number}/reviews`, (r) => { if (!Array.isArray(r)) throw new SourceError('invalid', 'GitHub reviews: unexpected response shape'); return { items: arr(r, 100) }; }), force)),
     settle('commits', client.cached(`${repo}:commits:${p.number}:${p.headSha}`, SETTLED_TTL, () => client.get(`${base}/pulls/${p.number}/commits`, { per_page: 50 }).then((c) => { if (!Array.isArray(c)) throw new SourceError('invalid', 'GitHub commits: unexpected response shape'); return c; }), force)),
@@ -216,7 +224,7 @@ export async function fetchPrDetail(client: GithubClient, repo: string, p: RawPr
     detail: {
       ok: checksOk && reviews !== undefined, checksOk, reviewsOk: reviews !== undefined, error: checksOk ? undefined : 'Check runs unreadable',
       checksPartial: reasons.length ? reasons.join('; ') : undefined, reviewsPartial: reviews?.truncated ? 'review list truncated' : undefined,
-      noFallback: malformedChecks || undefined,
+      noFallback: malformedChecks || undefined, checkRunsUnavailable: unavailableChecks || undefined,
     },
   };
 }

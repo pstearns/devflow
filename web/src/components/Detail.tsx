@@ -54,6 +54,7 @@ function PrBlock({ pr }: { pr: PullRequest }) {
       <div className="text-[11px] text-muted">Linked via {pr.ticket.via}</div>
       <dl className="mt-1.5">
         <Row k="CI"><Pill status={pr.ci} /> <span className="text-muted">{pr.ci.detail}</span></Row>
+        {pr.detail.checkRunsUnavailable && <Row k="Check-run details"><Pill value="unknown" label="Unavailable" /> <span className="text-muted">not readable with the current token; workflow runs are shown instead</span></Row>}
         <Row k="Independent review"><Pill status={pr.independentReview} /> <span className="text-muted">{pr.independentReview.detail}</span></Row>
         <Row k="Human review"><Pill status={pr.humanReview} /> <span className="text-muted">{pr.humanReview.detail}</span></Row>
       </dl>

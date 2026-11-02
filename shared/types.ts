@@ -143,7 +143,7 @@ export interface PullRequest {
   reviews: ReviewItem[];
   commits: CommitItem[];
   runs: RunItem[];
-  detail: { ok: boolean; checksOk: boolean; reviewsOk: boolean; error?: string; checksPartial?: string; reviewsPartial?: string }; // *Ok=false => unreadable; *Partial => readable but incomplete
+  detail: { ok: boolean; checksOk: boolean; reviewsOk: boolean; error?: string; checksPartial?: string; reviewsPartial?: string; checkRunsUnavailable?: boolean }; // *Ok=false => unreadable; *Partial => readable but incomplete
   ci: Status;
   humanReview: Status;
   independentReview: Status;

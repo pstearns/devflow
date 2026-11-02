@@ -153,7 +153,7 @@ describe('failure handling', () => {
     const snap = await svc((async (u: RequestInfo | URL) => String(u).includes('linear') ? jsonRes({ data: { teams: { nodes: [] } } }) : jsonRes([])) as typeof fetch).get();
     expect(snap.health.find((h) => h.id === 'linear:p')!.error).toMatch(/not found/);
   });
-  it('token missing Checks/Statuses permission: names the permission, keeps reviews/runs, falls back to workflow-run CI evidence', async () => {
+  it('no access to check runs: CI comes from workflow runs, details are labelled Unavailable, no permission prompt', async () => {
     const good = demoFetch(now);
     const f = (async (u: RequestInfo | URL, i?: RequestInit) => {
       const url = String(u);
@@ -162,13 +162,16 @@ describe('failure handling', () => {
     }) as typeof fetch;
     const snap = await new SnapshotService(demoConfig(), { linearKey: 'k', githubToken: 't', fetchImpl: f, mode: 'demo' }, () => now).get();
     const gh = snap.health.find((h) => h.id === 'github:demo-org/atlas')!;
-    expect(gh.state).toBe('partial');
-    expect(gh.warnings.join(' ')).toMatch(/checks=read/);
-    expect(gh.warnings.filter((w) => w.startsWith('check runs')).length).toBe(1); // once, not per PR
+    expect(JSON.stringify(gh)).not.toMatch(/checks=read|needs/i); // never prompts for the permission
+    expect(gh.warnings.some((w) => w.startsWith('check runs'))).toBe(false);
     const pr11 = snap.prs.find((p) => p.key === 'demo-org/atlas#11')!;
     expect(pr11.humanReview.value).toBe('failed'); // reviews still readable
-    expect(pr11.ci.evidence[0]!.source).toBe('GitHub Actions workflow run'); // labelled fallback source
-    const pr3 = snap.prs.find((p) => p.key === 'demo-org/atlas#3')!;
-    expect(pr3.ci.value).toBe('failed');
+    expect(pr11.detail.checkRunsUnavailable).toBe(true);
+    expect(pr11.ci.evidence[0]!.source).toBe('GitHub Actions workflow run');
+    expect(pr11.ci.detail).toMatch(/check-run details unavailable/);
+    expect(snap.prs.find((p) => p.key === 'demo-org/atlas#3')!.ci.value).toBe('failed');
+    // a PR whose head commit has no workflow run must be Unknown/Unavailable, never Passed
+    const noRun = snap.prs.find((p) => p.key === 'demo-org/atlas#16')!;
+    expect(noRun.ci.value).toBe('unknown');
   });
 });

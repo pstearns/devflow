@@ -11,17 +11,19 @@ const checkEv = (c: CheckItem): Evidence => ({
   at: c.at,
 });
 
-export function ciStatus(checks: CheckItem[], detailOk: boolean, partial?: string): Status {
-  if (!detailOk) return status('unknown', 'Checks could not be read from GitHub');
+export function ciStatus(checks: CheckItem[], detailOk: boolean, partial?: string, checkRunsUnavailable = false): Status {
+  if (!detailOk) return status('unknown', checkRunsUnavailable ? 'Unavailable: check-run details cannot be read and no GitHub Actions workflow run exists for this commit' : 'Checks could not be read from GitHub');
+  const via = checks.length > 0 && checks.every((c) => c.source === 'workflow_run') ? ' workflow run(s)' : ' check(s)';
+  const note = checkRunsUnavailable ? ' (check-run details unavailable; CI taken from GitHub Actions workflow runs)' : '';
   if (!checks.length) return status('unknown', 'No checks reported for the PR head commit');
   const failed = checks.filter((c) => c.state === 'failed');
-  if (failed.length) return status('failed', `${failed.length} of ${checks.length} check(s) failed`, failed.map(checkEv));
+  if (failed.length) return status('failed', `${failed.length} of ${checks.length}${via} failed${note}`, failed.map(checkEv));
   const pending = checks.filter((c) => c.state === 'pending');
-  if (pending.length) return status('pending', `${pending.length} of ${checks.length} check(s) still running${partial ? ` (incomplete: ${partial})` : ''}`, pending.map(checkEv));
+  if (pending.length) return status('pending', `${pending.length} of ${checks.length}${via} still running${partial ? ` (incomplete: ${partial})` : ''}${note}`, pending.map(checkEv));
   const unknown = checks.filter((c) => c.state === 'unknown');
-  if (unknown.length) return status('unknown', `${unknown.length} check(s) ended cancelled/stale — not a pass`, unknown.map(checkEv));
-  if (partial) return status('unknown', `${checks.length} check(s) succeeded, but evidence is incomplete (${partial}) — not reported as passed`, checks.slice(0, 8).map(checkEv));
-  return status('passed', `All ${checks.length} check(s) succeeded`, checks.slice(0, 8).map(checkEv));
+  if (unknown.length) return status('unknown', `${unknown.length}${via} ended cancelled/stale — not a pass${note}`, unknown.map(checkEv));
+  if (partial) return status('unknown', `${checks.length}${via} succeeded, but evidence is incomplete (${partial}) — not reported as passed${note}`, checks.slice(0, 8).map(checkEv));
+  return status('passed', `All ${checks.length}${via} succeeded${note}`, checks.slice(0, 8).map(checkEv));
 }
 
 export function humanReviewStatus(reviews: ReviewItem[], detailOk: boolean, prState: 'open' | 'closed' | 'merged', partial?: string): Status {
