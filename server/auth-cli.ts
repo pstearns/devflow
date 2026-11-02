@@ -1,9 +1,11 @@
 // Interactive admin setup. This is the ONLY way an admin account is created or its password changed:
 //   npm run auth:setup     create the single admin account
 //   npm run auth:reset     change the password (invalidates every session)
+//   npm run auth:unlock    clear a login lockout (password unchanged)
 //   npm run auth:status    non-secret status
 // The password is read from the terminal without echo, hashed with Argon2id and never stored, logged or passed on argv/env.
-import { AuthService, MIN_PASSWORD, defaultAuthPath, passwordPolicyError } from './auth.ts';
+import './node-check.ts'; // must stay first: refuses unsupported Node versions before anything else loads
+import { AuthService, MIN_PASSWORD, defaultAuthPath, passwordPolicyError, readAuthStatus } from './auth.ts';
 import { fileURLToPath } from 'node:url';
 
 /** Reads a line from a TTY with echo disabled. Refuses to run without an interactive terminal. */
@@ -40,21 +42,29 @@ async function newPassword(): Promise<string> {
 export async function main(argv: string[], env = process.env): Promise<number> {
   const cmd = argv[0];
   const path = defaultAuthPath(env);
-  if (cmd !== 'setup' && cmd !== 'reset' && cmd !== 'status') {
-    console.error('Usage: auth-cli <setup|reset|status>\n  setup   create the single admin account (interactive)\n  reset   change the admin password and end all sessions (interactive)\n  status  show non-secret status');
+  if (cmd !== 'setup' && cmd !== 'reset' && cmd !== 'unlock' && cmd !== 'status') {
+    console.error('Usage: auth-cli <setup|reset|unlock|status>\n  setup   create the single admin account (interactive)\n  reset   change the admin password and end all sessions (interactive)\n  unlock  clear the login lockout without changing the password\n  status  show non-secret status');
     return 2;
+  }
+  if (cmd === 'status') {
+    try {
+      const st = readAuthStatus(path); // read-only: creates no file or directory
+      console.log(`Database:        ${path}${st.exists ? '' : ' (not created yet)'}\nAdmin set up:    ${st.hasAdmin ? 'yes' : 'no (run: npm run auth:setup)'}\nActive sessions: ${st.activeSessions}\nLogin lock:      ${st.locked ? `LOCKED, ${st.retryAfterSeconds}s remaining (run: npm run auth:unlock)` : 'not locked'} (${st.recentFailures} recent failed attempt(s))\nPermissions:     dir ${st.permissions?.dir ?? 'n/a'}, file ${st.permissions?.file ?? 'n/a'} (expected 700 / 600)`);
+      return 0;
+    } catch (e) { console.error(`Error: ${e instanceof Error ? e.message : 'failed'}`); return 1; }
   }
   const auth = AuthService.open({ path });
   try {
-    if (cmd === 'status') {
-      const p = auth.permissions;
-      console.log(`Database:        ${path}\nAdmin set up:    ${auth.hasAdmin ? 'yes' : 'no (run: npm run auth:setup)'}\nActive sessions: ${auth.activeSessions}\nPermissions:     dir ${p?.dir ?? 'n/a'}, file ${p?.file ?? 'n/a'} (expected 700 / 600)`);
+    if (cmd === 'unlock') {
+      if (!auth.hasAdmin) { console.error('No admin account exists yet. Run: npm run auth:setup'); return 1; }
+      auth.unlock();
+      console.log('Login lockout cleared. The password and sessions were not changed.');
       return 0;
     }
     if (cmd === 'setup') {
       if (auth.hasAdmin) { console.error('An admin account already exists. To change the password run: npm run auth:reset'); return 1; }
       await auth.createAdmin(await newPassword());
-      console.log(`Admin account created. Only an Argon2id hash was stored (${path}).\nStart DevFlow and sign in at http://localhost:4317/login`);
+      console.log(`Admin account created. Only an Argon2id hash was stored (${path}).\nStart DevFlow and sign in at http://devflow.localhost:4317/login`);
       return 0;
     }
     if (!auth.hasAdmin) { console.error('No admin account exists yet. Run: npm run auth:setup'); return 1; }

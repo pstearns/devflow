@@ -15,7 +15,7 @@ export async function makeAuth(opts: { clock?: () => number; idleSeconds?: numbe
 type Res = Awaited<ReturnType<FastifyInstance['inject']>>;
 export interface Signed { cookie: string; csrf: string; token: string; headers: Record<string, string>; post: (url: string, body: unknown, extra?: Record<string, string>) => Promise<Res>; get: (url: string, extra?: Record<string, string>) => Promise<Res> }
 
-const HOST = 'localhost:4317';
+const HOST = 'devflow.localhost:4317';
 export const jsonHeaders = (extra: Record<string, string> = {}): Record<string, string> => ({ host: HOST, origin: `http://${HOST}`, 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', ...extra });
 
 /** Signs in through the real HTTP login endpoint, like the browser does. */

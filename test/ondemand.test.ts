@@ -223,14 +223,15 @@ describe('server surface', () => {
   const app = async () => { const { auth, password } = await makeAuth(); const a = await buildApp(new SnapshotService(demoConfig(), { linearKey: 'k', githubToken: 't', fetchImpl: demoFetch(now), mode: 'demo' }, () => now), { distDir: '/nonexistent', auth }); return Object.assign(a, { sess: await signIn(a, password) }); };
   it('is read-only, loopback-only, validates input, reports readiness', async () => {
     const a = await app();
-    const h = (host = 'localhost:4317') => ({ ...a.sess.headers, host });
+    const h = (host = 'devflow.localhost:4317') => ({ ...a.sess.headers, host });
     expect((await a.inject({ method: 'POST', url: '/api/snapshot', headers: h() })).statusCode).toBe(405);
     expect((await a.inject({ method: 'GET', url: '/api/snapshot', headers: h('evil.example') })).statusCode).toBe(403);
-    expect((await a.inject({ url: '/api/issue/not%20valid', headers: h('localhost') })).statusCode).toBe(400);
-    expect((await a.inject({ url: '/api/issue/ZZZ-1', headers: h('localhost') })).statusCode).toBe(404);
-    expect((await a.inject({ url: '/api/issue/ATL-3', headers: h('127.0.0.1:4317') })).json().issues.length).toBeGreaterThan(0);
-    expect((await a.inject({ url: '/api/healthz', headers: h('localhost') })).statusCode).toBe(200);
-    const ready = await a.inject({ url: '/api/readyz', headers: h('localhost') });
+    expect((await a.inject({ url: '/api/issue/not%20valid', headers: h('devflow.localhost:4317') })).statusCode).toBe(400);
+    expect((await a.inject({ url: '/api/issue/ZZZ-1', headers: h('devflow.localhost:4317') })).statusCode).toBe(404);
+    expect((await a.inject({ url: '/api/issue/ATL-3', headers: h() })).json().issues.length).toBeGreaterThan(0);
+    expect((await a.inject({ url: '/api/issue/ATL-3', headers: h('127.0.0.1:4317') })).statusCode).toBe(403); // bare loopback is no longer served
+    expect((await a.inject({ url: '/api/healthz', headers: h('devflow.localhost:4317') })).statusCode).toBe(200);
+    const ready = await a.inject({ url: '/api/readyz', headers: h('devflow.localhost:4317') });
     expect(ready.statusCode).toBe(503); // no web build at that path: not ready, and says why
     expect(ready.json().webBuild).toBe(false);
   });
@@ -246,7 +247,7 @@ describe('server surface', () => {
     writeFileSync(`${dir}/dist/login.html`, '<html>login</html>');
     const a = await buildApp(new SnapshotService(demoConfig(), { mode: 'demo' }, () => now), { distDir: `${dir}/dist`, auth });
     const sess = await signIn(a, password);
-    const get = (url: string) => a.inject({ url, headers: { host: 'localhost', cookie: sess.cookie } });
+    const get = (url: string) => a.inject({ url, headers: { host: 'devflow.localhost:4317', cookie: sess.cookie } });
     expect((await get('/')).body).toContain('shell');
     expect((await get('/some/client/route')).body).toContain('shell');
     const js = await get('/assets/a.js');

@@ -40,7 +40,10 @@ export function resolveScope(cfg: Config, teamKeyRaw: string, project?: LinearPr
   if (teamCfg) {
     return {
       teamKey, project, teamCfg, workflow: teamCfg.workflow ?? DEFAULT_WORKFLOW, policy: teamCfg.workflow ? 'team' : 'default', explicitPolicy: !!teamCfg.workflow,
-      writeAllowed: teamCfg.write, writeReason: teamCfg.write ? undefined : `Writes are not enabled for team ${teamKey} (set write: true in its teams[] entry)`, repos: teamCfg.repos,
+      // fail closed: no explicit workflow means the ready label is unknown, so it could not be protected
+      writeAllowed: teamCfg.write && !!teamCfg.workflow,
+      writeReason: !teamCfg.write ? `Writes are not enabled for team ${teamKey} (set write: true in its teams[] entry)` : !teamCfg.workflow ? `Team ${teamKey} has write: true but no explicit workflow, so its ready label is not protected; add a workflow to its teams[] entry` : undefined,
+      repos: teamCfg.repos,
     };
   }
   return {

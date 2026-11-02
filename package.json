@@ -20,6 +20,7 @@
     "audit": "npm audit --omit=dev",
     "auth:setup": "node dist-server/server/auth-cli.js setup",
     "auth:reset": "node dist-server/server/auth-cli.js reset",
+    "auth:unlock": "node dist-server/server/auth-cli.js unlock",
     "auth:status": "node dist-server/server/auth-cli.js status"
   },
   "dependencies": {

@@ -297,7 +297,7 @@ describe('HTTP security boundary (behind authentication)', () => {
     const { origin: _o, ...noOrigin } = good;
     expect((await post('labels', body, noOrigin)).statusCode).toBe(403);
     expect((await post('labels', body, { ...good, origin: 'http://evil.example' })).statusCode).toBe(403);
-    expect((await post('labels', body, { ...good, origin: 'https://localhost:4317' })).statusCode).toBe(403);
+    expect((await post('labels', body, { ...good, origin: 'https://devflow.localhost:4317' })).statusCode).toBe(403);
     expect((await post('labels', body, { ...good, 'sec-fetch-site': 'cross-site' })).statusCode).toBe(403);
     expect((await post('labels', body, { ...good, 'x-devflow-csrf': 'wrong' })).statusCode).toBe(403);
     const { 'x-devflow-csrf': _c, ...noCsrf } = good;

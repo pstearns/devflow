@@ -5,9 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
-import { ARGON2, AuthService, MIN_PASSWORD, SESSION_COOKIE, defaultAuthPath, hashPassword, needsRehash, passwordPolicyError, verifyPassword } from '../server/auth.ts';
+import { request as httpRequest } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { nodeVersionError } from '../server/node-check.ts';
+import { ARGON2, AuthService, MIN_PASSWORD, SESSION_COOKIE, defaultAuthPath, hashPassword, needsRehash, passwordPolicyError, readAuthStatus, verifyPassword } from '../server/auth.ts';
 import { main, promptHidden } from '../server/auth-cli.ts';
-import { buildApp } from '../server/app.ts';
+import { buildApp, normalizePath } from '../server/app.ts';
 import { SnapshotService } from '../server/service.ts';
 import { parseConfig } from '../server/config.ts';
 import { jsonHeaders, makeAuth, randomPassword, signIn } from './helpers.ts';
@@ -71,9 +74,9 @@ describe('account lifecycle', () => {
   it('opening the service never creates an admin; everything stays locked until setup', async () => {
     const w = await webApp({ withAdmin: false });
     expect(w.auth.hasAdmin).toBe(false);
-    expect((await w.app.inject({ url: '/api/snapshot', headers: { host: 'localhost' } })).statusCode).toBe(503);
+    expect((await w.app.inject({ url: '/api/snapshot', headers: { host: 'devflow.localhost:4317' } })).statusCode).toBe(503);
     expect((await login(w.app, 'anything at all here')).statusCode).toBe(503);
-    expect((await w.app.inject({ url: '/api/auth/state', headers: { host: 'localhost' } })).json()).toMatchObject({ setup: false, authenticated: false });
+    expect((await w.app.inject({ url: '/api/auth/state', headers: { host: 'devflow.localhost:4317' } })).json()).toMatchObject({ setup: false, authenticated: false });
     expect(w.auth.hasAdmin).toBe(false); // still none after all of that
   });
   it('creates exactly one admin; reset changes the password and ends every session', async () => {
@@ -159,6 +162,46 @@ describe('login, failures and throttling', () => {
     expect((await login(w.app, w.password)).statusCode).toBe(200); // lock expired; success clears the counter
     for (let i = 0; i < 4; i++) expect((await login(w.app, `fresh wrong attempt ${i} ok!`)).statusCode).toBe(401); // counter really reset
   });
+  it('concurrent wrong guesses cannot outrun the lockout: only the first five are ever verified', async () => {
+    const w = await webApp();
+    const res = await Promise.all(Array.from({ length: 8 }, (_, i) => login(w.app, `concurrent wrong guess ${i}!!`)));
+    expect(res.filter((r) => r.statusCode === 401 || (r.statusCode === 429 && r.json().code === 'locked' && r.headers['retry-after'])).length).toBe(8);
+    expect(w.auth.lockStatus.recentFailures).toBe(5); // 5 guesses were actually checked; the other 3 never reached verification
+    expect(res.every((r) => r.headers['set-cookie'] === undefined)).toBe(true);
+  });
+  it('a correct password queued behind the guesses that cause a lockout is refused, not verified', async () => {
+    const w = await webApp();
+    // called synchronously, so the order in the queue is exactly this order: 5 wrong guesses, then the right password
+    const wrong = Array.from({ length: 5 }, (_, i) => w.auth.login(`queued wrong guess ${i}!!`));
+    const right = w.auth.login(w.password);
+    const rr = await right;
+    expect(rr).toMatchObject({ ok: false, code: 'locked' });
+    expect((await Promise.all(wrong)).every((r) => !r.ok)).toBe(true);
+    expect(w.auth.activeSessions).toBe(0);
+    expect((await login(w.app, w.password)).statusCode).toBe(429); // and it stays locked afterwards
+  });
+  it('bounds pending logins: a flood is refused immediately instead of queueing without limit', async () => {
+    const w = await webApp();
+    const res = await Promise.all(Array.from({ length: 40 }, (_, i) => login(w.app, `flood guess number ${i}!!`)));
+    expect(res.filter((r) => r.statusCode === 429 && r.json().code === 'busy').length).toBeGreaterThanOrEqual(30);
+    expect(res.some((r) => r.statusCode === 200)).toBe(false);
+    expect(w.auth.lockStatus.recentFailures).toBeLessThanOrEqual(5);
+  });
+  it('an internal verification error leaves no stale failure record and does not count toward the lock', async () => {
+    const c = clock();
+    const auth = AuthService.open({ path: ':memory:', clock: c.now, verify: async () => { throw new Error('out of memory'); } });
+    await auth.createAdmin(randomPassword());
+    for (let i = 0; i < 8; i++) await expect(auth.login(`guess number ${i} here!!`)).rejects.toThrow(/out of memory/);
+    expect(auth.lockStatus).toMatchObject({ locked: false, recentFailures: 0 });
+    expect(auth.activeSessions).toBe(0);
+  });
+  it('concurrent valid and invalid logins are counted exactly: a correct login among fewer than five guesses succeeds and clears history', async () => {
+    const w = await webApp();
+    const rs = await Promise.all([...Array.from({ length: 3 }, (_, i) => w.auth.login(`concurrent bad ${i} guess!`)), w.auth.login(w.password)]);
+    expect(rs.slice(0, 3).every((r) => !r.ok)).toBe(true);
+    expect(rs[3]).toMatchObject({ ok: true });
+    expect(w.auth.lockStatus).toMatchObject({ locked: false, recentFailures: 0 });
+  });
   it('rejects malformed login bodies and non-JSON / cross-origin login posts', async () => {
     const w = await webApp();
     for (const bad of [undefined, null, 42, ['x'], { a: 1 }, '']) expect((await login(w.app, bad)).statusCode, JSON.stringify(bad)).toBe(400);
@@ -178,7 +221,7 @@ describe('every endpoint requires a session', () => {
     writeFileSync(join(d, 'assets', 'a.js'), 'console.log(1)'); writeFileSync(join(d, 'secret.txt'), 'not public'); writeFileSync(join(d, 'auth.sqlite'), 'db');
     return d;
   })();
-  const H = { host: 'localhost:4317' };
+  const H = { host: 'devflow.localhost:4317' };
 
   it('API endpoints answer 401 to anonymous, forged and malformed cookies (and never leak data)', async () => {
     const w = await webApp({ dist });
@@ -216,10 +259,134 @@ describe('every endpoint requires a session', () => {
     const l = await w.app.inject({ url: '/login', headers: { ...H, cookie: s.cookie } });
     expect([l.statusCode, l.headers.location]).toEqual([302, '/']);
   });
-  it('the loopback Host check still applies first', async () => {
+  describe('request path normalization (one function for the gate and the static router)', () => {
+    const SHELL = 'app shell';
+    const BAD = [
+      '/assets/..%2findex.html', '/assets/..%2Findex.html', '/assets/%2e%2e%2findex.html', '/assets/..%5cindex.html', // encoded separators
+      '/assets/%252e%252e/index.html', '/assets/..%252findex.html', '/assets/%252e%252e%252findex.html', // double encoding
+      '/assets/%zz', '/assets/%', '/assets/%2', '/assets/a%', '/assets/%c0%ae%c0%ae/index.html', '/assets/%ff', // malformed escapes / invalid UTF-8
+      '/assets/..\\index.html', '/assets/a\\..\\index.html', '/assets\\a.js', // mixed / backslash separators
+      '/assets/%2e%2e/index.html', '/assets/%2E%2E/index.html', '/assets/./a.js', '/assets/%2e/a.js', '/assets//a.js', '//assets/a.js', '/assets/a.js/../../index.html', // dot and empty segments
+      '/assets/%00', '/assets/a%00.js', '/assets/a%0d%0a', // NUL / control characters
+      '/api/%61uth/state', '/api/auth%2fstate', '/api/healthz%00',
+    ];
+    it('normalizePath accepts ordinary paths and rejects every ambiguous representation', () => {
+      for (const ok of ['/', '/login', '/pipeline', '/pipeline/', '/assets/a.js', '/assets/index-Ab3_x.css', '/some/client/route', '/api/issue/ATL-1', '/team/ATL?x=%2f&y=%zz', '/a%20b']) expect(normalizePath(ok), ok).toBeDefined();
+      expect(normalizePath('/a%20b')).toBe('/a b');
+      expect(normalizePath('/pipeline?refresh=1')).toBe('/pipeline');
+      for (const bad of [...BAD, 'assets/a.js', 'http://evil.example/assets/a.js', '', '/assets/../index.html']) expect(normalizePath(bad), bad).toBeUndefined();
+    });
+    it('every bad path is refused (400) before authentication, with or without a session, and never returns the app shell', async () => {
+      const w = await webApp({ dist });
+      const s = await signIn(w.app, w.password);
+      for (const url of BAD) {
+        const anon = await w.app.inject({ url, headers: H });
+        // (light-my-request itself rewrites literal dots/backslashes, so those are covered over a real socket below)
+        expect(anon.body, url).not.toContain(SHELL);
+        const signed = await w.app.inject({ url, headers: { ...H, cookie: s.cookie } });
+        expect(signed.body, url).not.toContain('not public');
+      }
+      for (const url of BAD.filter((u) => u.includes('%') && !/%2e/i.test(u) && !u.includes('%252e%252e/'))) { // (inject's URL parser pre-normalizes %2e dot segments; the socket test covers them)
+        for (const headers of [H, { ...H, cookie: s.cookie }]) expect((await w.app.inject({ url, headers })).statusCode, url).toBe(400);
+      }
+    });
+    it('literal ../ traversal over a real socket (where nothing pre-normalizes the request line) is refused too', async () => {
+      const w = await webApp({ dist });
+      await w.app.listen({ host: '127.0.0.1', port: 0 });
+      const port = (w.app.server.address() as AddressInfo).port;
+      const get = (path: string, headers: Record<string, string> = {}) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const rq = httpRequest({ host: '127.0.0.1', port, path, method: 'GET', headers: { host: 'devflow.localhost:4317', ...headers } }, (res) => {
+          let body = ''; res.on('data', (d) => (body += d)); res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+        });
+        rq.on('error', reject); rq.end();
+      });
+      try {
+        for (const path of ['/assets/../index.html', '/assets/../../etc/passwd', '/assets/a.js/../../index.html', '/assets/./../index.html', '/assets/..%2findex.html', '/../index.html', '/assets/..\\index.html', '/assets\\a.js', '//evil.example/x', '/assets/%2e%2e/index.html', '/assets/%2E%2E/index.html', '/assets/%2e/a.js', '/assets/%2e%2e%2findex.html']) {
+          const r = await get(path);
+          expect([path, r.status]).toEqual([path, 400]);
+          expect(r.body).not.toContain(SHELL);
+        }
+        expect((await get('/assets/a.js')).status).toBe(200);
+        expect((await get('/index.html')).status).toBe(302); // the shell itself still needs a session
+      } finally { await w.app.close(); }
+    });
+    it('/assets/ never falls back to the app shell: unknown, extensionless and directory paths are 404 for anyone', async () => {
+      const w = await webApp({ dist });
+      const s = await signIn(w.app, w.password);
+      expect((await w.app.inject({ url: '/assets', headers: H })).statusCode).toBe(302); // not under /assets/: an ordinary protected route
+      for (const url of ['/assets/nothing', '/assets/', '/assets/missing.js', '/assets/sub/dir']) {
+        for (const headers of [H, { ...H, cookie: s.cookie }]) {
+          const r = await w.app.inject({ url, headers });
+          expect(r.body, url).not.toContain(SHELL);
+          expect(r.statusCode, url).toBe(404);
+        }
+      }
+    });
+    it('normal behaviour is preserved: login assets are public, the shell and SPA routes need a session, refresh works', async () => {
+      const w = await webApp({ dist });
+      for (const url of ['/login', '/login.html', '/assets/a.js']) expect((await w.app.inject({ url, headers: H })).statusCode, url).toBe(200);
+      expect((await w.app.inject({ url: '/pipeline', headers: H })).headers.location).toBe('/login');
+      const s = await signIn(w.app, w.password);
+      for (const url of ['/', '/pipeline', '/pipeline/', '/team/ATL?x=1', '/some/client/route', '/a%20b']) {
+        const r = await s.get(url);
+        expect([url, r.statusCode, r.body.includes(SHELL)], url).toEqual([url, 200, true]); // a browser refresh on any client route
+      }
+      expect((await s.get('/secret.txt')).body).toContain('not public'); // existing files in dist remain servable to a signed-in user only
+      expect((await w.app.inject({ url: '/secret.txt', headers: H })).statusCode).toBe(302);
+    });
+    it('a symlink inside dist that points outside it is not served', async () => {
+      const outside = tmp('devflow-outside-'); writeFileSync(join(outside, 'x.txt'), 'outside secret');
+      const d = tmp('devflow-dist-'); mkdirSync(join(d, 'assets')); writeFileSync(join(d, 'index.html'), SHELL); writeFileSync(join(d, 'login.html'), 'l');
+      symlinkSync(join(outside, 'x.txt'), join(d, 'assets', 'leak.txt'));
+      const w = await webApp({ dist: d });
+      const r = await w.app.inject({ url: '/assets/leak.txt', headers: H });
+      expect([r.statusCode, r.body.includes('outside secret')]).toEqual([404, false]);
+    });
+  });
+  describe('cross-site API reads', () => {
+    it('a page on another local port cannot make authenticated API reads (or refreshes that spend upstream quota)', async () => {
+      const c = clock(); let upstream = 0;
+      const auth = AuthService.open({ path: ':memory:', clock: c.now }); const password = randomPassword(); await auth.createAdmin(password);
+      const service = new SnapshotService(parseConfig({ projects: [] }), { linearKey: 'k', githubToken: 't', fetchImpl: (async () => { upstream++; throw new Error('offline'); }) as typeof fetch });
+      const app = await buildApp(service, { distDir: '/none', auth });
+      const s = await signIn(app, password);
+      for (const extra of [{ 'sec-fetch-site': 'same-site' }, { 'sec-fetch-site': 'cross-site' }, { origin: 'http://localhost:3000' }, { origin: 'http://devflow.localhost:9999' }, { origin: 'null' }] as Record<string, string>[]) {
+        for (const url of ['/api/snapshot?refresh=1', '/api/snapshot', '/api/team/ATL?refresh=1', '/api/issue/ATL-1', '/api/healthz', '/api/auth/session']) {
+          const r = await s.get(url, extra);
+          expect([url, JSON.stringify(extra), r.statusCode]).toEqual([url, JSON.stringify(extra), 403]);
+        }
+      }
+      expect(upstream).toBe(0);
+      expect((await s.get('/api/healthz', { 'sec-fetch-site': 'same-origin' })).statusCode).toBe(200);
+      expect((await s.get('/api/healthz', { 'sec-fetch-site': 'none' })).statusCode).toBe(200); // address-bar navigation
+      expect((await s.get('/api/healthz', { origin: 'http://devflow.localhost:4317' })).statusCode).toBe(200);
+      expect((await s.get('/api/snapshot?refresh=1', { 'sec-fetch-site': 'same-origin' })).statusCode).not.toBe(403);
+    });
+  });
+  it('strict Host validation: only devflow.localhost on the listening port is served; everything else is refused first', async () => {
     const w = await webApp();
     const s = await signIn(w.app, w.password);
-    expect((await w.app.inject({ url: '/api/healthz', headers: { cookie: s.cookie, host: 'evil.example' } })).statusCode).toBe(403);
+    const at = (host: string, url = '/api/healthz') => w.app.inject({ url, headers: { cookie: s.cookie, host } });
+    expect((await at('DEVFLOW.localhost:4317')).statusCode).toBe(200); // host names are case-insensitive
+    for (const bad of ['evil.example', 'devflow.localhost', 'devflow.localhost:4318', 'devflow.localhost.', 'devflow.localhost.evil.example:4317', 'x.devflow.localhost:4317', 'user@devflow.localhost:4317', 'localhost:4317', '127.0.0.1:4317', '[::1]:4317', '']) {
+      expect((await at(bad)).statusCode, bad).toBe(403);
+    }
+    // bare loopback names get a content-free redirect for page navigations only; no cookie is read or set
+    const r = await w.app.inject({ url: '/pipeline?x=1', headers: { cookie: s.cookie, host: 'localhost:4317' } });
+    expect([r.statusCode, r.headers.location, r.headers['set-cookie']]).toEqual([308, 'http://devflow.localhost:4317/pipeline?x=1', undefined]);
+    expect((await w.app.inject({ url: '/api/snapshot', headers: { cookie: s.cookie, host: 'localhost:4317' } })).statusCode).toBe(403);
+    expect((await w.app.inject({ method: 'POST', url: '/api/auth/login', headers: jsonHeaders({ host: 'localhost:4317', origin: 'http://localhost:4317' }), payload: '{}' })).statusCode).toBe(403);
+    // a non-default port is honoured exactly
+    const other = await buildApp(emptyService(), { distDir: '/none', auth: w.auth, port: 5000 });
+    expect((await other.inject({ url: '/api/auth/state', headers: { host: 'devflow.localhost:5000' } })).statusCode).toBe(200);
+    expect((await other.inject({ url: '/api/auth/state', headers: { host: 'devflow.localhost:4317' } })).statusCode).toBe(403);
+  });
+  it('the session cookie is host-only: no Domain attribute, so it is never sent to other local names or apps', async () => {
+    const w = await webApp();
+    const set = String((await login(w.app, w.password)).headers['set-cookie']);
+    expect(set).not.toMatch(/domain=/i);
+    expect(set).toMatch(/HttpOnly/);
+    expect(set).toMatch(/SameSite=Strict/);
   });
 });
 
@@ -228,7 +395,7 @@ describe('session lifetime: 30-minute sliding inactivity timeout, enforced serve
   async function session() {
     const w = await webApp();
     const s = await signIn(w.app, w.password);
-    const at = (url: string, extra: Record<string, string> = {}) => w.app.inject({ url, headers: { host: 'localhost:4317', cookie: s.cookie, ...extra } });
+    const at = (url: string, extra: Record<string, string> = {}) => w.app.inject({ url, headers: { host: 'devflow.localhost:4317', cookie: s.cookie, ...extra } });
     return { ...w, s, at };
   }
   it('expires 30 minutes after the last real interaction, deletes the session and clears the cookie', async () => {
@@ -285,12 +452,43 @@ describe('session lifetime: 30-minute sliding inactivity timeout, enforced serve
     w.c.advance(25 * MIN);
     expect((await w.at('/api/healthz')).statusCode).toBe(200);
   });
+  it('forged requests from another local origin cannot renew a session, even with the interaction header and a valid cookie', async () => {
+    const w = await session();
+    const evil = { origin: 'http://localhost:3000', 'sec-fetch-site': 'same-site' };
+    w.c.advance(25 * MIN);
+    for (const url of ['/api/auth/touch', '/api/actions/labels', '/api/actions/status']) {
+      expect((await w.s.post(url, {}, evil)).statusCode, url).toBe(403);
+      expect((await w.s.post(url, {}, { origin: 'http://127.0.0.1:9999', 'sec-fetch-site': 'cross-site' })).statusCode, url).toBe(403);
+      expect((await w.s.post(url, {}, { 'content-type': 'text/plain' })).statusCode, url).toBe(415);
+      expect((await w.s.post(url, {}, { 'x-devflow-csrf': 'wrong' })).statusCode, url).toBe(403);
+    }
+    expect((await w.s.get('/api/healthz', { 'sec-fetch-site': 'same-site' })).statusCode).toBe(403); // another local origin: refused outright, and must not renew
+    w.c.advance(6 * MIN); // 31 minutes after the last real interaction
+    expect((await w.at('/api/healthz')).statusCode).toBe(401);
+  });
+  it('a validated request renews the session only after every check passed', async () => {
+    const w = await session();
+    w.c.advance(25 * MIN);
+    expect((await w.s.post('/api/actions/status', {})).statusCode).not.toBe(403); // valid origin, content type and CSRF => renewed
+    w.c.advance(25 * MIN);
+    expect((await w.at('/api/healthz')).statusCode).toBe(200);
+  });
+  it('a system clock that moves backwards ends the session instead of extending it', async () => {
+    const w = await session();
+    w.c.advance(10 * MIN);
+    expect((await w.at('/api/healthz')).statusCode).toBe(200);
+    w.c.advance(-60 * MIN); // clock set back an hour
+    expect((await w.at('/api/healthz')).statusCode).toBe(401);
+    w.c.advance(60 * MIN);
+    expect((await w.at('/api/healthz')).statusCode).toBe(401); // and it stays dead once the clock is right again
+    expect(w.auth.activeSessions).toBe(0);
+  });
   it('page navigation with an expired session redirects to the login page', async () => {
     const dist = tmp('devflow-dist-'); writeFileSync(join(dist, 'index.html'), 'x'); writeFileSync(join(dist, 'login.html'), 'x');
     const w = await webApp({ dist });
     const s = await signIn(w.app, w.password);
     w.c.advance(31 * MIN);
-    const r = await w.app.inject({ url: '/', headers: { host: 'localhost:4317', cookie: s.cookie } });
+    const r = await w.app.inject({ url: '/', headers: { host: 'devflow.localhost:4317', cookie: s.cookie } });
     expect([r.statusCode, r.headers.location]).toEqual([302, '/login?expired=1']);
   });
   it('honours a shorter configured idle window (used by browser tests) but defaults to 30 minutes', async () => {
@@ -298,7 +496,7 @@ describe('session lifetime: 30-minute sliding inactivity timeout, enforced serve
     const w = await webApp({ idleSeconds: 5 });
     const s = await signIn(w.app, w.password);
     w.c.advance(6);
-    expect((await w.app.inject({ url: '/api/healthz', headers: { host: 'localhost', cookie: s.cookie } })).statusCode).toBe(401);
+    expect((await w.app.inject({ url: '/api/healthz', headers: { host: 'devflow.localhost:4317', cookie: s.cookie } })).statusCode).toBe(401);
   });
 });
 
@@ -330,7 +528,7 @@ describe('logout, reuse and rotation', () => {
     const t2 = tokenOf(r2)!;
     expect(t2).not.toBe(s1.token);
     expect((await s1.get('/api/healthz')).statusCode).toBe(401); // old token revoked by the fresh login
-    expect((await w.app.inject({ url: '/api/healthz', headers: { host: 'localhost', cookie: `${SESSION_COOKIE}=${t2}` } })).statusCode).toBe(200);
+    expect((await w.app.inject({ url: '/api/healthz', headers: { host: 'devflow.localhost:4317', cookie: `${SESSION_COOKIE}=${t2}` } })).statusCode).toBe(200);
   });
   it('keeps at most 10 live sessions', async () => {
     const { auth, password } = await makeAuth();
@@ -418,13 +616,13 @@ describe('no credential leakage', () => {
     expect(ok.body).not.toContain(token); // the token is delivered ONLY as a cookie...
     const { 'set-cookie': _sc, ...okHeaders } = ok.headers; seen.push(ok.body, JSON.stringify(okHeaders)); // ...so everything but that one header is scanned
     const s = { cookie: `${SESSION_COOKIE}=${token}` };
-    for (const url of ['/api/auth/session', '/api/auth/state', '/api/healthz', '/api/snapshot', '/api/nope']) rec(await w.app.inject({ url, headers: { host: 'localhost', ...s } }));
-    rec(await w.app.inject({ url: '/api/healthz', headers: { host: 'localhost' } })); // anonymous
+    for (const url of ['/api/auth/session', '/api/auth/state', '/api/healthz', '/api/snapshot', '/api/nope']) rec(await w.app.inject({ url, headers: { host: 'devflow.localhost:4317', ...s } }));
+    rec(await w.app.inject({ url: '/api/healthz', headers: { host: 'devflow.localhost:4317' } })); // anonymous
     const blob = [...seen, ...w.logs].join('\n');
     for (const secret of secrets) expect(blob.includes(secret), `leaked ${secret.slice(0, 6)}…`).toBe(false);
     expect(blob).not.toMatch(/\$argon2/);
     expect(w.logs).toEqual(['auth login failed', 'auth login ok']); // events only, nothing identifying
-    const stateBody = (await w.app.inject({ url: '/api/auth/state', headers: { host: 'localhost' } })).json();
+    const stateBody = (await w.app.inject({ url: '/api/auth/state', headers: { host: 'devflow.localhost:4317' } })).json();
     expect(Object.keys(stateBody).sort()).toEqual(['authenticated', 'idleSeconds', 'setup']);
   });
   it('only login, logout and expiry set cookies', async () => {
@@ -457,6 +655,8 @@ describe('interactive CLI', () => {
   it('setup without a terminal fails and creates no account; status prints no secrets; bad usage exits 2', async () => {
     const dir = tmp(); const env = { DEVFLOW_AUTH_DB: join(dir, 'auth.sqlite') } as NodeJS.ProcessEnv;
     const logs: string[] = []; const errs: string[] = [];
+    expect(await main(['status'], env)).toBe(0);
+    expect(readdirSync(dir)).toEqual([]); // status on an uninitialized installation creates nothing
     const lo = console.log, le = console.error;
     console.log = (...a) => logs.push(a.join(' ')); console.error = (...a) => errs.push(a.join(' '));
     try {
@@ -471,7 +671,45 @@ describe('interactive CLI', () => {
     db.close();
     expect(logs.join('\n')).toMatch(/Admin set up:\s+no/);
     expect(logs.join('\n') + errs.join('\n')).not.toContain('argv-password-ignored-123');
-    expect(existsSync(env.DEVFLOW_AUTH_DB!)).toBe(true);
-    expect((statSync(env.DEVFLOW_AUTH_DB!).mode & 0o777).toString(8)).toBe('600');
+  });
+  it('unlock clears a lockout without changing the password or sessions; status reports the lock', async () => {
+    const dir = tmp(); const path = join(dir, 'auth.sqlite'); const env = { DEVFLOW_AUTH_DB: path } as NodeJS.ProcessEnv;
+    const pw = randomPassword();
+    const a = AuthService.open({ path });
+    await a.createAdmin(pw);
+    for (let i = 0; i < 5; i++) await a.login(`wrong guess for the cli ${i}!`);
+    const session = await a.login(pw.slice(0, -1) + 'x'); // still locked; no session
+    expect(session).toMatchObject({ ok: false, code: 'locked' });
+    a.close();
+    const logs: string[] = []; const lo = console.log;
+    console.log = (...x) => logs.push(x.join(' '));
+    try {
+      expect(await main(['status'], env)).toBe(0);
+      expect(logs.join('\n')).toMatch(/Login lock:\s+LOCKED, \d+s remaining/);
+      logs.length = 0;
+      expect(await main(['unlock'], env)).toBe(0);
+      expect(await main(['status'], env)).toBe(0);
+      expect(logs.join('\n')).toMatch(/Login lock:\s+not locked \(0 recent/);
+    } finally { console.log = lo; }
+    const b = AuthService.open({ path });
+    expect(await b.login(pw)).toMatchObject({ ok: true }); // same password still works
+    b.close();
+  });
+  it('status is read-only: it creates no directory or file, and does not alter an existing database or its permissions', async () => {
+    const root = tmp(); const path = join(root, 'not', 'yet', 'auth.sqlite');
+    expect(readAuthStatus(path)).toMatchObject({ exists: false, hasAdmin: false, locked: false });
+    const lo = console.log; console.log = () => {};
+    try { expect(await main(['status'], { DEVFLOW_AUTH_DB: path } as NodeJS.ProcessEnv)).toBe(0); } finally { console.log = lo; }
+    expect(existsSync(join(root, 'not'))).toBe(false);
+    const real = join(root, 'auth.sqlite'); const a = AuthService.open({ path: real }); await a.createAdmin(randomPassword()); a.close();
+    chmodSync(real, 0o644); const before = readFileSync(real);
+    expect(readAuthStatus(real)).toMatchObject({ exists: true, hasAdmin: true, permissions: { file: '644' } });
+    expect((statSync(real).mode & 0o777).toString(8)).toBe('644'); // not "fixed" by a status check
+    expect(readFileSync(real).equals(before)).toBe(true);
+    expect(readdirSync(root).sort()).toEqual(['auth.sqlite']); // no journal or side files
+  });
+  it('enforces Node 24.7+', () => {
+    for (const ok of ['24.7.0', '24.12.1', '25.0.0', '26.6.0']) expect(nodeVersionError(ok), ok).toBeUndefined();
+    for (const bad of ['24.6.9', '24.0.0', '22.22.0', '20.11.1', '18.0.0']) expect(nodeVersionError(bad), bad).toMatch(/24\.7/);
   });
 });

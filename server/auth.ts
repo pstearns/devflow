@@ -24,6 +24,7 @@ const MAX_SESSIONS = 10;
 const LOCK_AFTER = 5; // failed logins before throttling starts
 const LOCK_BASE_S = 30, LOCK_MAX_S = 900; // 30 s doubling to 15 min
 const ATTEMPT_WINDOW_S = 900;
+const MAX_PENDING_LOGINS = 8; // logins waiting for or running a hash; more are refused immediately (bounded queue)
 
 export const defaultAuthPath = (env: NodeJS.ProcessEnv = process.env) => env.DEVFLOW_AUTH_DB || join(homedir(), '.local', 'share', 'devflow', 'auth.sqlite');
 
@@ -67,12 +68,44 @@ export const needsRehash = (phc: string) => {
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
+/** Seconds still locked, given the timestamps (newest first) of failures inside the attempt window. */
+const lockWait = (failuresNewestFirst: number[], nowS: number): number => {
+  if (failuresNewestFirst.length < LOCK_AFTER) return 0;
+  const wait = Math.min(LOCK_MAX_S, LOCK_BASE_S * 2 ** (failuresNewestFirst.length - LOCK_AFTER));
+  return Math.max(0, failuresNewestFirst[0]! + wait - nowS);
+};
+
+export interface AuthStatus { exists: boolean; hasAdmin: boolean; activeSessions: number; locked: boolean; retryAfterSeconds: number; recentFailures: number; permissions?: { dir: string; file: string } }
+
+/**
+ * Non-secret status WITHOUT side effects: never creates the directory or database, never changes permissions, opens
+ * SQLite read-only. An uninitialized installation reports `exists: false`.
+ */
+export function readAuthStatus(path: string, nowMs: number = Date.now(), idleSeconds: number = IDLE_SECONDS): AuthStatus {
+  const none: AuthStatus = { exists: false, hasAdmin: false, activeSessions: 0, locked: false, retryAfterSeconds: 0, recentFailures: 0 };
+  if (path === ':memory:' || !existsSync(path)) return none;
+  const permissions = { dir: (statSync(dirname(path)).mode & 0o777).toString(8), file: (statSync(path).mode & 0o777).toString(8) };
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const has = (t: string) => !!db.prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+    const nowS = Math.floor(nowMs / 1000);
+    const failures = has('login_attempts') ? (db.prepare('SELECT at FROM login_attempts WHERE success = 0 AND at > ? ORDER BY at DESC').all(nowS - ATTEMPT_WINDOW_S) as { at: number }[]).map((r) => r.at) : [];
+    const wait = lockWait(failures, nowS);
+    return {
+      exists: true, permissions,
+      hasAdmin: has('admin') && !!db.prepare('SELECT 1 AS x FROM admin WHERE id = 1').get(),
+      activeSessions: has('sessions') ? (db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE last_activity_ms > ? AND last_activity_ms <= ?').get(nowMs - idleSeconds * 1000, nowMs) as { c: number }).c : 0,
+      locked: wait > 0, retryAfterSeconds: wait, recentFailures: failures.length,
+    };
+  } finally { db.close(); }
+}
+
 export type Login =
   | { ok: true; token: string; csrf: string }
-  | { ok: false; code: 'invalid' | 'locked' | 'not-setup' | 'bad-input'; retryAfterSeconds?: number };
+  | { ok: false; code: 'invalid' | 'locked' | 'busy' | 'not-setup' | 'bad-input'; retryAfterSeconds?: number };
 export type Validated = { ok: true; csrf: string; remainingSeconds: number } | { ok: false; reason: 'none' | 'expired' };
 
-export interface AuthOptions { path: string; clock?: () => number; idleSeconds?: number; log?: (line: string) => void }
+export interface AuthOptions { path: string; clock?: () => number; idleSeconds?: number; log?: (line: string) => void; verify?: (password: string, phc: string) => Promise<boolean> /* tests only */ }
 
 export class AuthService {
   readonly path: string;
@@ -81,11 +114,14 @@ export class AuthService {
   private clock: () => number;
   private log: (l: string) => void;
   private hashing = new Limiter(2); // bound concurrent 64 MiB hashes
+  private pendingLogins = 0;
+  private verify: (password: string, phc: string) => Promise<boolean>;
   private csrfKey: string;
 
   private constructor(opts: AuthOptions, db: DatabaseSync, csrfKey: string) {
     this.path = opts.path; this.db = db; this.csrfKey = csrfKey;
     this.clock = opts.clock ?? Date.now; this.idleSeconds = opts.idleSeconds ?? IDLE_SECONDS; this.log = opts.log ?? (() => {});
+    this.verify = opts.verify ?? verifyPassword;
   }
 
   /** Opens (creating the empty database if needed) with owner-only permissions. Never creates the admin account. */
@@ -164,31 +200,56 @@ export class AuthService {
   }
 
   // ---- throttling -------------------------------------------------------------------------------------------------
+  /** Clears failed-login history (and so any lockout) without touching the password or sessions. Called from the CLI. */
+  unlock(): void { this.db.exec('DELETE FROM login_attempts;'); }
+
+  /** Non-secret lock state for `auth:status`. */
+  get lockStatus(): { locked: boolean; retryAfterSeconds: number; recentFailures: number } {
+    const t = this.now();
+    const n = (this.db.prepare('SELECT COUNT(*) AS c FROM login_attempts WHERE success = 0 AND at > ?').get(t - ATTEMPT_WINDOW_S) as { c: number }).c;
+    const wait = this.lockRemaining();
+    return { locked: wait > 0, retryAfterSeconds: wait, recentFailures: n };
+  }
+
   private lockRemaining(): number {
     const t = this.now();
-    const rows = this.db.prepare('SELECT at FROM login_attempts WHERE success = 0 AND at > ? ORDER BY at DESC').all(t - ATTEMPT_WINDOW_S) as { at: number }[];
-    if (rows.length < LOCK_AFTER) return 0;
-    const wait = Math.min(LOCK_MAX_S, LOCK_BASE_S * 2 ** (rows.length - LOCK_AFTER));
-    return Math.max(0, rows[0]!.at + wait - t);
+    return lockWait((this.db.prepare('SELECT at FROM login_attempts WHERE success = 0 AND at > ? ORDER BY at DESC').all(t - ATTEMPT_WINDOW_S) as { at: number }[]).map((r) => r.at), t);
   }
 
   async login(password: unknown): Promise<Login> {
     if (!this.hasAdmin) return { ok: false, code: 'not-setup' };
     if (typeof password !== 'string' || password.length === 0 || password.length > 1024) return { ok: false, code: 'bad-input' };
-    const wait = this.lockRemaining();
-    if (wait > 0) { this.log('auth login throttled'); return { ok: false, code: 'locked', retryAfterSeconds: wait }; }
-    const row = this.db.prepare('SELECT password_hash FROM admin WHERE id = 1').get() as { password_hash: string };
-    const ok = await this.hashing.run(() => verifyPassword(password, row.password_hash)); // always pays the full hashing cost
-    const t = this.now();
-    this.db.prepare('DELETE FROM login_attempts WHERE at < ?').run(t - 86400);
-    if (!ok) {
-      this.db.prepare('INSERT INTO login_attempts (at, success) VALUES (?, 0)').run(t);
-      const after = this.lockRemaining();
-      this.log('auth login failed');
-      return after > 0 ? { ok: false, code: 'locked', retryAfterSeconds: after } : { ok: false, code: 'invalid' };
-    }
+    if (this.pendingLogins >= MAX_PENDING_LOGINS) { this.log('auth login refused: queue full'); return { ok: false, code: 'busy', retryAfterSeconds: 1 }; }
+    this.pendingLogins++;
+    try {
+      const row = this.db.prepare('SELECT password_hash FROM admin WHERE id = 1').get() as { password_hash: string };
+      // Lock state is decided INSIDE the queue, immediately before verification, so a request that queued before a lockout
+      // cannot be verified after it. The guess is recorded as a failure BEFORE the (async) hash starts, so every concurrent
+      // guess counts against the limit; a correct password then clears the history below.
+      const r = await this.hashing.run(async (): Promise<{ locked: number } | { ok: boolean }> => {
+        const wait = this.lockRemaining();
+        if (wait > 0) return { locked: wait };
+        const id = Number(this.db.prepare('INSERT INTO login_attempts (at, success) VALUES (?, 0)').run(this.now()).lastInsertRowid);
+        try { return { ok: await this.verify(password, row.password_hash) }; } catch (e) {
+          // an internal error is not a wrong guess: do not leave a stale failure that could lock out the real admin
+          this.db.prepare('DELETE FROM login_attempts WHERE id = ?').run(id);
+          throw e;
+        }
+      });
+      if ('locked' in r) { this.log('auth login throttled'); return { ok: false, code: 'locked', retryAfterSeconds: r.locked }; }
+      this.db.prepare('DELETE FROM login_attempts WHERE at < ?').run(this.now() - 86400);
+      if (!r.ok) {
+        const after = this.lockRemaining();
+        this.log('auth login failed');
+        return after > 0 ? { ok: false, code: 'locked', retryAfterSeconds: after } : { ok: false, code: 'invalid' };
+      }
+      return await this.openSession(password, row.password_hash);
+    } finally { this.pendingLogins--; }
+  }
+
+  private async openSession(password: string, storedHash: string): Promise<Login> {
     this.db.prepare('DELETE FROM login_attempts').run();
-    if (needsRehash(row.password_hash)) this.db.prepare('UPDATE admin SET password_hash = ? WHERE id = 1').run(await this.hashing.run(() => hashPassword(password)));
+    if (needsRehash(storedHash)) this.db.prepare('UPDATE admin SET password_hash = ? WHERE id = 1').run(await this.hashing.run(() => hashPassword(password)));
     this.purge();
     const token = randomBytes(32).toString('base64url');
     const hash = sha256(token);
@@ -201,7 +262,7 @@ export class AuthService {
   }
 
   private csrfFor(tokenHash: string) { return createHmac('sha256', this.csrfKey).update(`csrf:${tokenHash}`).digest('hex'); }
-  private purge() { this.db.prepare('DELETE FROM sessions WHERE last_activity_ms <= ?').run(this.nowMs() - this.idleSeconds * 1000); }
+  private purge() { this.db.prepare('DELETE FROM sessions WHERE last_activity_ms <= ? OR last_activity_ms > ?').run(this.nowMs() - this.idleSeconds * 1000, this.nowMs()); }
 
   /**
    * Resolves a cookie token to a live session. Expiry is decided here from the stored last-activity time, regardless of
@@ -214,7 +275,8 @@ export class AuthService {
     const row = this.db.prepare('SELECT id, last_activity_ms FROM sessions WHERE token_hash = ?').get(hash) as { id: number; last_activity_ms: number } | undefined;
     if (!row) return { ok: false, reason: 'none' };
     const t = this.nowMs();
-    if (t - row.last_activity_ms >= this.idleSeconds * 1000) { // exactly the window: not a millisecond more
+    // a clock that moved backwards makes the idle time unknowable, so the session ends (fail closed), like exact expiry
+    if (t < row.last_activity_ms || t - row.last_activity_ms >= this.idleSeconds * 1000) { // exactly the window: not a millisecond more
       this.db.prepare('DELETE FROM sessions WHERE id = ?').run(row.id);
       this.log('auth session expired');
       return { ok: false, reason: 'expired' };
@@ -223,6 +285,9 @@ export class AuthService {
     if (interaction && t > last) { this.db.prepare('UPDATE sessions SET last_activity_ms = ? WHERE id = ?').run(t, row.id); last = t; }
     return { ok: true, csrf: this.csrfFor(hash), remainingSeconds: Math.max(0, Math.ceil((this.idleSeconds * 1000 - (t - last)) / 1000)) };
   }
+
+  /** Slides the idle window. Call ONLY after Origin, content type and CSRF checks have passed for the request. */
+  touch(token: string | undefined): Validated { return this.validate(token, true); }
 
   csrfValid(token: string | undefined, given: unknown): boolean {
     if (!token || typeof given !== 'string') return false;

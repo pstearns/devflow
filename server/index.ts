@@ -1,9 +1,10 @@
+import './node-check.ts'; // must stay first: refuses unsupported Node versions before anything else loads
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, loadEnvFile, type Config } from './config.ts';
 import { demoConfig, demoFetch } from './demo.ts';
-import { buildApp } from './app.ts';
+import { APP_HOSTNAME, buildApp } from './app.ts';
 import { SnapshotService } from './service.ts';
 import { LinearClient } from './linear.ts';
 import { LinearWriteClient } from './linear-write.ts';
@@ -78,20 +79,20 @@ try {
 auth = auth!;
 if (!auth.hasAdmin) console.warn('DevFlow: no admin account yet. Everything is locked until you run "npm run auth:setup" in a terminal.');
 
-const app = await buildApp(service, {
-  auth,
-  actions, distDir: distDir!, onRequest: (m, u) => { lastRequest = Date.now(); if (accessLog) console.log(`${new Date().toISOString()} ${m} ${u.split('?')[0]}`); } });
-
 const HOST = '127.0.0.1'; // loopback only; never exposed to the LAN
 const PORT = Number(process.env.DEVFLOW_PORT) || cfg.port; // exactly one port: no scanning, no silent drift
+const app = await buildApp(service, {
+  auth, port: PORT,
+  actions, distDir: distDir!, onRequest: (m, u) => { lastRequest = Date.now(); if (accessLog) console.log(`${new Date().toISOString()} ${m} ${u.split('?')[0]}`); } });
+
 try {
   await app.listen({ host: HOST, port: PORT });
 } catch (e) {
   die((e as NodeJS.ErrnoException).code === 'EADDRINUSE'
-    ? `port ${PORT} is already in use (is DevFlow already running? try http://localhost:${PORT})`
+    ? `port ${PORT} is already in use (is DevFlow already running? try http://${APP_HOSTNAME}:${PORT})`
     : `could not listen on ${HOST}:${PORT}`);
 }
-console.log(`DevFlow ${demo ? '(DEMO DATA) ' : ''}listening on http://localhost:${PORT}`);
+console.log(`DevFlow ${demo ? '(DEMO DATA) ' : ''}listening on http://${APP_HOSTNAME}:${PORT} (bound to ${HOST})`);
 if (!demo) console.log(`  Linear: ${process.env.LINEAR_API_KEY ? 'key set' : 'LINEAR_API_KEY missing'} · GitHub: ${process.env.GITHUB_TOKEN ? 'token set' : 'GITHUB_TOKEN missing'} · projects: ${cfg.projects.length}`);
 
 let closing = false;

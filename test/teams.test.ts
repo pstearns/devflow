@@ -79,11 +79,11 @@ describe('on-demand team loading', () => {
     const { auth, password } = await makeAuth();
     const app = await buildApp(service, { distDir: '/none', auth });
     const sess = await signIn(app, password);
-    const get = (url: string) => app.inject({ url, headers: { host: 'localhost', cookie: sess.cookie } });
+    const get = (url: string) => app.inject({ url, headers: { host: 'devflow.localhost:4317', cookie: sess.cookie } });
     expect((await get('/api/team/QAT')).json().teams.find((t: { key: string }) => t.key === 'QAT').loaded).toBe(true);
     expect((await get('/api/team/NOPE')).statusCode).toBe(404);
     expect((await get('/api/team/a%20b')).statusCode).toBe(400);
-    expect((await app.inject({ method: 'POST', url: '/api/team/QAT', headers: { host: 'localhost', cookie: sess.cookie } })).statusCode).toBe(405);
+    expect((await app.inject({ method: 'POST', url: '/api/team/QAT', headers: { host: 'devflow.localhost:4317', cookie: sess.cookie } })).statusCode).toBe(405);
   });
 });
 
@@ -264,11 +264,15 @@ describe('scope resolver and configuration migration', () => {
     const withTeam = parseConfig({ ...{ projects: legacy.projects.map((p) => ({ id: p.id, name: p.name, linear: p.linear, github: { repos: p.repos } })) }, teams: [{ key: 'cra', write: true, workflow: { readyLabel: 'Ready' } }] });
     expect(resolveScope(withTeam, 'CRA', undefined)).toMatchObject({ policy: 'team', writeAllowed: true, explicitPolicy: true });
   });
-  it('a teams[] entry without a workflow authorizes writes but not approval; without write it authorizes nothing', () => {
-    const c = parseConfig({ projects: [], teams: [{ key: 'A', write: true }, { key: 'B' }] });
-    expect(resolveScope(c, 'A')).toMatchObject({ writeAllowed: true, explicitPolicy: false, policy: 'default' });
+  it('a write-enabled teams[] entry without a workflow fails closed: rejected by the parser, and read-only if built by hand', () => {
+    expect(() => parseConfig({ projects: [], teams: [{ key: 'A', write: true }] })).toThrow(/requires an explicit "workflow"/);
+    const c = parseConfig({ projects: [], teams: [{ key: 'B' }, { key: 'D', write: true, workflow: { readyLabel: 'Go' } }] });
     expect(resolveScope(c, 'B')).toMatchObject({ writeAllowed: false });
     expect(resolveScope(c, 'C')).toMatchObject({ writeAllowed: false, explicitPolicy: false });
+    expect(resolveScope(c, 'D')).toMatchObject({ writeAllowed: true, explicitPolicy: true });
+    const bypass = { ...c, teams: [{ key: 'A', write: true, repos: [], knowledge: [] }] }; // a Config that never went through parseConfig
+    expect(resolveScope(bypass, 'A')).toMatchObject({ writeAllowed: false, explicitPolicy: false });
+    expect(resolveScope(bypass, 'A').writeReason).toMatch(/no explicit workflow/);
   });
   it('validates teams[] entries', () => {
     expect(() => parseConfig({ projects: [], teams: [{ key: 'A' }, { key: 'a' }] })).toThrow(/Duplicate teams/);
@@ -281,5 +285,22 @@ describe('scope resolver and configuration migration', () => {
     expect(snap.teams.map((t) => t.key)).toEqual(['ATL', 'BCN', 'QAT', 'ZED']);
     expect(snap.teams.every((t) => !t.loaded && !t.configured)).toBe(true);
     expect(snap.issues).toEqual([]); // nothing is read until a team is selected
+  });
+});
+
+describe('custom readiness labels cannot be edited as ordinary labels', () => {
+  it('a team whose ready label is custom (Go) cannot add or remove it through label edits', async () => {
+    const { actions, ops } = await setup();
+    const zed = (await setup()).snap.issues.find((i) => i.identifier.startsWith('ZED-'))!;
+    expect((await fail(actions.labels(zed.identifier, ['lbl-zed-go'], []))).code).toBe('protected-label');
+    expect(ops()).toEqual([]);
+  });
+  it('a write-enabled team with no workflow (config built by hand) refuses every label edit and mutates nothing', async () => {
+    const base = await setup();
+    const cfg = { ...base.cfg, teams: [{ key: 'ZED', write: true, repos: [], knowledge: [] }] };
+    const actions = new LinearActions({ cfg, read: new LinearClient(DEMO_READ_KEY, base.f), write: new LinearWriteClient(DEMO_WRITE_KEY, base.f), service: base.service, clock: () => now });
+    const zed = base.snap.issues.find((i) => i.identifier.startsWith('ZED-'))!;
+    for (const id of ['lbl-zed-go', 'lbl-zed-spike']) expect((await fail(actions.labels(zed.identifier, [id], []))).code).toBe('not-authorized');
+    expect(base.ops()).toEqual([]);
   });
 });

@@ -113,6 +113,8 @@ function parseTeams(raw: unknown): TeamCfg[] {
       if (!REPO_RE.test(r)) throw new Error(`teams[${key}]: repo "${r}" must be owner/repo`);
       return true;
     });
+    // Fail closed: a write-enabled team must say which label means "ready"; the generic default would leave a custom one unprotected.
+    if (t.write === true && !isObj(t.workflow)) throw new Error(`teams[${key}]: write: true requires an explicit "workflow" (readyLabel etc.); refusing to enable writes without one`);
     out.push({ key, write: t.write === true, workflow: isObj(t.workflow) ? parseWorkflow(t.workflow, `team ${key}`) : undefined, repos, knowledge: parseKnowledge(t.knowledge) });
   }
   return out;
