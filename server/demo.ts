@@ -98,6 +98,7 @@ export function demoFetch(nowMs = Date.now(), linearOpts: FakeLinearOpts = {}): 
     if (url.hostname === 'api.linear.app') {
       const auth = new Headers(init?.headers).get('authorization') ?? undefined;
       const r = lin.handle(JSON.parse(String(init?.body)), auth);
+      if (r.lost) throw new TypeError('fetch failed'); // committed upstream, but the caller never saw the answer
       return json(r.json, r.status);
     }
     if (url.hostname === 'api.github.com') {

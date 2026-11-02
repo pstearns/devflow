@@ -92,6 +92,8 @@ const MILESTONE_PROJECT: Record<string, string> = { m1: 'lp-ATL', m2: 'lp-ATL', 
 export interface FakeLinearOpts {
   /** Make a named operation fail with a GraphQL error (used to test failure handling). */
   fail?: (op: string, vars: Record<string, any>) => boolean;
+  /** Apply the mutation, then lose the response (a timeout after commit). Used to test ambiguous-outcome handling. */
+  lostResponse?: (op: string, vars: Record<string, any>) => boolean;
   /** Report success but apply nothing (used to test read-back verification). */
   silentNoop?: (op: string) => boolean;
   /** Teams the READ key cannot see (to test inaccessible teams). */
@@ -130,7 +132,12 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
   const err = (message: string, code: string, status = 200) => ({ status, json: { errors: [{ message, extensions: { code } }] } });
   const ok = (data: unknown) => ({ status: 200, json: { data } });
 
-  function handle(body: { query: string; variables: Record<string, any> }, auth: string | undefined) {
+  function handle(body: { query: string; variables: Record<string, any> }, auth: string | undefined): { status: number; json: unknown; lost?: boolean } {
+    const r = handleInner(body, auth);
+    const m = /^\s*mutation\s+(\w+)/.exec(body.query);
+    return m && opts.lostResponse?.(m[1]!, body.variables ?? {}) && r.status === 200 ? { ...r, lost: true } : r;
+  }
+  function handleInner(body: { query: string; variables: Record<string, any> }, auth: string | undefined) {
     const op = /^\s*(query|mutation)\s+(\w+)/.exec(body.query);
     const kind = op?.[1], name = op?.[2] ?? '';
     const v = body.variables ?? {};
