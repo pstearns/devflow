@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react';
 import type { Issue, Milestone, Snapshot } from '../../../shared/types.ts';
+import { IssueActions } from '../components/Actions.tsx';
+import { IssueLabels, LabelFilter } from '../components/Labels.tsx';
 import { Prompts } from '../components/Prompts.tsx';
 import { Card, Empty, Ext, Pill, Tag, select } from '../components/ui.tsx';
-import { BUCKETS, PRIORITIES, bucketOf, type Route } from '../lib.ts';
+import { BUCKETS, PRIORITIES, bucketOf, inSel, matchesLabels, parseLabelParam, type Route, type Sel } from '../lib.ts';
 
 function Progress({ m }: { m: Milestone }) {
   if (m.progress === null) return <span className="text-muted">no countable tasks</span>;
@@ -18,7 +20,7 @@ function Progress({ m }: { m: Milestone }) {
   );
 }
 
-function TaskRow({ i, depth, snap, onOpen, parentNote }: { i: Issue; depth: number; snap: Snapshot; onOpen: (id: string) => void; parentNote?: string }) {
+function TaskRow({ i, depth, snap, onOpen, parentNote, onResult }: { i: Issue; depth: number; snap: Snapshot; onOpen: (id: string) => void; parentNote?: string; onResult: (s: Snapshot, m: string) => void }) {
   const pr = snap.prs.find((p) => p.key === i.primaryPrKey);
   return (
     <tr className="align-top hover:bg-raised/50">
@@ -29,6 +31,7 @@ function TaskRow({ i, depth, snap, onOpen, parentNote }: { i: Issue; depth: numb
       <td className="max-w-[360px] py-1.5">
         <button className="text-left hover:underline" onClick={() => onOpen(i.identifier)}>{i.title}</button>
         {parentNote && <div className="text-[11px] text-muted">sub-task of {parentNote}</div>}
+        {i.labels.length > 0 && <div className="mt-0.5"><IssueLabels labels={i.labels} defs={snap.labels.filter((l) => l.teamKey === i.teamKey)} /></div>}
       </td>
       <td className="whitespace-nowrap"><Tag>{i.state.name}</Tag></td>
       <td className="whitespace-nowrap text-muted">{i.priorityLabel}</td>
@@ -38,13 +41,13 @@ function TaskRow({ i, depth, snap, onOpen, parentNote }: { i: Issue; depth: numb
       </td>
       <td className="whitespace-nowrap">{pr ? <><Ext href={pr.url} className="mono">#{pr.number}</Ext> <Pill status={pr.ci} compact /></> : <span className="text-muted">{i.stage && !['discovery', 'ready', 'done'].includes(i.stage) ? 'no PR evidence' : '—'}</span>}</td>
       <td className="whitespace-nowrap pr-3">{i.awaitingHuman.length ? <Tag tone="accent">{i.awaitingHuman[0]}</Tag> : i.rework.length ? <Tag tone="bad">↺ {i.rework[0]}</Tag> : i.stale ? <Tag tone="warn">stale</Tag> : ''}</td>
-      <td className="whitespace-nowrap pr-3"><Ext href={i.url} title="Open in Linear to edit">Linear</Ext></td>
+      <td className="whitespace-nowrap pr-3"><span className="flex items-center gap-2"><Ext href={i.url} title="Open in Linear to edit">Linear</Ext><IssueActions issue={i} snap={snap} onResult={onResult} compact /></span></td>
     </tr>
   );
 }
 
-export function Milestones({ snap, issues, project, route, go, onOpen }: {
-  snap: Snapshot; issues: Issue[]; project: string; route: Route; go: (p: Partial<Route>) => void; onOpen: (id: string) => void;
+export function Milestones({ snap, issues, sel, route, go, onOpen, onResult }: {
+  snap: Snapshot; issues: Issue[]; sel: Sel; route: Route; go: (p: Partial<Route>) => void; onOpen: (id: string) => void; onResult: (s: Snapshot, m: string) => void;
 }) {
   const f = route.params;
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -52,16 +55,20 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
   const set = (k: string, v: string) => go({ params: { [k]: v } });
 
   const issueBy = useMemo(() => new Map(snap.issues.map((i) => [i.identifier, i])), [snap]);
+  const selectedLabels = parseLabelParam(f.labels);
   const match = (i: Issue) =>
-    (!f.status || bucketOf(i) === f.status) && (!f.priority || String(i.priority) === f.priority) && (f.blocked !== '1' || i.readiness === 'blocked') &&
+    matchesLabels(i.labels, selectedLabels) && (!f.status || bucketOf(i) === f.status) && (!f.priority || String(i.priority) === f.priority) && (f.blocked !== '1' || i.readiness === 'blocked') &&
     (f.human !== '1' || i.awaitingHuman.length > 0) && (!q || `${i.identifier} ${i.title}`.toLowerCase().includes(q.toLowerCase()));
-  const filtering = !!(f.status || f.priority || f.blocked === '1' || f.human === '1' || q);
+  const filtering = !!(f.labels || f.status || f.priority || f.blocked === '1' || f.human === '1' || q);
 
+  const pname = (m: { teamKey: string; linearProjectId?: string }) => {
+    const t = snap.teams.find((x) => x.key === m.teamKey);
+    return `${sel.team ? '' : `${t?.name ?? m.teamKey} › `}${m.linearProjectId ? t?.projects.find((p) => p.id === m.linearProjectId)?.name ?? 'project' : 'no project'}`;
+  };
   const milestones = snap.milestones
-    .filter((m) => (project === 'all' || m.projectId === project) && (!f.milestone || m.id === f.milestone))
-    .sort((a, b) => Number(a.isUnassigned) - Number(b.isUnassigned) || Number(b.overdue) - Number(a.overdue) || (a.targetDate ?? '9').localeCompare(b.targetDate ?? '9') || a.name.localeCompare(b.name));
-  const msOptions = snap.milestones.filter((m) => project === 'all' || m.projectId === project);
-  const pname = (id: string) => snap.projects.find((p) => p.id === id)?.name ?? id;
+    .filter((m) => inSel(sel, m) && (!f.milestone || m.id === f.milestone))
+    .sort((a, b) => a.teamKey.localeCompare(b.teamKey) || Number(!a.linearProjectId) - Number(!b.linearProjectId) || (a.linearProjectId ?? '').localeCompare(b.linearProjectId ?? '') || Number(a.isUnassigned) - Number(b.isUnassigned) || Number(b.overdue) - Number(a.overdue) || (a.targetDate ?? '9').localeCompare(b.targetDate ?? '9') || a.name.localeCompare(b.name));
+  const msOptions = snap.milestones.filter((m) => inSel(sel, m) && m.kind === 'milestone');
   const toggle = (id: string) => setOpen((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   const rows = (m: Milestone) => {
@@ -82,7 +89,7 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel px-3 py-2">
         <select aria-label="Milestone" className={select} value={f.milestone ?? ''} onChange={(e) => set('milestone', e.target.value)}>
-          <option value="">All milestones</option>{msOptions.map((m) => <option key={m.id} value={m.id}>{m.name}{project === 'all' ? ` — ${pname(m.projectId)}` : ''}</option>)}
+          <option value="">All milestones</option>{msOptions.map((m) => <option key={m.id} value={m.id}>{m.name}{sel.project === 'all' || !sel.team ? ` — ${pname(m)}` : ''}</option>)}
         </select>
         <select aria-label="Status" className={select} value={f.status ?? ''} onChange={(e) => set('status', e.target.value)}>
           <option value="">Any status</option>{BUCKETS.map((b) => <option key={b.id} value={b.id}>{b.label}</option>)}
@@ -90,11 +97,12 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
         <select aria-label="Priority" className={select} value={f.priority ?? ''} onChange={(e) => set('priority', e.target.value)}>
           <option value="">Any priority</option>{PRIORITIES.map((p) => <option key={p.v} value={p.v}>{p.l}</option>)}
         </select>
+        <LabelFilter labels={snap.labels.filter((l) => !sel.team || l.teamKey === sel.team)} selected={selectedLabels} onChange={(n) => set('labels', n.join(','))} />
         <label className="flex items-center gap-1"><input type="checkbox" checked={f.blocked === '1'} onChange={(e) => set('blocked', e.target.checked ? '1' : '')} /> Blocked only</label>
         <label className="flex items-center gap-1"><input type="checkbox" checked={f.human === '1'} onChange={(e) => set('human', e.target.checked ? '1' : '')} /> Awaiting me</label>
         <input aria-label="Search" placeholder="Search id or title" className={`${select} w-44`} value={q} onChange={(e) => setQ(e.target.value)} />
         {(filtering || f.milestone) && <button className="text-accent" onClick={() => { setQ(''); go({ params: {} }); }}>Clear filters</button>}
-        <span className="ml-auto text-[11px] text-muted">Read-only. Edit tasks and milestones in Linear, then refresh.</span>
+        <span className="ml-auto text-[11px] text-muted">Open in Linear to edit freely, or use ⋯ Actions for the controlled changes.</span>
       </div>
 
       {milestones.length === 0 && <Card><Empty>No milestones or tasks loaded. Check integration health.</Empty></Card>}
@@ -111,8 +119,8 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
                 <span className="mono w-3 text-muted" aria-hidden>{expanded ? '▾' : '▸'}</span>
                 <span className="text-[14px] font-semibold">{m.name}</span>
               </button>
-              {project === 'all' && <span className="text-muted">{pname(m.projectId)}</span>}
-              {m.isUnassigned ? <Tag>{m.id.startsWith('unknown') ? 'unreadable milestone' : 'unassigned'}</Tag>
+              <span className="text-muted">{pname(m)}</span>
+              {m.isUnassigned ? <Tag>{m.kind === 'unreadable' ? 'unreadable milestone' : m.kind === 'no-project' ? 'not in a project' : 'unassigned'}</Tag>
                 : <span className={m.overdue ? 'text-bad' : 'text-muted'}>{m.targetDate ? `${m.overdue ? 'Overdue · ' : 'Target '}${m.targetDate}` : 'No target date'}</span>}
               <Progress m={m} />
               <span className="text-muted">{m.total} task{m.total === 1 ? '' : 's'}{m.started ? ` · ${m.started} started` : ''}{m.canceled ? ` · ${m.canceled} canceled` : ''}</span>
@@ -132,14 +140,14 @@ export function Milestones({ snap, issues, project, route, go, onOpen }: {
                         <tr><th className="py-1 pl-3 font-medium">Task</th><th className="font-medium">Title</th><th className="font-medium">State</th><th className="font-medium">Priority</th><th className="font-medium">Readiness</th><th className="font-medium">PR / CI</th><th className="font-medium">Needs</th><th /></tr>
                       </thead>
                       <tbody className="divide-y divide-line">
-                        {out.map((r) => <TaskRow key={r.i.id} i={r.i} depth={r.depth} snap={snap} onOpen={onOpen} parentNote={r.note} />)}
+                        {out.map((r) => <TaskRow key={r.i.id} i={r.i} depth={r.depth} snap={snap} onOpen={onOpen} parentNote={r.note} onResult={onResult} />)}
                       </tbody>
                     </table>
                   </div>
                 ) : <Empty>{total ? 'No tasks match the filters.' : 'No tasks in this milestone.'}</Empty>}
                 {!m.isUnassigned && (
                   <div className="border-t border-line px-3 py-2">
-                    <Prompts prompts={snap.prompts} only={['milestone']} project={pname(m.projectId)} milestone={m.name} />
+                    <Prompts prompts={snap.prompts} only={['milestone']} project={pname({ ...m, teamKey: m.teamKey })} milestone={m.name} />
                   </div>
                 )}
               </div>

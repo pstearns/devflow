@@ -6,6 +6,7 @@ import { GithubClient, fetchRepo } from '../server/github.ts';
 import { LinearClient } from '../server/linear.ts';
 import { Limiter, Memo, SourceError, fetchJson } from '../server/util.ts';
 import { buildApp } from '../server/app.ts';
+import { makeAuth, signIn } from './helpers.ts';
 
 const now = Date.parse('2026-06-01T12:00:00Z');
 const jsonRes = (b: unknown, status = 200, headers: Record<string, string> = {}) => new Response(JSON.stringify(b), { status, headers });
@@ -64,7 +65,7 @@ describe('on-demand reads (no polling)', () => {
     calls.length = 0;
     const snap = (await s.getIssue('ATL-3'))!;
     const i = snap.issues.find((x) => x.identifier === 'ATL-3')!;
-    expect(i.description).toContain('Synthetic description for ATL-3');
+    expect(i.description).toContain('Synthetic description');
     expect(i.detailAt).toBeTruthy();
     expect(calls.filter((c) => c.startsWith('linear:')).sort()).toEqual(['linear:IssueDetail']);
     expect(calls.some((c) => /beacon/.test(c))).toBe(false);
@@ -219,16 +220,18 @@ describe('incomplete evidence is never Passed', () => {
 });
 
 describe('server surface', () => {
-  const app = async () => buildApp(new SnapshotService(demoConfig(), { linearKey: 'k', githubToken: 't', fetchImpl: demoFetch(now), mode: 'demo' }, () => now), { distDir: '/nonexistent' });
+  const app = async () => { const { auth, password } = await makeAuth(); const a = await buildApp(new SnapshotService(demoConfig(), { linearKey: 'k', githubToken: 't', fetchImpl: demoFetch(now), mode: 'demo' }, () => now), { distDir: '/nonexistent', auth }); return Object.assign(a, { sess: await signIn(a, password) }); };
   it('is read-only, loopback-only, validates input, reports readiness', async () => {
     const a = await app();
-    expect((await a.inject({ method: 'POST', url: '/api/snapshot', headers: { host: 'localhost:4317' } })).statusCode).toBe(405);
-    expect((await a.inject({ method: 'GET', url: '/api/snapshot', headers: { host: 'evil.example' } })).statusCode).toBe(403);
-    expect((await a.inject({ url: '/api/issue/not%20valid', headers: { host: 'localhost' } })).statusCode).toBe(400);
-    expect((await a.inject({ url: '/api/issue/ZZZ-1', headers: { host: 'localhost' } })).statusCode).toBe(404);
-    expect((await a.inject({ url: '/api/issue/ATL-3', headers: { host: '127.0.0.1:4317' } })).json().issues.length).toBeGreaterThan(0);
-    expect((await a.inject({ url: '/api/healthz', headers: { host: 'localhost' } })).statusCode).toBe(200);
-    const ready = await a.inject({ url: '/api/readyz', headers: { host: 'localhost' } });
+    const h = (host = 'devflow.localhost:4317') => ({ ...a.sess.headers, host });
+    expect((await a.inject({ method: 'POST', url: '/api/snapshot', headers: h() })).statusCode).toBe(405);
+    expect((await a.inject({ method: 'GET', url: '/api/snapshot', headers: h('evil.example') })).statusCode).toBe(403);
+    expect((await a.inject({ url: '/api/issue/not%20valid', headers: h('devflow.localhost:4317') })).statusCode).toBe(400);
+    expect((await a.inject({ url: '/api/issue/ZZZ-1', headers: h('devflow.localhost:4317') })).statusCode).toBe(404);
+    expect((await a.inject({ url: '/api/issue/ATL-3', headers: h() })).json().issues.length).toBeGreaterThan(0);
+    expect((await a.inject({ url: '/api/issue/ATL-3', headers: h('127.0.0.1:4317') })).statusCode).toBe(403); // bare loopback is no longer served
+    expect((await a.inject({ url: '/api/healthz', headers: h('devflow.localhost:4317') })).statusCode).toBe(200);
+    const ready = await a.inject({ url: '/api/readyz', headers: h('devflow.localhost:4317') });
     expect(ready.statusCode).toBe(503); // no web build at that path: not ready, and says why
     expect(ready.json().webBuild).toBe(false);
   });
@@ -240,8 +243,11 @@ describe('server surface', () => {
     writeFileSync(`${dir}/dist/index.html`, '<html>shell</html>');
     writeFileSync(`${dir}/dist/assets/a.js`, 'console.log(1)');
     writeFileSync(`${dir}/.env`, 'SECRET=hunter2');
-    const a = await buildApp(new SnapshotService(demoConfig(), { mode: 'demo' }, () => now), { distDir: `${dir}/dist` });
-    const get = (url: string) => a.inject({ url, headers: { host: 'localhost' } });
+    const { auth, password } = await makeAuth();
+    writeFileSync(`${dir}/dist/login.html`, '<html>login</html>');
+    const a = await buildApp(new SnapshotService(demoConfig(), { mode: 'demo' }, () => now), { distDir: `${dir}/dist`, auth });
+    const sess = await signIn(a, password);
+    const get = (url: string) => a.inject({ url, headers: { host: 'devflow.localhost:4317', cookie: sess.cookie } });
     expect((await get('/')).body).toContain('shell');
     expect((await get('/some/client/route')).body).toContain('shell');
     const js = await get('/assets/a.js');
@@ -337,6 +343,6 @@ describe('source-specific backoff on issue reads', () => {
     expect(ghCalls).toBeGreaterThan(0); // GitHub still read
     expect(linCalls).toBe(0); // Linear paused until its reset
     expect(snap.health.find((h) => h.id.startsWith('github:'))!.state).toBe('ok');
-    expect(snap.health.find((h) => h.id === 'linear:atlas')!.state).toBe('stale');
+    expect(snap.health.find((h) => h.id === 'linear:team:ATL')!.state).toBe('stale');
   });
 });

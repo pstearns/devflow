@@ -1,7 +1,8 @@
 import type { Snapshot, SourceHealth } from '../shared/types.ts';
 import type { Config } from './config.ts';
-import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, normalizePr, type Denied, type RepoData } from './github.ts';
-import { LinearClient, fetchLinearIssue, fetchLinearProject, type LinearProjectData } from './linear.ts';
+import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, isFreshPrFor, normalizePr, type Denied, type RepoData } from './github.ts';
+import { LinearClient, discoverTeams, fetchLinearIssue, fetchTeamData, type TeamData, type TeamRef } from './linear.ts';
+import { configuredTeamKeys, repoOwners } from './scope.ts';
 import { buildSnapshot } from './snapshot.ts';
 import { SourceError, clampResume, requestScope } from './util.ts';
 
@@ -14,7 +15,10 @@ interface Cached<T> { data: T; at: string }
  * There are no timers here: with no browser connected, no Linear/GitHub request is ever made.
  */
 export class SnapshotService {
-  private linearCache = new Map<string, Cached<LinearProjectData>>();
+  private teamsCache = new Map<string, Cached<{ teams: TeamRef[]; warnings: string[] }>>(); // single entry 'linear:teams'
+  private teamCache = new Map<string, Cached<TeamData>>(); // loaded teams, by team key
+  private extraTeams = new Set<string>(); // teams the user selected that config does not mention: kept loaded on later refreshes
+  private teamInflight = new Map<string, Promise<Snapshot>>();
   private ghCache = new Map<string, Cached<RepoData>>();
   private details = new Map<string, { updatedAt?: string; description: string; at: string }>(); // lazily-fetched descriptions
   private backoff = new Map<string, number>(); // credential ('linear' | 'github') -> epoch ms until which we make no calls
@@ -49,6 +53,11 @@ export class SnapshotService {
       this.backoff.set(cred, clampResume(this.clock(), e.resetAt ? Date.parse(e.resetAt) : undefined));
   }
 
+  /** Overridden when the write feature is attached (see actions.ts). */
+  writeStatus(): { enabled: boolean; reason?: string } { return this.writeInfo; }
+  private writeInfo: { enabled: boolean; reason?: string } = { enabled: false, reason: 'Linear write access is not configured' };
+  setWriteInfo(i: { enabled: boolean; reason?: string }) { this.writeInfo = i; }
+
   private get staleMs() { return this.cfg.staleAfterMinutes * 60_000; }
 
   /** Dashboard open / Refresh. Cached data younger than the stale threshold is reused; `force` re-reads (min 5 s apart). */
@@ -76,34 +85,37 @@ export class SnapshotService {
   }
 
   /** Opening one issue: re-read only that issue (and its PRs' evidence), and only if its detail is missing or stale. */
-  async getIssue(identifier: string): Promise<Snapshot | undefined> {
+  /** Latest assembled snapshot without any I/O. */
+  peek(): Snapshot | undefined { return this.last?.snap; }
+
+  async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {
     const base = this.last?.snap ?? (await this.get());
     const issue = base.issues.find((i) => i.identifier === identifier.toUpperCase());
     if (!issue) return undefined;
-    if (issue.detailAt && this.clock() - Date.parse(issue.detailAt) < this.staleMs) return this.last!.snap;
+    if (!force && issue.detailAt && this.clock() - Date.parse(issue.detailAt) < this.staleMs) return this.last!.snap;
     const key = issue.identifier;
     let p = this.issueInflight.get(key);
     if (!p) {
-      p = this.refreshIssue(issue.identifier, issue.projectId, issue.prKeys).finally(() => this.issueInflight.delete(key));
+      p = this.refreshIssue(issue.identifier, issue.teamKey, issue.prKeys).finally(() => this.issueInflight.delete(key));
       this.issueInflight.set(key, p);
     }
     return p;
   }
 
-  private async refreshIssue(identifier: string, projectId: string, prKeys: string[]): Promise<Snapshot> {
+  private async refreshIssue(identifier: string, teamKey: string, prKeys: string[]): Promise<Snapshot> {
     const now = this.clock();
     for (const cred of ['linear', 'github'] as const)
       if (now < (this.backoff.get(cred) ?? 0) && (cred === 'linear' ? this.linear : this.github))
         throw new SourceError('rate_limit', `${cred === 'linear' ? 'Linear' : 'GitHub'} rate limited; waiting for reset`);
-    await this.refreshIssueSources(identifier, projectId, prKeys, now);
+    await this.refreshIssueSources(identifier, teamKey, prKeys, now);
     return this.assemble();
   }
 
-  private async refreshIssueSources(identifier: string, projectId: string, prKeys: string[], now: number): Promise<void> {
+  private async refreshIssueSources(identifier: string, teamKey: string, prKeys: string[], now: number): Promise<void> {
     if (this.linear) {
       let fresh;
-      try { fresh = await fetchLinearIssue(this.linear, projectId, identifier); } catch (e) { this.noteLimit('linear', e); throw e; }
-      const entry = this.linearCache.get(`linear:${projectId}`);
+      try { fresh = await fetchLinearIssue(this.linear, identifier); } catch (e) { this.noteLimit('linear', e); throw e; }
+      const entry = this.teamCache.get(SnapshotService.teamId(teamKey));
       const idx = entry?.data.issues.findIndex((i) => i.identifier === identifier) ?? -1;
       if (entry && idx >= 0) entry.data.issues[idx] = fresh;
       this.details.set(identifier, { updatedAt: fresh.updatedAt, description: fresh.description, at: new Date(now).toISOString() });
@@ -117,8 +129,11 @@ export class SnapshotService {
         const idx = entry?.data.prs.findIndex((p) => p.number === Number(num)) ?? -1;
         if (!entry || idx < 0) continue;
         // re-read the PR itself so head SHA / state are current, then its evidence
-        const raw = normalizePr(await this.github.get(`/repos/${repo}/pulls/${num}`)) ?? entry.data.prs[idx]!;
-        const next = await fetchPrDetail(this.github, repo, raw, denied, true);
+        const fresh = normalizePr(await this.github.get(`/repos/${repo}/pulls/${num}`));
+        // A malformed answer (e.g. HTTP 200 with {}), another repository's PR, or an inconsistent merged flag is not evidence: the cached PR stays for display only
+        // and is NOT marked verified, so nothing sensitive can rely on it.
+        if (!isFreshPrFor(fresh, repo, Number(num))) { continue; }
+        const next = await fetchPrDetail(this.github, repo, fresh, denied, true);
         entry.data.prs[idx] = next;
         applyRunFallback([next], entry.data.runs);
       }
@@ -151,51 +166,95 @@ export class SnapshotService {
     }
   }
 
+  private teamErrors = new Map<string, string>();
+  private static TEAMS_ID = 'linear:teams';
+  private static teamId = (key: string) => `linear:team:${key}`;
+
   private async refresh(force: boolean, signal: AbortSignal): Promise<Snapshot> {
     const health: SourceHealth[] = []; // committed to this.health only if the refresh is not cancelled
     const jobs: Promise<void>[] = [];
-    const repos = new Set<string>(); // a repo shared by several projects is read once
-    for (const p of this.cfg.projects) {
-      if (p.linear) {
-        const lc = p.linear;
-        if (!this.linear) health.push({ id: `linear:${p.id}`, label: `Linear (${p.name})`, state: 'not_configured', error: 'LINEAR_API_KEY is not set (read-only personal API key required)', warnings: [] });
-        else jobs.push(this.source(health, signal, `linear:${p.id}`, `Linear (${p.name})`, 'linear', this.linearCache, () => fetchLinearProject(this.linear!, p.id, lc)));
+    if (!this.linear) {
+      health.push({ id: SnapshotService.TEAMS_ID, label: 'Linear teams', state: 'not_configured', error: 'LINEAR_API_KEY is not set (read-only personal API key required)', warnings: [] });
+    } else {
+      // 1. discover the teams this key can see (nothing about teams is hard-coded)
+      await this.source(health, signal, SnapshotService.TEAMS_ID, 'Linear teams', 'linear', this.teamsCache, () => discoverTeams(this.linear!));
+      const discovered = this.teamsCache.get(SnapshotService.TEAMS_ID)?.data.teams ?? [];
+      // 2. read data for teams config mentions (and any the user opened earlier); other teams are read when first selected
+      const errors = new Map<string, string>();
+      for (const key of new Set([...configuredTeamKeys(this.cfg), ...this.extraTeams])) {
+        const ref = discovered.find((t) => t.key === key);
+        if (!ref) { if (this.teamsCache.has(SnapshotService.TEAMS_ID)) errors.set(key, `Team ${key} is not visible to this Linear key`); continue; } // discovery failed outright: do not claim the team is invisible
+        jobs.push(this.source(health, signal, SnapshotService.teamId(key), `Linear team ${key}`, 'linear', this.teamCache, () => fetchTeamData(this.linear!, ref)));
       }
-      for (const repo of p.repos) {
-        if (repos.has(repo)) continue;
-        repos.add(repo);
-        if (!this.github) health.push({ id: `github:${repo}`, label: `GitHub ${repo}`, state: 'not_configured', error: 'GITHUB_TOKEN is not set (read-only fine-grained token required)', warnings: [] });
-        else jobs.push(this.source(health, signal, `github:${repo}`, `GitHub ${repo}`, 'github', this.ghCache, () => fetchRepo(this.github!, repo, force, this.clock())));
-      }
+      this.teamErrors = errors;
+    }
+    const repos = new Set(repoOwners(this.cfg).keys()); // each configured repository is read once
+    for (const repo of repos) {
+      if (!this.github) health.push({ id: `github:${repo}`, label: `GitHub ${repo}`, state: 'not_configured', error: 'GITHUB_TOKEN is not set (read-only fine-grained token required)', warnings: [] });
+      else jobs.push(this.source(health, signal, `github:${repo}`, `GitHub ${repo}`, 'github', this.ghCache, () => fetchRepo(this.github!, repo, force, this.clock())));
     }
     await Promise.all(jobs);
     if (this.github?.rateLimit) for (const h of health) if (h.id.startsWith('github:') && !h.rateLimit) h.rateLimit = this.github.rateLimit;
-    if (!this.cfg.projects.length) health.push({ id: 'config', label: 'Configuration', state: 'not_configured', error: 'No projects configured. Copy devflow.config.example.json to devflow.config.json.', warnings: [] });
     if (signal.aborted) throw new SourceError('network', 'Refresh cancelled');
     health.sort((a, b) => a.id.localeCompare(b.id));
     this.health = health;
     return this.assemble();
   }
 
+  /**
+   * Opening a team that has not been read yet (an accessible team that config does not mention, or one that failed earlier).
+   * Reads only that team; other teams, projects and repos are untouched. The team must have been discovered from Linear first,
+   * so a browser-supplied key can never make DevFlow read something this credential cannot see.
+   */
+  async getTeam(keyRaw: string, force = false): Promise<Snapshot | undefined> {
+    const key = keyRaw.toUpperCase();
+    if (!/^[A-Z][A-Z0-9]*$/.test(key)) return undefined;
+    const base = this.last?.snap ?? (await this.get());
+    if (!base.teams.some((t) => t.key === key)) return undefined;
+    const cached = this.teamCache.get(SnapshotService.teamId(key));
+    if (!force && cached && this.clock() - Date.parse(cached.at) < this.staleMs) return this.last!.snap;
+    let p = this.teamInflight.get(key);
+    if (!p) {
+      p = this.loadTeam(key).finally(() => this.teamInflight.delete(key));
+      this.teamInflight.set(key, p);
+    }
+    return p;
+  }
+
+  private async loadTeam(key: string): Promise<Snapshot> {
+    if (!this.linear) throw new SourceError('auth', 'LINEAR_API_KEY is not set');
+    const ref = this.teamsCache.get(SnapshotService.TEAMS_ID)?.data.teams.find((t) => t.key === key);
+    if (!ref) throw new SourceError('not_found', `Team ${key} is not visible to this Linear key`);
+    const local: SourceHealth[] = [];
+    const ctl = new AbortController();
+    await requestScope.run(ctl.signal, () => this.source(local, ctl.signal, SnapshotService.teamId(key), `Linear team ${key}`, 'linear', this.teamCache, () => fetchTeamData(this.linear!, ref)));
+    const h = local[0]!;
+    this.health = [...this.health.filter((x) => x.id !== h.id), h].sort((a, b) => a.id.localeCompare(b.id));
+    if (h.state === 'error') { this.teamErrors.set(key, h.error ?? 'read failed'); throw new SourceError('http', h.error ?? `Could not read team ${key}`); }
+    this.teamErrors.delete(key);
+    if (!configuredTeamKeys(this.cfg).includes(key)) this.extraTeams.add(key); // keep it loaded across later refreshes
+    return this.assemble();
+  }
+
   /** Pure local assembly from caches: makes no network request. */
   private assemble(): Snapshot {
-    const linear = new Map<string, LinearProjectData>();
+    const linear = new Map<string, TeamData>();
     const github = new Map<string, RepoData>();
-    for (const p of this.cfg.projects) {
-      const l = this.linearCache.get(`linear:${p.id}`);
-      if (l) {
-        for (const i of l.data.issues) {
-          const d = this.details.get(i.identifier);
-          const fresh = !!d && d.updatedAt === i.updatedAt; // an edited issue invalidates its cached description
-          i.description = fresh ? d!.description : '';
-          i.detailAt = fresh ? d!.at : undefined;
-        }
-        linear.set(p.id, l.data);
+    for (const c of this.teamCache.values()) {
+      for (const i of c.data.issues) {
+        const d = this.details.get(i.identifier);
+        const fresh = !!d && d.updatedAt === i.updatedAt; // an edited issue invalidates its cached description
+        i.description = fresh ? d!.description : '';
+        i.detailAt = fresh ? d!.at : undefined;
       }
-      for (const repo of p.repos) { const g = this.ghCache.get(`github:${repo}`); if (g) github.set(repo, g.data); }
+      linear.set(c.data.team.key, c.data);
     }
+    for (const repo of repoOwners(this.cfg).keys()) { const g = this.ghCache.get(`github:${repo}`); if (g) github.set(repo, g.data); }
     const times = this.health.map((h) => h.lastSuccess).filter((t): t is string => !!t).sort();
-    const snap = buildSnapshot({ cfg: this.cfg, now: new Date(this.clock()), mode: this.mode, linear, github, health: this.health, dataAt: times[0] });
+    const snap = buildSnapshot({
+      cfg: this.cfg, now: new Date(this.clock()), mode: this.mode, teams: this.teamsCache.get(SnapshotService.TEAMS_ID)?.data.teams,
+      teamErrors: this.teamErrors, linear, github, health: this.health, dataAt: times[0], write: this.writeStatus(),
+    });
     this.last = { snap, at: this.last?.at ?? this.clock() };
     if (times.length) this.last.at = Math.max(...this.health.map((h) => Date.parse(h.lastAttempt ?? '') || 0), 0) || this.clock();
     return snap;

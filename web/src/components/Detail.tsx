@@ -1,8 +1,10 @@
-import type { AttentionItem, Issue, IssueRef, KnowledgeLink, ProjectInfo, PullRequest, Snapshot } from '../../../shared/types.ts';
+import type { AttentionItem, Issue, IssueRef, KnowledgeLink, PullRequest, Snapshot, TeamInfo, TeamProjectInfo } from '../../../shared/types.ts';
+import { IssueActions } from './Actions.tsx';
+import { IssueLabels } from './Labels.tsx';
 import { Lifecycle } from './Lifecycle.tsx';
 import { Prompts } from './Prompts.tsx';
 import { Card, EvidenceList, Ext, Pill, Tag, Time, btn } from './ui.tsx';
-import { copyText } from '../lib.ts';
+import { copyText, type Sel } from '../lib.ts';
 import { useState } from 'react';
 
 function Row({ k, children }: { k: string; children: React.ReactNode }) {
@@ -99,8 +101,11 @@ function PrBlock({ pr }: { pr: PullRequest }) {
   );
 }
 
-export function TicketDetail({ issue, snap, onOpen, loading, error }: { issue: Issue; snap: Snapshot; onOpen: (id: string) => void; loading?: boolean; error?: string }) {
-  const project = snap.projects.find((p) => p.id === issue.projectId);
+export function TicketDetail({ issue, snap, onOpen, loading, error, onResult }: { issue: Issue; snap: Snapshot; onOpen: (id: string) => void; loading?: boolean; error?: string; onResult: (s: Snapshot, message: string) => void }) {
+  const tinfo = snap.teams.find((t) => t.key === issue.teamKey);
+  const pinfo = tinfo?.projects.find((p) => p.id === issue.linearProjectId);
+  const scopeName = tinfo ? `${tinfo.name}${pinfo ? ` › ${pinfo.name}` : ' › no project'}` : issue.teamKey;
+  const labelDefs = snap.labels.filter((l) => l.teamKey === issue.teamKey);
   const ms = snap.milestones.find((m) => m.id === issue.milestoneId);
   const prs = issue.prKeys.map((k) => snap.prs.find((p) => p.key === k)).filter((p): p is PullRequest => !!p);
   const attention = snap.attention.filter((a) => a.ticket === issue.identifier);
@@ -115,9 +120,11 @@ export function TicketDetail({ issue, snap, onOpen, loading, error }: { issue: I
           {issue.rework.length > 0 && <Tag tone="bad">rework</Tag>}
           {issue.readiness === 'blocked' && <Tag tone="bad">blocked</Tag>}
           {issue.stale && <Tag tone="warn">stale</Tag>}
+          <span className="ml-auto"><IssueActions issue={issue} snap={snap} onResult={onResult} /></span>
         </div>
         <h3 className="mt-0.5 text-[15px] font-semibold leading-snug">{issue.title}</h3>
-        <div className="text-[12px] text-muted">{project?.name} · opens in Linear for editing; DevFlow is read-only</div>
+        {issue.labels.length > 0 && <div className="mt-1"><IssueLabels labels={issue.labels} defs={labelDefs} /></div>}
+        <div className="text-[12px] text-muted">{scopeName} · open in Linear to edit freely; DevFlow changes only what the Actions menu allows</div>
       </div>
 
       <Card title="Lifecycle"><div className="p-2"><Lifecycle issue={issue} /></div></Card>
@@ -136,10 +143,11 @@ export function TicketDetail({ issue, snap, onOpen, loading, error }: { issue: I
 
       <Card title="Linear">
         <dl className="p-2">
+          <Row k="Scope"><span>{scopeName}</span> <Tag tone={issue.policy === 'default' ? 'warn' : 'accent'}>{issue.policy === 'project' ? 'project policy' : issue.policy === 'team' ? 'team policy' : 'no explicit policy'}</Tag> <Tag tone={issue.write.allowed ? 'ok' : 'muted'}>{issue.write.allowed ? 'writes authorized' : 'read-only'}</Tag>{!issue.write.allowed && issue.write.reason && <div className="text-[11px] text-muted">{issue.write.reason}</div>}</Row>
           <Row k="Priority">{issue.priorityLabel}</Row>
           <Row k="Assignee">{issue.assignee ?? <span className="text-muted">unassigned</span>}</Row>
           <Row k="Milestone">{ms && !ms.isUnassigned ? <><Ext href={ms.url}>{ms.name}</Ext> {ms.targetDate && <span className="text-muted">target {ms.targetDate}</span>}</> : <span className="text-muted">none</span>}</Row>
-          <Row k="Labels">{issue.labels.length ? issue.labels.map((l) => <Tag key={l}>{l}</Tag>) : <span className="text-muted">none</span>}</Row>
+          <Row k="Labels">{issue.labels.length ? <IssueLabels labels={issue.labels} defs={labelDefs} /> : <span className="text-muted">none</span>}</Row>
           <Row k="Parent">{issue.parentIdentifier ? <button className="mono text-accent" onClick={() => onOpen(issue.parentIdentifier!)}>{issue.parentIdentifier}</button> : <span className="text-muted">none</span>}</Row>
           <Row k="Sub-tasks">{children.length ? children.map((c) => <div key={c.id}><button className="mono text-accent" onClick={() => onOpen(c.identifier)}>{c.identifier}</button> {c.title} <Tag>{c.state.name}</Tag></div>) : <span className="text-muted">none</span>}</Row>
           <Row k="Blocked by"><RefList refs={issue.blockedBy} empty="nothing" /></Row>
@@ -167,34 +175,71 @@ export function TicketDetail({ issue, snap, onOpen, loading, error }: { issue: I
       </Card>
 
       <Card title="Prompts">
-        <div className="p-2"><Prompts prompts={snap.prompts} project={project?.name ?? issue.projectId} ticket={issue.identifier} milestone={ms && !ms.isUnassigned ? ms.name : undefined} /></div>
+        <div className="p-2"><Prompts prompts={snap.prompts} project={scopeName} ticket={issue.identifier} milestone={ms && !ms.isUnassigned ? ms.name : undefined} /></div>
       </Card>
     </div>
   );
 }
 
-export function ProjectDetail({ project, snap }: { project: ProjectInfo; snap: Snapshot }) {
-  const health = snap.health.filter((h) => h.id.startsWith(`linear:${project.id}`) || project.repos.some((r) => h.id === `github:${r.repo}`));
+const POLICY_TEXT = { project: 'a project policy configured for this project', team: 'the explicit team-level policy', default: 'no explicit policy (generic defaults for display only; approval is not available)' } as const;
+
+function SourceLinks({ repos }: { repos: TeamProjectInfo['repos'] }) {
+  if (!repos.length) return <span className="text-muted">No GitHub repository is configured here, so no PR/CI evidence is shown.</span>;
+  return <>{repos.map((r) => <div key={r.repo}><Ext href={r.url}>{r.repo}</Ext> · <Ext href={`${r.url}/pulls`}>PRs</Ext> · <Ext href={r.actionsUrl}>Actions</Ext></div>)}</>;
+}
+
+/** Details for the current Team (or Team › Project) selection. Only configuration for exactly this scope is shown. */
+export function ScopeDetail({ snap, sel, onSelectProject }: { snap: Snapshot; sel: Sel; onSelectProject: (id: string) => void }) {
+  const team = snap.teams.find((t) => t.key === sel.team) as TeamInfo | undefined;
+  if (!team) return null;
+  const project = team.projects.find((p) => p.id === sel.project);
+  const scope = project ?? (sel.project === 'none' || sel.project === 'all' ? undefined : undefined);
+  const info = project ? { policy: project.policy, write: project.write, repos: project.repos, knowledge: project.knowledge, url: project.url } : { policy: team.teamLevel.policy, write: team.teamLevel.write, repos: team.teamLevel.repos, knowledge: team.teamLevel.knowledge, url: undefined as string | undefined };
+  void scope;
+  const health = snap.health.filter((h) => h.id === `linear:team:${team.key}` || (info.repos.some((r) => h.id === `github:${r.repo}`)));
   return (
     <div className="space-y-3">
-      <h3 className="text-[15px] font-semibold">{project.name}</h3>
+      <div>
+        <h3 className="text-[15px] font-semibold">{team.name} <span className="mono text-muted">{team.key}</span>{project ? ` › ${project.name}` : sel.project === 'none' ? ' › no project' : ''}</h3>
+        <div className="text-[12px] text-muted">{project ? 'Linear project' : sel.project === 'none' ? 'Issues that are not in any Linear project' : 'Whole team: every issue, including ones outside any project'}</div>
+      </div>
       <Card title="Go to source">
         <ul className="space-y-1 p-2">
-          <li><span className="inline-block w-24 text-muted">Linear</span>{project.linearUrl ? <Ext href={project.linearUrl}>Project</Ext> : <span className="text-muted">no project URL (not loaded, or several Linear projects)</span>}</li>
-          {project.repos.map((r) => (
-            <li key={r.repo}><span className="inline-block w-24 text-muted">GitHub</span><Ext href={r.url}>{r.repo}</Ext> · <Ext href={`${r.url}/pulls`}>PRs</Ext> · <Ext href={r.actionsUrl}>Actions</Ext></li>
-          ))}
+          <li><span className="inline-block w-24 text-muted">Linear</span>{info.url ? <Ext href={info.url}>Project</Ext> : <span className="text-muted">{project ? 'no project URL provided' : 'Linear provides no team URL; open a project or an issue'}</span>}</li>
+          <li className="flex"><span className="inline-block w-24 shrink-0 text-muted">GitHub</span><span><SourceLinks repos={info.repos} /></span></li>
         </ul>
       </Card>
-      <Card title="Project knowledge">
-        {project.knowledge.length ? <ul className="p-2">{project.knowledge.map((k, i) => <KnowledgeItem key={i} k={k} />)}</ul>
-          : <p className="p-2 text-muted">None configured. Add "knowledge" entries to devflow.config.json.</p>}
+      <Card title="Policy & write access">
+        <dl className="p-2">
+          <Row k="Readiness policy"><span>{POLICY_TEXT[info.policy]}</span></Row>
+          <Row k="Writes"><Tag tone={info.write.allowed ? 'ok' : 'muted'}>{info.write.allowed ? 'authorized' : 'read-only'}</Tag>{!info.write.allowed && info.write.reason && <div className="text-[11px] text-muted">{info.write.reason}</div>}</Row>
+          <Row k="Not inherited"><span className="text-muted">Rules from one project or team are never applied to another.</span></Row>
+        </dl>
+      </Card>
+      {!project && (
+        <Card title={`Projects in ${team.name} (${team.projects.length})`}>
+          <ul className="divide-y divide-line">
+            {team.projects.map((p) => (
+              <li key={p.id} className="flex flex-wrap items-center gap-2 px-3 py-1.5">
+                <button className="font-medium text-accent hover:underline" onClick={() => onSelectProject(p.id)}>{p.name}</button>
+                <Tag tone={p.policy === 'default' ? 'warn' : 'accent'}>{p.policy === 'default' ? 'no explicit policy' : `${p.policy} policy`}</Tag>
+                <Tag tone={p.write.allowed ? 'ok' : 'muted'}>{p.write.allowed ? 'writes authorized' : 'read-only'}</Tag>
+                <Tag>{p.repos.length ? `${p.repos.length} repo${p.repos.length > 1 ? 's' : ''}` : 'no GitHub'}</Tag>
+                {p.url && <span className="ml-auto"><Ext href={p.url}>Linear</Ext></span>}
+              </li>
+            ))}
+            {!team.projects.length && <li className="px-3 py-2 text-muted">This team has no Linear projects; all its issues are unprojected.</li>}
+          </ul>
+        </Card>
+      )}
+      <Card title="Knowledge">
+        {info.knowledge.length ? <ul className="p-2">{info.knowledge.map((k, i) => <KnowledgeItem key={i} k={k} />)}</ul> : <p className="p-2 text-muted">None configured for this scope.</p>}
       </Card>
       <Card title="Integration health">
-        <ul className="space-y-1 p-2">{health.map((h) => <li key={h.id}><b>{h.label}</b>: {h.state}{h.error ? ` — ${h.error}` : ''} {h.lastSuccess && <span className="text-muted">last ok <Time iso={h.lastSuccess} /></span>}</li>)}</ul>
+        <ul className="space-y-1 p-2">{health.map((h) => <li key={h.id}><b>{h.label}</b>: {h.state}{h.error ? ` — ${h.error}` : ''} {h.lastSuccess && <span className="text-muted">last ok <Time iso={h.lastSuccess} /></span>}</li>)}{!health.length && <li className="text-muted">Not read yet.</li>}</ul>
       </Card>
       <Card title="Prompts">
-        <div className="p-2"><Prompts prompts={snap.prompts} project={project.name} /><p className="mt-1 text-[11px] text-muted">Select a ticket to fill in its identifier.</p></div>
+        <div className="p-2"><Prompts prompts={snap.prompts} project={`${team.name}${project ? ` › ${project.name}` : ''}`} /><p className="mt-1 text-[11px] text-muted">Select a ticket to fill in its identifier.</p></div>
       </Card>
     </div>
   );

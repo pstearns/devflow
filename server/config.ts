@@ -3,13 +3,37 @@ import { isObj, str, arr } from './util.ts';
 import type { PromptDef } from '../shared/types.ts';
 
 export interface KnowledgeCfg { title: string; kind: 'obsidian' | 'repo' | 'url'; path?: string; repo?: string; ref?: string; url?: string }
+/** Names of Linear labels/states that carry lifecycle meaning. Configuration, not code: nothing project-specific is built in. */
+export interface WorkflowCfg {
+  readyLabel: string;
+  discoveryLabels: string[];
+  classificationLabels: string[];
+  protectedLabels: string[]; // never editable via the ordinary label menu (readyLabel is always protected)
+  todoState: string;
+  backlogState: string;
+}
+export const DEFAULT_WORKFLOW: WorkflowCfg = {
+  readyLabel: 'Ready', discoveryLabels: ['Discovery'], classificationLabels: ['Idea', 'Bug', 'Security', 'Feature', 'Research', 'Tech Debt'],
+  protectedLabels: [], todoState: 'Todo', backlogState: 'Backlog',
+};
+
 export interface ProjectCfg {
   id: string;
   name: string;
+  workflow: WorkflowCfg;
   linear?: { teamKey: string; projects: string[] };
   repos: string[]; // owner/repo
   knowledge: KnowledgeCfg[];
 }
+/** Explicit team-level entry: authorizes writes for the team's issues that no config project covers, and carries the team-level policy. */
+export interface TeamCfg {
+  key: string;
+  write: boolean;
+  workflow?: WorkflowCfg; // present => an explicit team-level readiness policy exists
+  repos: string[];
+  knowledge: KnowledgeCfg[];
+}
+
 export interface Config {
   port: number;
   staleAfterMinutes: number; // data older than this is shown as stale and re-read on open/focus; never polled
@@ -19,6 +43,7 @@ export interface Config {
   /** Explicit places where independent (e.g. Codex) review results are recorded. Empty => review stays Unknown. */
   review: { checkName?: string; passedLabel?: string; findingsLabel?: string };
   projects: ProjectCfg[];
+  teams: TeamCfg[];
   prompts: PromptDef[];
 }
 
@@ -33,6 +58,50 @@ export const DEFAULT_PROMPTS: PromptDef[] = [
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,40}$/i;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+function strList(v: unknown, fallback: string[]): string[] {
+  return Array.isArray(v) ? v.map((x) => str(x, 100)).filter((x): x is string => !!x) : fallback;
+}
+function bool(v: unknown, d: boolean) { return typeof v === 'boolean' ? v : d; }
+
+function parseWorkflow(raw: unknown, id: string): WorkflowCfg {
+  const d = DEFAULT_WORKFLOW;
+  const w = isObj(raw) ? raw : {};
+  const readyLabel = str(w.readyLabel, 100) ?? d.readyLabel;
+  if (!readyLabel.trim()) throw new Error(`Project "${id}": workflow.readyLabel must not be empty`);
+  return {
+    readyLabel, discoveryLabels: strList(w.discoveryLabels, d.discoveryLabels), classificationLabels: strList(w.classificationLabels, d.classificationLabels),
+    protectedLabels: strList(w.protectedLabels, d.protectedLabels), todoState: str(w.todoState, 100) ?? d.todoState, backlogState: str(w.backlogState, 100) ?? d.backlogState,
+  };
+}
+
+function parseKnowledge(v: unknown): KnowledgeCfg[] {
+  return arr(v, 50).flatMap((k) => {
+    if (!isObj(k)) return [];
+    const kind = k.kind === 'obsidian' || k.kind === 'repo' || k.kind === 'url' ? k.kind : undefined;
+    const title = str(k.title, 200);
+    if (!kind || !title) return [];
+    return [{ title, kind, path: str(k.path, 500), repo: str(k.repo, 200), ref: str(k.ref, 100), url: str(k.url, 2048) }];
+  });
+}
+
+function parseTeams(raw: unknown): TeamCfg[] {
+  const out: TeamCfg[] = [];
+  for (const t of arr(raw, 50)) {
+    if (!isObj(t)) throw new Error('Each teams entry must be an object');
+    const key = (str(t.key, 12) ?? '').toUpperCase();
+    if (!/^[A-Z][A-Z0-9]*$/.test(key)) throw new Error(`teams[]: key "${str(t.key, 12) ?? ''}" invalid`);
+    if (out.some((x) => x.key === key)) throw new Error(`Duplicate teams entry "${key}"`);
+    const repos = (isObj(t.github) ? arr(t.github.repos, 50) : []).map((r) => str(r, 200) ?? '').filter((r) => {
+      if (!REPO_RE.test(r)) throw new Error(`teams[${key}]: repo "${r}" must be owner/repo`);
+      return true;
+    });
+    // Fail closed: a write-enabled team must say which label means "ready"; the generic default would leave a custom one unprotected.
+    if (t.write === true && !isObj(t.workflow)) throw new Error(`teams[${key}]: write: true requires an explicit "workflow" (readyLabel etc.); refusing to enable writes without one`);
+    out.push({ key, write: t.write === true, workflow: isObj(t.workflow) ? parseWorkflow(t.workflow, `team ${key}`) : undefined, repos, knowledge: parseKnowledge(t.knowledge) });
+  }
+  return out;
+}
 
 export function parseConfig(raw: unknown): Config {
   if (!isObj(raw)) throw new Error('Config must be a JSON object');
@@ -62,7 +131,7 @@ export function parseConfig(raw: unknown): Config {
       if (!kind || !title) return [];
       return [{ title, kind, path: str(k.path, 500), repo: str(k.repo, 200), ref: str(k.ref, 100), url: str(k.url, 2048) }];
     });
-    projects.push({ id, name, linear, repos, knowledge });
+    projects.push({ id, name, workflow: parseWorkflow(p.workflow, id), linear, repos, knowledge });
   }
   const ob = isObj(raw.obsidian) && str(raw.obsidian.vault, 200) ? { vault: str(raw.obsidian.vault, 200)!, vaultPath: str(raw.obsidian.vaultPath, 500) } : undefined;
   const rv = isObj(raw.review) ? raw.review : {};
@@ -80,6 +149,7 @@ export function parseConfig(raw: unknown): Config {
     obsidian: ob,
     review: { checkName: str(rv.checkName, 200), passedLabel: str(rv.passedLabel, 100), findingsLabel: str(rv.findingsLabel, 100) },
     projects,
+    teams: parseTeams(raw.teams),
     prompts,
   };
 }

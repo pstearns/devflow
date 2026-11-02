@@ -1,9 +1,10 @@
 // Combines Linear + GitHub data into one derived, read-only Snapshot.
 import type {
-  ActivityEvent, AttentionItem, Evidence, Issue, KnowledgeLink, PullRequest, ProjectInfo, SourceHealth, Snapshot, Stage, Tri,
+  ActivityEvent, AttentionItem, Evidence, Issue, KnowledgeLink, LabelDef, PrScope, PullRequest, SourceHealth, Snapshot, Stage, TeamInfo, TeamProjectInfo, Tri,
 } from '../shared/types.ts';
-import type { Config, ProjectCfg } from './config.ts';
-import { buildMilestones, type LinearProjectData } from './linear.ts';
+import { DEFAULT_WORKFLOW, type Config, type KnowledgeCfg, type WorkflowCfg } from './config.ts';
+import { buildTeamMilestones, type TeamData, type TeamRef } from './linear.ts';
+import { repoOwners, resolveScope, type LinearProjectRef } from './scope.ts';
 import type { RepoData } from './github.ts';
 import { matchPrs } from './match.ts';
 import { ciStatus, humanReviewStatus, independentReviewStatus, status } from './status.ts';
@@ -13,18 +14,21 @@ export interface BuildInput {
   cfg: Config;
   now: Date;
   mode: 'live' | 'demo';
-  linear: Map<string, LinearProjectData>; // by DevFlow project id
+  teams?: TeamRef[]; // discovered from Linear (undefined = discovery unavailable)
+  teamErrors?: Map<string, string>; // per-team read errors
+  linear: Map<string, TeamData>; // loaded teams, by team key
   github: Map<string, RepoData>; // by owner/repo
   health: SourceHealth[];
   dataAt?: string;
+  write?: { enabled: boolean; reason?: string };
 }
 
 const DAY = 86400000;
 const enc = encodeURIComponent;
 
-function knowledgeFor(p: ProjectCfg, cfg: Config, docs: LinearProjectData['documents']): KnowledgeLink[] {
+function knowledgeFrom(list: KnowledgeCfg[], cfg: Config, docs: { title: string; url: string }[]): KnowledgeLink[] {
   const out: KnowledgeLink[] = [];
-  for (const k of p.knowledge) {
+  for (const k of list) {
     if (k.kind === 'obsidian') {
       const path = k.path ?? '';
       const ob = cfg.obsidian;
@@ -48,22 +52,26 @@ function knowledgeFor(p: ProjectCfg, cfg: Config, docs: LinearProjectData['docum
   return out;
 }
 
+const repoLinks = (repos: string[]) => repos.map((r) => ({ repo: r, url: `https://github.com/${r}`, actionsUrl: `https://github.com/${r}/actions` }));
+const wfInfo = (w: WorkflowCfg) => ({ readyLabel: w.readyLabel, discoveryLabels: w.discoveryLabels, classificationLabels: w.classificationLabels, protectedLabels: w.protectedLabels });
+
 function pickPrimary(prs: PullRequest[]): PullRequest | undefined {
   const byUpdated = (a: PullRequest, b: PullRequest) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '');
   const open = prs.filter((p) => p.state === 'open').sort(byUpdated);
   return open[0] ?? prs.filter((p) => p.state === 'merged').sort(byUpdated)[0] ?? undefined;
 }
 
-export function deriveIssue(issue: Issue, prs: PullRequest[], cfg: Config, now: number): void {
+export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, cfg: Config, now: number): void {
   issue.openBlockers = issue.blockedBy.filter((b) => !b.resolved);
   const t = issue.state.type;
   const resolved = t === 'completed' || t === 'canceled';
   const marker = !resolved && issue.openBlockers.length === 0
-    ? (/blocked/i.test(issue.state.name) ? `Linear state "${issue.state.name}"` : issue.labels.find((l) => /^blocked$/i.test(l)) ? 'Linear label "blocked"' : undefined)
+    ? (/blocked/i.test(issue.state.name) ? `Linear state "${issue.state.name}"` : issue.labels.find((l) => /^blocked$/i.test(l.name)) ? 'Linear label "blocked"' : undefined)
     : undefined;
   issue.blockedMarker = marker;
-  issue.readiness = resolved ? 'na' : issue.openBlockers.length || marker ? 'blocked' : t === 'unstarted' ? 'ready' : t === 'backlog' || t === 'triage' ? 'not-ready' : 'na';
+  issue.readiness = 'na'; // set below, once the stage is known
 
+  const hasLabel = (name: string) => issue.labels.some((l) => l.name.toLowerCase() === name.toLowerCase());
   const primary = pickPrimary(prs);
   issue.primaryPrKey = primary?.key;
   const lv = (label: string): Evidence => ({ source: 'Linear state', label, url: issue.url });
@@ -95,12 +103,21 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], cfg: Config, now: 
   } else if (t === 'started') {
     stage = /review/i.test(issue.state.name) ? 'review' : 'implementation';
     issue.stageEvidence.push(lv(`State: ${issue.state.name}${stage === 'review' ? ' (no PR evidence)' : ''}`));
-  } else if (t === 'unstarted') { stage = 'ready'; issue.stageEvidence.push(lv(`State: ${issue.state.name}`)); }
-  else if (t === 'backlog' || t === 'triage') { stage = 'discovery'; issue.stageEvidence.push(lv(`State: ${issue.state.name}`)); }
+  } else if (t === 'unstarted' || t === 'backlog' || t === 'triage') {
+    // Ready is an authorization: it needs BOTH an unstarted (Todo) state and the Ready label.
+    if (hasLabel(wf.readyLabel) && t === 'unstarted') { stage = 'ready'; issue.stageEvidence.push(lv(`State: ${issue.state.name} + label "${wf.readyLabel}"`)); }
+    else {
+      const disc = wf.discoveryLabels.find(hasLabel);
+      stage = disc ? 'discovery' : 'backlog';
+      issue.stageEvidence.push(lv(disc ? `Label "${disc}" (state ${issue.state.name})` : `State: ${issue.state.name}${t === 'unstarted' ? ` — not authorized (no "${wf.readyLabel}" label)` : ''}`));
+      if (hasLabel(wf.readyLabel)) issue.stageEvidence.push(lv(`Label "${wf.readyLabel}" is present but the state is ${issue.state.name}, not an unstarted state; not treated as Ready`));
+    }
+  }
   issue.stage = stage;
+  issue.readiness = resolved ? 'na' : issue.openBlockers.length || marker ? 'blocked' : stage === 'ready' ? 'ready' : stage === 'backlog' || stage === 'discovery' ? 'not-ready' : 'na';
 
   const noPr = (): ReturnType<typeof status> =>
-    t === 'canceled' || !stage || stage === 'discovery' || stage === 'ready'
+    t === 'canceled' || !stage || stage === 'backlog' || stage === 'discovery' || stage === 'ready'
       ? status('na', 'Work has not reached this gate')
       : status('unknown', 'No linked PR evidence');
   issue.gates = {
@@ -123,81 +140,141 @@ export function buildSnapshot(inp: BuildInput): Snapshot {
   const today = now.toISOString().slice(0, 10);
   const issues: Issue[] = [];
   const prs: PullRequest[] = [];
-  const milestones = [] as Snapshot['milestones'];
-  const projects: ProjectInfo[] = [];
+  const milestones: Snapshot['milestones'] = [];
+  const labels: LabelDef[] = [];
+  const teams: TeamInfo[] = [];
+  const low = (x: string) => x.toLowerCase();
 
-  for (const p of cfg.projects) {
-    const ld = inp.linear.get(p.id);
-    projects.push({
-      id: p.id, name: p.name, linearUrl: ld?.projectUrl,
-      repos: p.repos.map((r) => ({ repo: r, url: `https://github.com/${r}`, actionsUrl: `https://github.com/${r}/actions` })),
-      knowledge: knowledgeFor(p, cfg, ld?.documents ?? []),
-    });
-    if (ld) {
-      for (const i of ld.issues) i.childIdentifiers = []; // cached issue objects are reused across builds
-      const byId = new Map(ld.issues.map((i) => [i.identifier, i]));
-      for (const i of ld.issues) if (i.parentIdentifier) byId.get(i.parentIdentifier)?.childIdentifiers.push(i.identifier);
-      issues.push(...ld.issues);
-      milestones.push(...buildMilestones(p.id, ld.milestones, ld.issues, today));
+  // ---- repositories: each belongs to exactly the scope that lists it
+  const owners = repoOwners(cfg);
+  const teamRefs = new Map<string, TeamRef>((inp.teams ?? []).map((t) => [t.key, t]));
+  const projectIdsFor = (teamKey: string, wanted: string[]): string[] => {
+    const t = teamRefs.get(teamKey) ?? inp.linear.get(teamKey)?.team;
+    return (t?.projects ?? []).filter((p) => wanted.some((w) => [p.id, p.name, p.slugId].some((v) => v && low(v) === low(w)))).map((p) => p.id);
+  };
+  const repoScope = new Map<string, PrScope>();
+  for (const [repo, o] of owners) {
+    if (o.projects) {
+      const wanted = o.projects.linear?.projects ?? [];
+      repoScope.set(repo, { teamKey: o.teamKey, projectIds: wanted.length ? projectIdsFor(o.teamKey, wanted) : null, includeUnprojected: false });
+    } else repoScope.set(repo, { teamKey: o.teamKey, projectIds: [], includeUnprojected: true });
+  }
+
+  // ---- issues, scoped per team/project (policy and repos come from the issue's own scope, never from the browser)
+  const reposOf = new Map<string, string[]>();
+  for (const data of inp.linear.values()) {
+    const refs = new Map<string, LinearProjectRef>(data.team.projects.map((p) => [p.id, p]));
+    const byId = new Map(data.issues.map((i) => [i.identifier, i]));
+    for (const i of data.issues) {
+      i.childIdentifiers = []; // cached issue objects are reused across builds
+      const sc = resolveScope(cfg, i.teamKey, i.linearProjectId ? refs.get(i.linearProjectId) ?? { id: i.linearProjectId, name: i.linearProjectName ?? '' } : undefined);
+      i.configProjectId = sc.configProject?.id;
+      i.policy = sc.policy;
+      i.write = { allowed: sc.writeAllowed, reason: sc.writeReason };
+      reposOf.set(i.identifier, sc.repos);
     }
-    for (const repo of p.repos) {
-      for (const r of inp.github.get(repo)?.prs ?? []) {
-        if (prs.some((x) => x.key === `${repo}#${r.number}`)) continue; // repo shared by two projects: first project owns it
-        const pr: PullRequest = {
-          ...r, key: `${repo}#${r.number}`, repo, projectId: p.id,
-          ticket: { link: 'unlinked', candidates: [], via: '' },
-          runs: [],
-          ci: ciStatus(r.checks, r.detail.checksOk, r.detail.checksPartial, r.detail.checkRunsUnavailable),
-          humanReview: humanReviewStatus(r.reviews, r.detail.reviewsOk, r.state, r.detail.reviewsPartial),
-          independentReview: independentReviewStatus({ labels: r.labels, checks: r.checks, state: r.state, detailOk: r.detail.checksOk }, cfg.review),
-        };
-        prs.push(pr);
-      }
+    for (const i of data.issues) if (i.parentIdentifier) byId.get(i.parentIdentifier)?.childIdentifiers.push(i.identifier);
+    issues.push(...data.issues);
+    milestones.push(...buildTeamMilestones(data.team.key, data.team.projects, data.milestones, data.issues, today));
+  }
+
+  // ---- pull requests: only repositories that are configured, each with the scope that owns it
+  for (const [repo, o] of owners) {
+    void o;
+    for (const r of inp.github.get(repo)?.prs ?? []) {
+      const key = `${repo}#${r.number}`;
+      if (prs.some((x) => x.key === key)) continue;
+      prs.push({
+        ...r, key, repo, scope: repoScope.get(repo)!,
+        ticket: { link: 'unlinked', candidates: [], via: '' },
+        runs: [],
+        ci: ciStatus(r.checks, r.detail.checksOk, r.detail.checksPartial, r.detail.checkRunsUnavailable),
+        humanReview: humanReviewStatus(r.reviews, r.detail.reviewsOk, r.state, r.detail.reviewsPartial),
+        independentReview: independentReviewStatus({ labels: r.labels, checks: r.checks, state: r.state, detailOk: r.detail.checksOk }, cfg.review),
+      });
     }
   }
-  matchPrs(prs, issues);
+  // A PR can only link to an issue whose OWN scope lists the PR's repository.
+  matchPrs(prs, issues, (issue, pr) => (reposOf.get(issue.identifier) ?? []).includes(pr.repo));
   const prByKey = new Map(prs.map((p) => [p.key, p]));
-  // attach workflow runs by head sha / branch
-  for (const p of cfg.projects) for (const repo of p.repos) {
+  for (const pr of prs) {
+    const issue = pr.ticket.identifier ? issues.find((i) => i.identifier === pr.ticket.identifier) : undefined;
+    if (issue) pr.scope = { teamKey: issue.teamKey, projectIds: issue.linearProjectId ? [issue.linearProjectId] : [], includeUnprojected: !issue.linearProjectId };
+  }
+  for (const repo of owners.keys())
     for (const run of inp.github.get(repo)?.runs ?? [])
       for (const pr of prs) if (pr.repo === repo && (pr.headSha === run.sha || pr.headRef === run.branch)) pr.runs.push(run);
+  const refsByTeam = new Map([...inp.linear.values()].map((d) => [d.team.key, new Map(d.team.projects.map((p) => [p.id, p]))]));
+  for (const i of issues) {
+    const ref = i.linearProjectId ? refsByTeam.get(i.teamKey)?.get(i.linearProjectId) : undefined;
+    const sc = resolveScope(cfg, i.teamKey, i.linearProjectId ? ref ?? { id: i.linearProjectId, name: i.linearProjectName ?? '' } : undefined);
+    deriveIssue(i, i.prKeys.map((k) => prByKey.get(k)!).filter(Boolean), sc.workflow, cfg, nowMs);
   }
-  for (const i of issues) deriveIssue(i, i.prKeys.map((k) => prByKey.get(k)!).filter(Boolean), cfg, nowMs);
 
-  const activity = buildActivity(issues, prs, inp.github, cfg);
+  // ---- teams as first-class navigation (discovered, then enriched with configuration)
+  const keys = [...new Set([...(inp.teams ?? []).map((t) => t.key), ...inp.linear.keys(), ...inp.teamErrors?.keys() ?? []])];
+  const prot = (w: WorkflowCfg) => [w.readyLabel, ...w.protectedLabels].map(low);
+  for (const key of keys.sort()) {
+    const ref = teamRefs.get(key) ?? inp.linear.get(key)?.team;
+    const data = inp.linear.get(key);
+    const projects: TeamProjectInfo[] = (ref?.projects ?? []).map((p) => {
+      const sc = resolveScope(cfg, key, p);
+      const cp = sc.configProject;
+      return {
+        id: p.id, name: p.name, slugId: p.slugId, url: p.url, configId: cp?.id,
+        repos: repoLinks(sc.repos), knowledge: knowledgeFrom([...(cp?.knowledge ?? []), ...(sc.teamCfg?.knowledge ?? [])], cfg, (data?.documents ?? []).filter((d) => d.projectId === p.id)),
+        policy: sc.policy, write: { allowed: sc.writeAllowed, reason: sc.writeReason }, workflow: wfInfo(sc.workflow),
+      };
+    });
+    const tl = resolveScope(cfg, key, undefined);
+    teams.push({
+      key, id: ref?.id ?? '', name: ref?.name ?? key, loaded: !!data, configured: cfg.projects.some((p) => p.linear?.teamKey === key) || cfg.teams.some((t) => t.key === key),
+      projects, error: inp.teamErrors?.get(key),
+      teamLevel: { policy: tl.policy, write: { allowed: tl.writeAllowed, reason: tl.writeReason }, repos: repoLinks(tl.repos), knowledge: knowledgeFrom(tl.teamCfg?.knowledge ?? [], cfg, []), workflow: wfInfo(tl.workflow) },
+    });
+    if (data) {
+      // protected / classification hints cover every scope in the team; the server still enforces per issue
+      const scopes = [tl, ...(ref?.projects ?? []).map((p) => resolveScope(cfg, key, p))];
+      const protectedNames = new Set(scopes.flatMap((x) => prot(x.workflow)));
+      const classNames = new Set(scopes.flatMap((x) => x.workflow.classificationLabels.map(low)));
+      for (const l of data.labels) labels.push({ ...l, teamKey: key, protected: protectedNames.has(low(l.name)), classification: classNames.has(low(l.name)) });
+    }
+  }
+
+  const activity = buildActivity(issues, prs, inp.github, repoScope);
   const attention = buildAttention(issues, prs, milestones, inp.health, cfg, nowMs);
   return {
     generatedAt: now.toISOString(), dataAt: inp.dataAt ?? now.toISOString(), mode, staleAfterSeconds: cfg.staleAfterMinutes * 60, staleDays: cfg.staleDays,
-    projects, issues, milestones, prs, activity, attention, health: inp.health, prompts: cfg.prompts,
+    teams, issues, milestones, prs, activity, attention, health: inp.health, prompts: cfg.prompts, labels, write: inp.write ?? { enabled: false },
   };
 }
 
 const runTri = (conclusion?: string, st?: string): Tri =>
   st && st !== 'completed' ? 'pending' : conclusion === 'success' ? 'passed' : conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'startup_failure' ? 'failed' : 'unknown';
 
-export function buildActivity(issues: Issue[], prs: PullRequest[], github: Map<string, RepoData>, cfg: Config): ActivityEvent[] {
+export function buildActivity(issues: Issue[], prs: PullRequest[], github: Map<string, RepoData>, repoScope: Map<string, PrScope>): ActivityEvent[] {
   const ev: ActivityEvent[] = [];
   for (const pr of prs) {
-    const base = { source: 'github' as const, projectId: pr.projectId, ticket: pr.ticket.identifier, url: pr.url };
+    const base = { source: 'github' as const, teamKey: pr.scope.teamKey, scope: pr.scope, ticket: pr.ticket.identifier, url: pr.url };
     const t = `#${pr.number} ${pr.title}`;
     if (pr.createdAt) ev.push({ ...base, id: `${pr.key}:open`, ts: pr.createdAt, kind: 'pr_opened', title: t, detail: `Opened by ${pr.author ?? 'unknown'}` });
     if (pr.mergedAt) ev.push({ ...base, id: `${pr.key}:merged`, ts: pr.mergedAt, kind: 'pr_merged', title: t, detail: 'Merged', status: 'passed' });
     else if (pr.state === 'closed' && pr.updatedAt) ev.push({ ...base, id: `${pr.key}:closed`, ts: pr.updatedAt, kind: 'pr_closed', title: t, detail: 'Closed without merge' });
     else if (pr.state === 'open' && pr.updatedAt && pr.updatedAt !== pr.createdAt) ev.push({ ...base, id: `${pr.key}:upd:${pr.updatedAt}`, ts: pr.updatedAt, kind: 'pr_updated', title: t, detail: 'Updated' });
   }
-  for (const p of cfg.projects) for (const repo of p.repos) {
+  for (const [repo, sc] of repoScope) {
     for (const run of github.get(repo)?.runs ?? []) {
       if (!run.at) continue;
       const pr = prs.find((x) => x.repo === repo && (x.headSha === run.sha || x.headRef === run.branch));
       ev.push({
-        id: `${repo}:run:${run.id}`, ts: run.at, source: 'github', kind: 'ci_run', projectId: p.id,
+        id: `${repo}:run:${run.id}`, ts: run.at, source: 'github', kind: 'ci_run', teamKey: (pr?.scope ?? sc).teamKey, scope: pr?.scope ?? sc,
         title: `${run.name} (${repo})`, detail: `${run.branch ?? 'unknown branch'} @ ${run.sha.slice(0, 7)} — ${run.conclusion ?? run.status}`,
         status: runTri(run.conclusion, run.status), ticket: pr?.ticket.identifier, url: run.url,
       });
     }
   }
   for (const i of issues) {
-    const base = { source: 'linear' as const, projectId: i.projectId, ticket: i.identifier, url: i.url };
+    const base = { source: 'linear' as const, teamKey: i.teamKey, linearProjectId: i.linearProjectId, ticket: i.identifier, url: i.url };
     for (const c of i.recentChanges)
       ev.push({ ...base, id: `${i.identifier}:chg:${c.at}`, ts: c.at, kind: 'issue_changed', title: `${i.identifier} ${i.title}`, detail: `${c.from ?? '?'} → ${c.to ?? '?'}${c.actor ? ` by ${c.actor}` : ''}` });
     const newest = i.recentChanges.map((c) => Date.parse(c.at)).sort((a, b) => b - a)[0] ?? 0;
@@ -216,15 +293,15 @@ export function buildAttention(
 
   for (const h of health) {
     if (h.state === 'not_configured')
-      out.push({ id: `health:${h.id}`, kind: 'integration', severity: 'medium', actionable: true, projectId: '', title: `${h.label} is not configured`, cause: h.error ?? 'Missing credentials', evidence: [{ source: 'DevFlow config', label: h.id }], nextAction: 'Add the missing credential to .env (see .env.example), then restart DevFlow.' });
+      out.push({ id: `health:${h.id}`, kind: 'integration', severity: 'medium', actionable: true, teamKey: '', title: `${h.label} is not configured`, cause: h.error ?? 'Missing credentials', evidence: [{ source: 'DevFlow config', label: h.id }], nextAction: 'Add the missing credential to .env (see .env.example), then restart DevFlow.' });
     else if (h.state === 'error' || h.state === 'stale')
-      out.push({ id: `health:${h.id}`, kind: 'integration', severity: 'high', actionable: true, projectId: '', title: `${h.label} ${h.state === 'stale' ? 'is serving stale data' : 'failed'}`, cause: h.error ?? 'Unknown error', evidence: [{ source: 'DevFlow health', label: `Last success: ${h.lastSuccess ?? 'never'}` }], nextAction: 'Fix the cause shown (token, permission, rate limit); data refreshes automatically.' });
+      out.push({ id: `health:${h.id}`, kind: 'integration', severity: 'high', actionable: true, teamKey: '', title: `${h.label} ${h.state === 'stale' ? 'is serving stale data' : 'failed'}`, cause: h.error ?? 'Unknown error', evidence: [{ source: 'DevFlow health', label: `Last success: ${h.lastSuccess ?? 'never'}` }], nextAction: 'Fix the cause shown (token, permission, rate limit); data refreshes automatically.' });
   }
 
   for (const pr of prs) {
     if (pr.state !== 'open') continue;
     const issue = pr.ticket.identifier ? issueBy.get(pr.ticket.identifier) : undefined;
-    const common = { projectId: pr.projectId, ticket: pr.ticket.identifier, prKey: pr.key };
+    const common = { teamKey: pr.scope.teamKey, scope: pr.scope, ticket: pr.ticket.identifier, prKey: pr.key };
     const name = `${pr.ticket.identifier ?? 'Unlinked'} · PR #${pr.number}`;
     if (pr.ci.value === 'failed')
       out.push({ ...common, id: `ci:${pr.key}`, kind: 'ci_failed', severity: 'high', actionable: true, title: `${name}: CI failing`, cause: pr.ci.detail, evidence: pr.ci.evidence, nextAction: 'Open the failing check, fix or rerun, push to the branch.' });
@@ -250,7 +327,7 @@ export function buildAttention(
 
   for (const i of issues) {
     if (i.state.type === 'completed' || i.state.type === 'canceled') continue;
-    const common = { projectId: i.projectId, ticket: i.identifier };
+    const common = { teamKey: i.teamKey, linearProjectId: i.linearProjectId, ticket: i.identifier };
     const lev = (l: string): Evidence => ({ source: 'Linear', label: l, url: i.url });
     if (i.openBlockers.length && (i.state.type === 'started' || i.state.type === 'unstarted'))
       out.push({ ...common, id: `blk:${i.identifier}`, kind: 'blocked', severity: i.state.type === 'started' ? 'high' : 'medium', actionable: true, title: `${i.identifier}: blocked by ${i.openBlockers.map((b) => b.identifier).join(', ')}`, cause: `Unresolved blocking relation(s): ${i.openBlockers.map((b) => `${b.identifier} (${b.stateName})`).join(', ')}`, evidence: i.openBlockers.map((b) => ({ source: 'Linear relation', label: `${b.identifier} blocks ${i.identifier}`, url: b.url })), nextAction: 'Resolve or re-plan the blocker in Linear.' });
@@ -266,7 +343,7 @@ export function buildAttention(
   const today = new Date(nowMs).toISOString().slice(0, 10);
   for (const m of milestones) {
     if (m.overdue)
-      out.push({ id: `ms:${m.id}`, kind: 'milestone_overdue', severity: 'high', actionable: true, projectId: m.projectId, title: `Milestone "${m.name}" is overdue`, cause: `Target ${m.targetDate} (today ${today}); ${m.done} of ${m.total - m.canceled} done`, evidence: [{ source: 'Linear milestone', label: `Target ${m.targetDate}`, url: m.url }], nextAction: 'Re-plan the date or the scope in Linear.' });
+      out.push({ id: `ms:${m.id}`, kind: 'milestone_overdue', severity: 'high', actionable: true, teamKey: m.teamKey, linearProjectId: m.linearProjectId, title: `Milestone "${m.name}" is overdue`, cause: `Target ${m.targetDate} (today ${today}); ${m.done} of ${m.total - m.canceled} done`, evidence: [{ source: 'Linear milestone', label: `Target ${m.targetDate}`, url: m.url }], nextAction: 'Re-plan the date or the scope in Linear.' });
   }
   return out.sort((a, b) => sev[a.severity] - sev[b.severity] || Number(b.actionable) - Number(a.actionable));
 }

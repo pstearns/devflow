@@ -1,19 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeIssue, normalizeRef, buildMilestones, LinearClient } from '../server/linear.ts';
+import { normalizeIssue, normalizeRef, buildTeamMilestones, LinearClient } from '../server/linear.ts';
 import { normalizeCheckRuns, normalizeCommitStatuses, normalizePr, normalizeReviews, GithubClient } from '../server/github.ts';
 import { extractIssueIds, safeUrl } from '../server/util.ts';
 import { parseConfig } from '../server/config.ts';
 
 describe('Linear normalization', () => {
   it('rejects malformed issues and survives hostile fields', () => {
-    expect(normalizeIssue(null, 'p')).toBeUndefined();
-    expect(normalizeIssue({ id: 'x', identifier: 'not an id' }, 'p')).toBeUndefined();
-    const i = normalizeIssue({ id: 'u', identifier: 'cra-61', title: 42, state: 'weird', url: 'javascript:alert(1)', priority: 'high', labels: { nodes: [1, { name: 'ok' }] }, relations: 'x' }, 'p')!;
+    expect(normalizeIssue(null)).toBeUndefined();
+    expect(normalizeIssue({ id: 'x', identifier: 'not an id' })).toBeUndefined();
+    const i = normalizeIssue({ id: 'u', identifier: 'cra-61', title: 42, state: 'weird', url: 'javascript:alert(1)', priority: 'high', labels: { nodes: [1, { name: 'no id' }, { id: 'l1', name: 'ok', color: 'javascript:alert(1)' }] }, relations: 'x' })!;
     expect(i.identifier).toBe('CRA-61');
     expect(i.title).toBe('(untitled)');
     expect(i.url).toBeUndefined();
     expect(i.state.type).toBe('unknown');
-    expect(i.labels).toEqual(['ok']);
+    expect(i.labels).toEqual([{ id: 'l1', name: 'ok', color: '#8b97a7' }]); // bad color never reaches a style
     expect(i.priority).toBe(0);
   });
   it('maps blocking relations in the right direction and ignores other relation types', () => {
@@ -22,15 +22,15 @@ describe('Linear normalization', () => {
       id: 'u', identifier: 'ABC-2', title: 't', state: { name: 'Todo', type: 'unstarted' },
       inverseRelations: { nodes: [{ type: 'blocks', issue: ref('ABC-1', 'started') }, { type: 'related', issue: ref('ABC-9', 'started') }] },
       relations: { nodes: [{ type: 'blocks', relatedIssue: ref('ABC-3', 'unstarted') }] },
-    }, 'p')!;
+    })!;
     expect(i.blockedBy.map((b) => b.identifier)).toEqual(['ABC-1']);
     expect(i.blocks.map((b) => b.identifier)).toEqual(['ABC-3']);
     expect(normalizeRef({ identifier: 'ABC-1', state: { type: 'completed' } })!.resolved).toBe(true);
   });
   it('marks truncated descriptions instead of silently cutting them', () => {
-    const i = normalizeIssue({ id: 'u', identifier: 'ABC-1', title: 't', description: 'x'.repeat(12000), state: { name: 'n', type: 'started' } }, 'p')!;
+    const i = normalizeIssue({ id: 'u', identifier: 'ABC-1', title: 't', description: 'x'.repeat(12000), state: { name: 'n', type: 'started' } })!;
     expect(i.description).toContain('truncated by DevFlow');
-    expect(normalizeIssue({ id: 'u', identifier: 'ABC-1', title: 't', description: 'short', state: { name: 'n', type: 'started' } }, 'p')!.description).toBe('short');
+    expect(normalizeIssue({ id: 'u', identifier: 'ABC-1', title: 't', description: 'short', state: { name: 'n', type: 'started' } })!.description).toBe('short');
   });
   it('only surfaces https links', () => {
     expect(safeUrl('https://github.com/a/b')).toBeTruthy();
@@ -39,21 +39,33 @@ describe('Linear normalization', () => {
 });
 
 describe('milestone progress', () => {
-  const mk = (n: number, type: string, ms?: string) => normalizeIssue({ id: `u${n}`, identifier: `ABC-${n}`, title: 't', state: { name: type, type }, projectMilestone: ms ? { id: ms } : null }, 'p')!;
+  const P = [{ id: 'pr1', name: 'P1', url: 'https://linear.app/p1' }, { id: 'pr2', name: 'P2' }];
+  const mk = (n: number, type: string, ms?: string, project: string | null = 'pr1') => normalizeIssue({ id: `u${n}`, identifier: `ABC-${n}`, title: 't', state: { name: type, type }, team: { key: 'ABC' }, project: project ? { id: project, name: project } : null, projectMilestone: ms ? { id: ms } : null })!;
+  const defs = [{ id: 'm', projectId: 'pr1', name: 'M', description: '', targetDate: '2020-01-01' }, { id: 'empty', projectId: 'pr1', name: 'E', description: '', targetDate: '2020-01-01' }, { id: 'm-other', projectId: 'pr2', name: 'Other project milestone', description: '' }];
   it('computes progress from actual states, excludes canceled, never infers', () => {
     const issues = [mk(1, 'completed', 'm'), mk(2, 'started', 'm'), mk(3, 'canceled', 'm'), mk(4, 'unstarted'), mk(5, 'unstarted', 'gone')];
-    const ms = buildMilestones('p', [{ id: 'm', name: 'M', description: '', targetDate: '2020-01-01' }, { id: 'empty', name: 'E', description: '', targetDate: '2020-01-01' }], issues, '2026-01-01');
+    const ms = buildTeamMilestones('ABC', P, defs, issues, '2026-01-01');
     const m = ms.find((x) => x.id === 'm')!;
-    expect([m.total, m.done, m.canceled, m.progress, m.overdue]).toEqual([3, 1, 1, 0.5, true]);
+    expect([m.total, m.done, m.canceled, m.progress, m.overdue, m.kind]).toEqual([3, 1, 1, 0.5, true, 'milestone']);
     const empty = ms.find((x) => x.id === 'empty')!;
     expect(empty.progress).toBeNull();
     expect(empty.overdue).toBe(false);
-    expect(ms.find((x) => x.id === 'none:p')!.issueIdentifiers).toEqual(['ABC-4']);
-    expect(ms.find((x) => x.id === 'unknown:p')!.issueIdentifiers).toEqual(['ABC-5']);
+    expect(ms.find((x) => x.id === 'none:pr1')!.issueIdentifiers).toEqual(['ABC-4']); // unassigned tasks kept, per project
+    expect(ms.find((x) => x.id === 'unknown:pr1')!.issueIdentifiers).toEqual(['ABC-5']); // unreadable milestone is surfaced
+  });
+  it('keeps project milestone assignments separate per project and shows unprojected issues in their own group', () => {
+    const issues = [mk(1, 'started', 'm'), mk(2, 'started', 'm-other', 'pr2'), mk(3, 'unstarted', undefined, null), mk(4, 'unstarted', undefined, 'pr2')];
+    const ms = buildTeamMilestones('ABC', P, defs, issues, '2026-01-01');
+    expect(ms.find((x) => x.id === 'm')!.issueIdentifiers).toEqual(['ABC-1']);
+    expect(ms.find((x) => x.id === 'm-other')).toMatchObject({ issueIdentifiers: ['ABC-2'], linearProjectId: 'pr2' });
+    expect(ms.find((x) => x.id === 'none:pr2')!.issueIdentifiers).toEqual(['ABC-4']);
+    const noProject = ms.find((x) => x.kind === 'no-project')!;
+    expect(noProject.issueIdentifiers).toEqual(['ABC-3']); // milestones belong to projects, so unprojected issues are grouped apart
+    expect(noProject.linearProjectId).toBeUndefined();
   });
   it('a milestone whose countable issues are all done is not overdue', () => {
-    const ms = buildMilestones('p', [{ id: 'm', name: 'M', description: '', targetDate: '2020-01-01' }], [mk(1, 'completed', 'm')], '2026-01-01');
-    expect(ms[0]!.overdue).toBe(false);
+    const ms = buildTeamMilestones('ABC', P, defs, [mk(1, 'completed', 'm')], '2026-01-01');
+    expect(ms.find((x) => x.id === 'm')!.overdue).toBe(false);
   });
 });
 
@@ -86,6 +98,26 @@ describe('identifier extraction', () => {
   });
 });
 
+describe('Linear query complexity', () => {
+  it('nested page sizes stay within what Linear accepts (100x100 was rejected live; 50x50 is accepted)', async () => {
+    const { Q_TEAMS, Q_ISSUES, Q_TEAM_PROJECTS, Q_ACTION_ISSUE: _ } = { ...(await import('../server/linear.ts')), Q_ACTION_ISSUE: '' };
+    const worst = (q: string) => {
+      // product of `first: N` along the deepest nesting chain, approximated by multiplying every connection size on the path
+      let depth = 0, mult = [1], best = 1;
+      for (const tok of q.match(/first:\s*\d+|[{}]/g) ?? []) {
+        if (tok === '{') depth++;
+        else if (tok === '}') { depth--; mult.length = Math.max(1, depth + 1); }
+        else { const n = Number(tok.replace(/\D/g, '')); mult[depth] = (mult[depth - 1] ?? 1) * n; best = Math.max(best, mult[depth]!); }
+      }
+      return best;
+    };
+    expect(worst(Q_TEAMS)).toBeLessThanOrEqual(2500);
+    expect(worst(Q_TEAMS)).toBeLessThan(10000);
+    expect(worst(Q_ISSUES)).toBeLessThanOrEqual(10000);
+    expect(worst(Q_TEAM_PROJECTS)).toBeLessThanOrEqual(10000);
+  });
+});
+
 describe('read-only guards', () => {
   it('Linear client refuses mutations without making a request', async () => {
     let called = false;
@@ -103,6 +135,17 @@ describe('read-only guards', () => {
 });
 
 describe('config', () => {
+  it('the shipped example config parses and carries the workflow policy', async () => {
+    const { readFileSync } = await import('node:fs');
+    const c = parseConfig(JSON.parse(readFileSync(new URL('../devflow.config.example.json', import.meta.url), 'utf8')));
+    expect(c.projects[0]!.workflow).toMatchObject({ readyLabel: 'Ready', todoState: 'Todo', backlogState: 'Backlog' });
+  });
+  it('workflow settings are per project, validated, and have generic defaults (nothing project-specific built in)', () => {
+    const c = parseConfig({ projects: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B', workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'] } }] });
+    expect(c.projects[0]!.workflow.readyLabel).toBe('Ready');
+    expect(c.projects[1]!.workflow).toMatchObject({ readyLabel: 'Go', discoveryLabels: ['Spike'] });
+    expect(() => parseConfig({ projects: [{ id: 'a', name: 'A', workflow: { readyLabel: '  ' } }] })).toThrow(/readyLabel/);
+  });
   it('never exits on idle by default (opt-in only)', () => {
     expect(parseConfig({ projects: [] }).idleExitMinutes).toBe(0);
     expect(parseConfig({ projects: [], idleExitMinutes: 30 }).idleExitMinutes).toBe(30);

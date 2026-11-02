@@ -18,3 +18,7 @@ Thumbs.db
 .npm/
 .eslintcache
 .cache/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

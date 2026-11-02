@@ -48,7 +48,7 @@ export class GithubClient {
 
 export interface RawPr {
   number: number; title: string; url?: string; state: 'open' | 'closed' | 'merged'; draft: boolean; author?: string;
-  headRef: string; headSha: string; branchUrl?: string; baseRef: string; createdAt?: string; updatedAt?: string; mergedAt?: string; labels: string[];
+  headRef: string; headSha: string; branchUrl?: string; baseRef: string; baseRepo?: string; mergedFlag?: boolean; createdAt?: string; updatedAt?: string; mergedAt?: string; labels: string[];
 }
 
 export function normalizePr(raw: unknown): RawPr | undefined {
@@ -66,10 +66,22 @@ export function normalizePr(raw: unknown): RawPr | undefined {
     number, title: str(raw.title, 500) ?? '', url: safeUrl(raw.html_url), state, draft: raw.draft === true,
     author: isObj(raw.user) ? str(raw.user.login, 100) : undefined,
     headRef, headSha, baseRef: str(base.ref, 300) ?? '',
+    baseRepo: isObj(base.repo) ? str(base.repo.full_name, 200) : undefined, mergedFlag: typeof raw.merged === 'boolean' ? raw.merged : undefined,
     branchUrl: state === 'open' && repoUrl ? `${repoUrl}/tree/${encodeURIComponent(headRef).replace(/%2F/g, '/')}` : undefined,
     createdAt: iso(raw.created_at), updatedAt: iso(raw.updated_at), mergedAt,
     labels: arr(raw.labels, 30).map((l) => (isObj(l) ? str(l.name, 100) : undefined)).filter((x): x is string => !!x),
   };
+}
+
+/**
+ * A fresh single-PR answer is evidence only if it is demonstrably THIS pull request: the repository the PR belongs to
+ * (base.repo.full_name) must be the one that was asked for, the number must match, and "merged" needs GitHub's own
+ * `merged: true` flag together with merged_at (they must agree). Anything else is malformed, never a pass.
+ */
+export function isFreshPrFor(fresh: RawPr | undefined, repo: string, number: number): fresh is RawPr {
+  if (!fresh || fresh.number !== number) return false;
+  if (!fresh.baseRepo || fresh.baseRepo.toLowerCase() !== repo.toLowerCase()) return false;
+  return (fresh.state === 'merged') === (fresh.mergedFlag === true);
 }
 
 export function normalizeCheckRuns(raw: unknown): CheckItem[] {

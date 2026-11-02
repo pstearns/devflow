@@ -7,8 +7,10 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 
 PORT="${DEVFLOW_PORT:-4317}"
-URL="http://localhost:${PORT}"
-ready() { curl -fsS --max-time 2 "${URL}/api/readyz" >/dev/null 2>&1; }
+URL="http://devflow.localhost:${PORT}"
+# /api/* now requires a session, so "is DevFlow up?" is answered by the public sign-in page
+# The probe goes to the loopback address with the exact Host header the server requires, so it needs no name resolution.
+ready() { curl -fsS --max-time 2 -H "Host: devflow.localhost:${PORT}" "http://127.0.0.1:${PORT}/login" 2>/dev/null | grep -q "DevFlow"; }
 
 open_browser() {
   [ "${DEVFLOW_NO_BROWSER:-0}" = "1" ] && return 0
@@ -26,7 +28,7 @@ fi
 # Find node even when launched from a non-interactive shell (nvm is not loaded there).
 NODE="${NODE_BIN:-$(command -v node || true)}"
 if [ -z "${NODE}" ]; then NODE="$(ls -d "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1 || true)"; fi
-[ -x "${NODE:-}" ] || { echo "node not found. Install Node 22+ or set NODE_BIN." >&2; exit 1; }
+[ -x "${NODE:-}" ] || { echo "node not found. Install Node 24.7+ or set NODE_BIN." >&2; exit 1; }
 
 [ -f dist-server/server/index.js ] && [ -f dist/index.html ] || { echo "DevFlow is not built. Run: npm run build" >&2; exit 1; }
 

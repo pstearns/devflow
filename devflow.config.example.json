@@ -2,7 +2,10 @@
   "port": 4317,
   "staleAfterMinutes": 5,
   "staleDays": 5,
-  "obsidian": { "vault": "YourVaultName", "vaultPath": "/mnt/d/AI-Knowledge" },
+  "obsidian": {
+    "vault": "YourVaultName",
+    "vaultPath": "/mnt/AI-Knowledge"
+  },
   "review": {
     "checkName": "",
     "passedLabel": "",
@@ -12,16 +15,74 @@
     {
       "id": "example",
       "name": "Example Project",
-      "linear": { "teamKey": "ABC", "projects": [] },
-      "github": { "repos": ["your-org/your-repo"] },
+      "linear": {
+        "teamKey": "ABC",
+        "projects": []
+      },
+      "github": {
+        "repos": [
+          "your-org/your-repo"
+        ]
+      },
       "knowledge": [
-        { "title": "Project index", "kind": "obsidian", "path": "Projects/Example/Index.md" },
-        { "title": "Repo contract", "kind": "repo", "repo": "your-org/your-repo", "path": "docs/CONTRACT.md", "ref": "main" },
-        { "title": "Runbook", "kind": "url", "url": "https://example.com/runbook" }
-      ]
+        {
+          "title": "Project index",
+          "kind": "obsidian",
+          "path": "Projects/Example/Index.md"
+        },
+        {
+          "title": "Repo contract",
+          "kind": "repo",
+          "repo": "your-org/your-repo",
+          "path": "docs/CONTRACT.md",
+          "ref": "main"
+        },
+        {
+          "title": "Runbook",
+          "kind": "url",
+          "url": "https://example.com/runbook"
+        }
+      ],
+      "workflow": {
+        "readyLabel": "Ready",
+        "discoveryLabels": [
+          "Discovery"
+        ],
+        "classificationLabels": [
+          "Idea",
+          "Bug",
+          "Security",
+          "Feature",
+          "Research",
+          "Tech Debt"
+        ],
+        "protectedLabels": [],
+        "todoState": "Todo",
+        "backlogState": "Backlog"
+      }
     }
   ],
   "prompts": {
     "discover": "Discover {{ticket}} in {{project}}. Read the issue; list gaps and questions. Do not implement."
-  }
+  },
+  "teams": [
+    {
+      "key": "ABC",
+      "write": false,
+      "workflow": {
+        "readyLabel": "Ready",
+        "discoveryLabels": [
+          "Discovery"
+        ],
+        "classificationLabels": [
+          "Idea",
+          "Bug"
+        ]
+      },
+      "github": {
+        "repos": []
+      },
+      "knowledge": []
+    }
+  ]
 }
