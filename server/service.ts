@@ -1,6 +1,6 @@
 import type { Snapshot, SourceHealth } from '../shared/types.ts';
 import type { Config } from './config.ts';
-import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, normalizePr, type Denied, type RepoData } from './github.ts';
+import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, isFreshPrFor, normalizePr, type Denied, type RepoData } from './github.ts';
 import { LinearClient, discoverTeams, fetchLinearIssue, fetchTeamData, type TeamData, type TeamRef } from './linear.ts';
 import { configuredTeamKeys, repoOwners } from './scope.ts';
 import { buildSnapshot } from './snapshot.ts';
@@ -145,9 +145,9 @@ export class SnapshotService {
         if (!entry || idx < 0) continue;
         // re-read the PR itself so head SHA / state are current, then its evidence
         const fresh = normalizePr(await this.github.get(`/repos/${repo}/pulls/${num}`));
-        // A malformed answer (e.g. HTTP 200 with {}) or the wrong PR is not evidence: the cached PR stays for display only
+        // A malformed answer (e.g. HTTP 200 with {}), another repository's PR, or an inconsistent merged flag is not evidence: the cached PR stays for display only
         // and is NOT marked verified, so nothing sensitive can rely on it.
-        if (!fresh || fresh.number !== Number(num)) { this.prVerified.delete(key); continue; }
+        if (!isFreshPrFor(fresh, repo, Number(num))) { this.prVerified.delete(key); continue; }
         const next = await fetchPrDetail(this.github, repo, fresh, denied, true);
         entry.data.prs[idx] = next;
         applyRunFallback([next], entry.data.runs);

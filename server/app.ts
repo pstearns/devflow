@@ -222,7 +222,7 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
         case 'status': return await actions.status(identifier, body.stateId as string);
         case 'milestone': return await actions.milestone(identifier, body.milestoneId === null ? null : (body.milestoneId as string));
         case 'approve': return await actions.approve(identifier, body.confirm);
-        case 'revoke': return await actions.revoke(identifier, body.confirm, body.reason);
+        case 'revoke': return await actions.revoke(identifier, body.confirm);
         default: return reply.code(404).send({ ok: false, code: 'unknown-action', error: 'Unknown action' });
       }
     } catch (e) { return actionFail(reply, e); }

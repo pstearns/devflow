@@ -35,7 +35,7 @@ describe('credential separation', () => {
     expect(f.store.issues.ATL!.find((x) => x.n === 3)!.labels).toEqual(['Feature']);
     const w = new LinearWriteClient(DEMO_WRITE_KEY, f);
     await expect(w.addLabel('bad id!', 'lbl-bug')).rejects.toThrow(); // ids are validated
-    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(w)).sort()).toEqual(['addLabel', 'comment', 'constructor', 'id', 'removeLabel', 'run', 'setMilestone', 'setState', 'viewerName'].sort()); // no generic send / delete
+    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(w)).sort()).toEqual(['addLabel', 'constructor', 'id', 'removeLabel', 'run', 'setMilestone', 'setState'].sort()); // no generic send / delete
   });
   it('write stays disabled without a write credential', async () => {
     const { actions, ops } = await setup({}, false);
@@ -103,7 +103,7 @@ describe('approval eligibility (pure policy)', () => {
   it('honours per-project policy and missing prerequisites', () => {
     const base = { id: 'u', identifier: 'ABC-1', title: 't', description: 'x'.repeat(60), priority: 0, state: { id: 's1', name: 'Backlog', type: 'backlog' as const }, teamKey: 'ABC',
       states: [{ id: 's1', name: 'Backlog', type: 'backlog' as const, position: 0 }, { id: 's2', name: 'Todo', type: 'unstarted' as const, position: 1 }],
-      labels: [], milestones: [], openBlockers: [], depsVerifiable: true, comments: [], teamLabels: [{ id: 'r', name: 'Ready', color: '#fff', isGroup: false, scope: 'team' as const }] };
+      labels: [], milestones: [], openBlockers: [], depsVerifiable: true, records: [], teamLabels: [{ id: 'r', name: 'Ready', color: '#fff', isGroup: false, scope: 'team' as const }] };
     expect(evaluateApproval(base, DEFAULT_WORKFLOW, true, OK_SCOPE).eligible).toBe(true);
     const strict = { ...DEFAULT_WORKFLOW, readiness: { ...DEFAULT_WORKFLOW.readiness, requireMilestone: true, requirePriority: true, requireClassificationLabel: true } };
     expect(evaluateApproval(base, strict, true, OK_SCOPE).checks.filter((c) => !c.ok).map((c) => c.id).sort()).toEqual(['classification', 'milestone', 'priority']);
@@ -129,73 +129,41 @@ describe('approve for execution', () => {
     }
     expect(ops()).toEqual([]);
   });
-  it('moves to Todo + Ready, records owner approval evidence, then re-reads and verifies', async () => {
-    const { actions, spec, ops, f, logs } = await setup();
+  it('moves to Todo + Ready, then re-reads Linear and verifies (no comments, nothing else written)', async () => {
+    const { actions, spec, ops, logs } = await setup();
     const r = await actions.approve('ATL-15', 'atl-15'); // case-insensitive confirmation
     expect(r).toMatchObject({ ok: true, verified: true });
     expect(spec('ATL-15').state).toBe('Todo');
     expect(spec('ATL-15').labels).toContain('Ready');
     expect(spec('ATL-15').labels).toContain('Idea'); // unrelated label preserved
-    expect(ops()).toEqual(['Viewer'.replace('Viewer', 'IssueUpdate'), 'IssueAddLabel', 'CommentCreate']);
-    const note = f.store.comments.get('ATL-15')![0]!.body;
-    expect(note).toMatch(/Approved for execution/);
-    expect(note).toMatch(/Approved by: Demo Owner/);
-    expect(note).toMatch(/devflow-approval:/);
+    expect(ops()).toEqual(['IssueUpdate', 'IssueAddLabel']); // Todo, then Ready: exactly what a person would do in Linear
     expect(r.snapshot.issues.find((i) => i.identifier === 'ATL-15')!.stage).toBe('ready'); // classification derived from the verified Linear state
     expect(logs.join('\n')).not.toMatch(new RegExp(DEMO_WRITE_KEY)); // credentials never logged
     expect(logs).toEqual(['action=approve issue=ATL-15 outcome=ok']);
   });
-  it('rolls back when a step fails (no Ready without evidence)', async () => {
-    const { actions, spec } = await setup({ fail: (op) => op === 'CommentCreate' });
-    const e = await fail(actions.approve('ATL-15', 'ATL-15'));
-    expect(e.code).toBe('write-failed');
-    expect(e.message).toMatch(/rolled back/);
-    expect(spec('ATL-15').state).toBe('Backlog');
-    expect(spec('ATL-15').labels).not.toContain('Ready');
-  });
-  it('rolls back when the label write fails after the state change', async () => {
-    const { actions, spec } = await setup({ fail: (op) => op === 'IssueAddLabel' });
-    expect((await fail(actions.approve('ATL-15', 'ATL-15'))).code).toBe('write-failed');
-    expect(spec('ATL-15').state).toBe('Backlog');
-  });
-  it('detects a missing evidence comment during read-back and rolls the approval back', async () => {
-    const { actions, spec } = await setup({ silentNoop: (op) => op === 'CommentCreate' });
-    const e = await fail(actions.approve('ATL-15', 'ATL-15'));
-    expect(e.code).toBe('verify-failed');
-    expect(e.message).toMatch(/rolled back/);
-    expect(spec('ATL-15').labels).not.toContain('Ready');
-    expect(spec('ATL-15').state).toBe('Backlog');
-  });
-  it('detects a state change Linear ignored', async () => {
-    const { actions } = await setup({ silentNoop: (op) => op === 'IssueUpdate' });
-    expect((await fail(actions.approve('ATL-15', 'ATL-15'))).code).toBe('verify-failed');
-  });
   it('serializes concurrent writes so two approvals never interleave', async () => {
     const { actions, ops } = await setup();
     await Promise.all([actions.approve('ATL-15', 'ATL-15'), actions.approve('ATL-19', 'ATL-19')]);
-    expect(ops()).toEqual(['IssueUpdate', 'IssueAddLabel', 'CommentCreate', 'IssueUpdate', 'IssueAddLabel', 'CommentCreate']);
+    expect(ops()).toEqual(['IssueUpdate', 'IssueAddLabel', 'IssueUpdate', 'IssueAddLabel']);
   });
 });
 
 describe('revoke readiness', () => {
-  it('removes Ready, returns the issue to Backlog and records evidence, verified', async () => {
-    const { actions, spec, f } = await setup();
-    const r = await actions.revoke('ATL-7', 'ATL-7', 'Scope changed <!-- x -->');
+  it('removes Ready and returns the issue to Backlog, verified', async () => {
+    const { actions, spec, ops } = await setup();
+    const r = await actions.revoke('ATL-7', 'ATL-7');
     expect(r.ok).toBe(true);
     expect(spec('ATL-7').labels).toEqual(['Feature']);
     expect(spec('ATL-7').state).toBe('Backlog');
-    const note = f.store.comments.get('ATL-7')![0]!.body;
-    expect(note).toMatch(/Readiness revoked/);
-    expect(note).toMatch(/Reason: Scope changed/);
-    expect(note).not.toMatch(/<!-- x -->/); // reason is sanitized; only our own marker comment remains
+    expect(ops()).toEqual(['IssueRemoveLabel', 'IssueUpdate']);
     expect(r.snapshot.issues.find((i) => i.identifier === 'ATL-7')!.stage).toBe('backlog');
   });
   it('is refused for issues that are not Ready or already started, and needs confirmation', async () => {
     const { actions, ops, spec } = await setup();
-    expect((await fail(actions.revoke('ATL-16', 'ATL-16', ''))).code).toBe('not-ready');
-    expect((await fail(actions.revoke('ATL-7', 'nope', ''))).code).toBe('not-confirmed');
+    expect((await fail(actions.revoke('ATL-16', 'ATL-16'))).code).toBe('not-ready');
+    expect((await fail(actions.revoke('ATL-7', 'nope'))).code).toBe('not-confirmed');
     spec('ATL-6').state = 'In Progress'; // Ready label but work started
-    expect((await fail(actions.revoke('ATL-6', 'ATL-6', ''))).code).toBe('started');
+    expect((await fail(actions.revoke('ATL-6', 'ATL-6'))).code).toBe('started');
     expect(ops()).toEqual([]);
   });
 });

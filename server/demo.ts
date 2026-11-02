@@ -67,7 +67,7 @@ export function demoFetch(nowMs = Date.now(), linearOpts: FakeLinearOpts = {}): 
       return specs.map((p) => ({
         number: p.n, title: p.title, html_url: `https://example.invalid/gh/${repo}/pull/${p.n}`, state: p.state === 'open' ? 'open' : 'closed', draft: !!p.draft,
         merged_at: p.state === 'merged' ? ago(p.ageH, nowMs) : null, created_at: ago(p.ageH + 5, nowMs), updated_at: ago(p.ageH, nowMs),
-        user: { login: 'demo-dev' }, head: { ref: p.branch, sha: sha(ri, p.n), repo: { html_url: `https://example.invalid/gh/${repo}` } }, base: { ref: 'main' },
+        user: { login: 'demo-dev' }, head: { ref: p.branch, sha: sha(ri, p.n), repo: { html_url: `https://example.invalid/gh/${repo}` } }, base: { ref: 'main', repo: { full_name: repo } }, merged: p.state === 'merged',
         labels: (p.labels ?? []).map((name) => ({ name })),
       }));
     }

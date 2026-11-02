@@ -78,7 +78,6 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
   const [err, setErr] = useState<string>();
   const [checks, setChecks] = useState<ActionOptions['approve']['checks']>();
   const [typed, setTyped] = useState('');
-  const [reason, setReason] = useState('');
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [stateId, setStateId] = useState('');
   const [ms, setMs] = useState('');
@@ -181,7 +180,7 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
 
         {opts && kind === 'approve' && (
           <div className="space-y-2">
-            <p className="text-[12px]">Approving authorizes execution: DevFlow will move <b>{issue.identifier}</b> to <b>{opts.approve.todoState ?? 'Todo'}</b>, add the protected <b>Ready</b> label, and record owner approval as a Linear comment, then re-read Linear to verify. It does not start any agent.</p>
+            <p className="text-[12px]">Approving authorizes execution: DevFlow will move <b>{issue.identifier}</b> to <b>{opts.approve.todoState ?? 'Todo'}</b>, add the protected <b>Ready</b> label (the same two changes you would make in Linear), then re-read Linear and show what it reports. It does not start any agent.</p>
             <ul className="space-y-0.5" aria-label="Eligibility checks">
               {(checks ?? opts.approve.checks).map((c) => (
                 <li key={c.id} className="flex gap-2"><span className={c.ok ? 'text-ok' : 'text-bad'} aria-hidden>{c.ok ? '✓' : '✕'}</span><span><span className={c.ok ? '' : 'font-medium'}>{c.label}</span><span className="block text-[11px] text-muted">{c.detail}</span></span></li>
@@ -199,19 +198,16 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
 
         {opts && kind === 'revoke' && (
           <div className="space-y-2">
-            <p className="text-[12px]">Revoking removes the protected <b>Ready</b> label, returns <b>{issue.identifier}</b> to Backlog and records the revocation in Linear.</p>
+            <p className="text-[12px]">Revoking removes the protected <b>Ready</b> label, returns <b>{issue.identifier}</b> to Backlog, then re-reads Linear and shows what it reports.</p>
             {!opts.revoke.possible && opts.revoke.reason && <p className="text-warn">{opts.revoke.reason}</p>}
             {opts.revoke.possible && !disabled && (
               <>
-                <label className="block text-[12px]">Reason (optional, recorded in Linear)
-                  <textarea className={`${select} mt-1 block w-full`} rows={2} maxLength={300} value={reason} onChange={(e) => setReason(e.target.value)} />
-                </label>
                 <label className="block text-[12px]">Type <span className="mono">{issue.identifier}</span> to confirm
                   <input className={`${select} mt-1 block w-full`} value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" aria-label="Confirmation" />
                 </label>
               </>
             )}
-            <button ref={first} className={btn} disabled={busy || disabled || !opts.revoke.possible || !confirmOk} onClick={() => submit('revoke', { confirm: typed, reason })}>{busy ? 'Revoking…' : 'Revoke readiness'}</button>
+            <button ref={first} className={btn} disabled={busy || disabled || !opts.revoke.possible || !confirmOk} onClick={() => submit('revoke', { confirm: typed })}>{busy ? 'Revoking…' : 'Revoke readiness'}</button>
           </div>
         )}
 

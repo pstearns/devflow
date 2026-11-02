@@ -19,8 +19,7 @@ export const Q_ACTION_ISSUE = `query ActionIssue($id: String!) { issue(id: $id) 
   labels(first: 50) { nodes { id name color } }
   project { id name slugId projectMilestones(first: 100) { nodes { id name } } } projectMilestone { id name }
   relations(first: 50) { nodes { type relatedIssue { identifier } } }
-  inverseRelations(first: 50) { nodes { type issue { identifier title url state { name type } } } }
-  comments(last: 50) { nodes { id body } } } }`;
+  inverseRelations(first: 50) { nodes { type issue { identifier title url state { name type } } } } } }`;
 
 interface StateDef { id: string; name: string; type: StateType; position: number }
 export interface Ctx {
@@ -31,7 +30,6 @@ export interface Ctx {
   project?: { id: string; name: string; slugId?: string };
   milestones: { id: string; name: string }[]; milestone?: { id: string; name: string };
   openBlockers: { identifier: string; stateName: string }[]; depsVerifiable: boolean;
-  comments: string[];
   teamLabels: RawLabel[];
 }
 
@@ -59,7 +57,6 @@ export function parseCtx(data: Record<string, unknown>, teamLabels: RawLabel[]):
       return t === 'completed' || t === 'canceled' ? [] : [{ identifier: str(r.issue.identifier, 40) ?? '?', stateName: isObj(r.issue.state) ? str(r.issue.state.name, 100) ?? '?' : '?' }];
     }),
     depsVerifiable: inv.length < 50 && nodes(i.relations, 100).length < 50, // a full page may hide more relations
-    comments: nodes(i.comments, 100).map((c) => (isObj(c) ? str(c.body, 4000) ?? '' : '')),
     teamLabels,
   };
 }
@@ -77,17 +74,6 @@ export function findBacklog(ctx: Ctx, wf: WorkflowCfg): StateDef | undefined {
   return b.find((s) => low(s.name) === low(wf.backlogState)) ?? b[0];
 }
 export const hasReady = (ctx: Ctx, wf: WorkflowCfg) => ctx.labels.some((l) => low(l.name) === low(wf.readyLabel));
-
-const MARKERS = ['devflow-approval-incomplete:', 'devflow-approval-rolledback:', 'devflow-approval:', 'devflow-revoke:'] as const;
-/** True when the NEWEST DevFlow approval marker on the issue says an approval was left incomplete (comments are oldest-first). */
-export function approvalMarkedIncomplete(ctx: Ctx): boolean {
-  for (let i = ctx.comments.length - 1; i >= 0; i--) {
-    const m = MARKERS.find((k) => ctx.comments[i]!.includes(k));
-    if (m) return m === 'devflow-approval-incomplete:';
-  }
-  return false;
-}
-const sameSet = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every((x) => b.has(x));
 
 /** Readiness policy evaluation. Every unverifiable prerequisite is a failed check (approval refused), never a silent pass. */
 export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolean, scope: Pick<Scope, 'policy' | 'explicitPolicy' | 'writeAllowed' | 'writeReason'>): { checks: ActionCheck[]; eligible: boolean; already: boolean } {
@@ -122,7 +108,7 @@ export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolea
 }
 
 /** Which workflow transitions the generic status menu allows. Approval/completion cannot be bypassed through it. */
-export function statusOptions(ctx: Ctx, wf: WorkflowCfg, mergedPr: boolean, writeEnabled: boolean, approvalBlocked = false): ActionOptions['states'] {
+export function statusOptions(ctx: Ctx, wf: WorkflowCfg, mergedPr: boolean, writeEnabled: boolean): ActionOptions['states'] {
   const ready = hasReady(ctx, wf);
   return ctx.states.sort((a, b) => a.position - b.position).map((s) => {
     const current = s.id === ctx.state.id;
@@ -132,7 +118,6 @@ export function statusOptions(ctx: Ctx, wf: WorkflowCfg, mergedPr: boolean, writ
     else if (isResolvedType(ctx.state.type)) reason = 'Closed issues are reopened in Linear';
     else if (s.type === 'canceled') reason = 'Cancel in Linear (not available here)';
     else if (s.type === 'completed') reason = mergedPr ? undefined : 'Done requires a merged linked PR (verified from GitHub)';
-    else if (s.type === 'started' && ctx.state.type !== 'started' && approvalBlocked) reason = `An approval of ${ctx.identifier} did not complete cleanly; resolve it in Linear (check state and the ${wf.readyLabel} label) before starting work`;
     else if (s.type === 'started' && ctx.state.type !== 'started' && !ready) reason = `Starting work requires approval: use "Approve for execution" (${wf.readyLabel})`;
     else if ((s.type === 'backlog' || s.type === 'triage') && ready) reason = `Revoke readiness first (${wf.readyLabel} label is set)`;
     else if (s.type !== 'backlog' && s.type !== 'unstarted' && s.type !== 'started' && s.type !== 'triage') reason = 'State type not supported here';
@@ -144,8 +129,6 @@ type Log = (line: string) => void;
 
 export class LinearActions {
   private chain: Promise<unknown> = Promise.resolve();
-  /** Issues whose approval ended in an unverifiable state. In-memory backstop for the durable marker comment; only blocks while Ready is set. */
-  private unresolved = new Set<string>();
   constructor(
     private deps: { cfg: Config; read: LinearClient; write?: LinearWriteClient; service: SnapshotService; log?: Log; clock?: () => number },
   ) {}
@@ -189,7 +172,6 @@ export class LinearActions {
     const w = this.enabled && sc.writeAllowed;
     const whyNot = !this.enabled ? 'Linear write access is not configured' : sc.writeReason ?? 'Writes are not enabled for this team/project';
     const ready = hasReady(ctx, wf);
-    const blocked = this.approvalBlocked(ctx, wf);
     const ap = evaluateApproval(ctx, wf, this.enabled, sc);
     const labels = ctx.teamLabels.filter((l) => !l.isGroup || ctx.labels.some((x) => x.id === l.id)).map((l) => {
       const applied = ctx.labels.some((x) => x.id === l.id);
@@ -201,7 +183,7 @@ export class LinearActions {
       writeEnabled: w, reason: w ? undefined : whyNot,
       scope: { teamKey: ctx.teamKey, projectName: ctx.project?.name, policy: sc.policy, explicitPolicy: sc.explicitPolicy },
       identifier: ctx.identifier, title: ctx.title, state: ctx.state, labels,
-      states: statusOptions(ctx, wf, this.mergedPr(ctx.identifier), w, blocked), // cached PR data: display only; status() re-verifies before any Done
+      states: statusOptions(ctx, wf, this.mergedPr(ctx.identifier), w), // cached PR data: display only; status() re-verifies before any Done
       milestones: { current: ctx.milestone?.id, options: ctx.milestones, canChange: w && !!ctx.project, reason: !w ? whyNot : !ctx.project ? 'The issue is not in a Linear project' : undefined },
       approve: { eligible: ap.eligible, already: ap.already, checks: ap.checks, todoState: findTodo(ctx, wf)?.name },
       revoke: { possible: w && ready && (ctx.state.type === 'unstarted'), reason: !w ? whyNot : !ready ? `Not marked ${wf.readyLabel}` : ctx.state.type !== 'unstarted' ? 'Work has started; change the state in Linear' : undefined },
@@ -238,29 +220,16 @@ export class LinearActions {
     });
   }
 
-  /** An approval left half-applied must never become executable through ordinary status changes. */
-  private approvalBlocked(ctx: Ctx, wf: WorkflowCfg): boolean {
-    if (!hasReady(ctx, wf)) { this.unresolved.delete(ctx.identifier); return false; }
-    return this.unresolved.has(ctx.identifier) || approvalMarkedIncomplete(ctx);
+  /** A read that reports failure as "unknown" instead of throwing. */
+  private async tryLoad(identifier: string): Promise<Ctx | undefined> {
+    try { return await this.load(identifier); } catch { return undefined; }
   }
 
-  /**
-   * Compensation after an approval that did not verify. It never trusts what the failed calls reported (a timeout may follow
-   * a commit): it reads Linear first, changes only what differs from the captured pre-approval state, and succeeds only if
-   * a FRESH read shows that status and the full label set equal the original.
-   */
-  private async restore(w: LinearWriteClient, identifier: string, wf: WorkflowCfg, prior: { stateId: string; labelIds: Set<string>; hadReady: boolean }, readyId: string): Promise<{ verified: boolean; last?: Ctx }> {
-    let last: Ctx | undefined;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const cur = await this.load(identifier);
-        if (cur.state.id !== prior.stateId) { try { await w.setState(cur.id, prior.stateId); } catch { /* outcome unknown: the read below decides */ } }
-        if (hasReady(cur, wf) !== prior.hadReady) { try { await (prior.hadReady ? w.addLabel(cur.id, readyId) : w.removeLabel(cur.id, readyId)); } catch { /* same */ } }
-        last = await this.load(identifier);
-        if (last.state.id === prior.stateId && hasReady(last, wf) === prior.hadReady && sameSet(new Set(last.labels.map((l) => l.id)), prior.labelIds)) return { verified: true, last };
-      } catch { /* unreadable: try once more, then give up */ }
-    }
-    return { verified: false, last };
+  /** The action was sent but Linear's own answer does not show the intended result: say what Linear shows, claim nothing else. */
+  private notConfirmed(what: string, failure: unknown, after: Ctx | undefined): ActionError {
+    const why = failure instanceof SourceError ? failure.message : failure ? 'a Linear write failed' : 'Linear did not reflect the change';
+    const seen = after ? `Linear currently shows status "${after.state.name}" with labels: ${after.labels.map((l) => l.name).join(', ') || 'none'}.` : 'Linear could not be read back, so the current state is unknown.';
+    return new ActionError(502, failure ? 'write-failed' : 'verify-failed', `${what} was not confirmed (${why}). ${seen} Nothing was rolled back automatically; check the issue in Linear.`);
   }
 
   // ---- ordinary labels ----
@@ -315,7 +284,7 @@ export class LinearActions {
         if (ev === 'unverified') throw new ActionError(502, 'evidence-unverified', `${ctx.identifier} was not changed: GitHub could not freshly verify the linked PR (unavailable or malformed response). Try again, or complete it in Linear.`);
         merged = ev === 'merged';
       }
-      const opt = statusOptions(ctx, wf, merged, true, this.approvalBlocked(ctx, wf)).find((s) => s.id === stateId);
+      const opt = statusOptions(ctx, wf, merged, true).find((s) => s.id === stateId);
       if (!opt) throw new ActionError(422, 'unknown-state', 'That state does not exist for this team');
       if (!opt.allowed) throw new ActionError(403, 'transition-refused', opt.reason ?? 'Transition not allowed');
       await w.setState(ctx.id, stateId);
@@ -343,6 +312,7 @@ export class LinearActions {
   }
 
   // ---- protected: approval ----
+  // Same effect as doing it in Linear: Todo + the Ready label. Send, re-read Linear, report what Linear shows.
   approve(identifier: string, confirm: unknown) {
     return this.run('approve', identifier, async () => {
       const w = this.writer();
@@ -350,55 +320,23 @@ export class LinearActions {
       const ctx = await this.load(identifier);
       const sc = this.authorized(ctx);
       const wf = sc.workflow;
-      if (this.approvalBlocked(ctx, wf)) throw new ActionError(409, 'manual-intervention', `An earlier approval of ${ctx.identifier} did not complete cleanly. Check its state and the ${wf.readyLabel} label in Linear; remove ${wf.readyLabel} to clear the block.`);
       const ev = evaluateApproval(ctx, wf, true, sc);
       if (!ev.eligible) throw new ActionError(422, 'ineligible', `Cannot approve ${ctx.identifier}: ${ev.checks.filter((c) => !c.ok).map((c) => c.label).join('; ')}`, ev.checks);
       const todo = findTodo(ctx, wf)!;
       const readyLabel = ctx.teamLabels.find((l) => low(l.name) === low(wf.readyLabel) && !l.isGroup)!;
-      const who = await w.viewerName();
-      const when = new Date((this.deps.clock ?? Date.now)()).toISOString();
-      const nonce = randomUUID();
-      // The ACTUAL pre-approval facts, read from Linear just now: status and label membership (incl. a pre-existing Ready).
-      const prior = { stateId: ctx.state.id, labelIds: new Set(ctx.labels.map((l) => l.id)), hadReady: hasReady(ctx, wf) };
       let failure: unknown;
       try {
-        await w.setState(ctx.id, todo.id);
-        await w.addLabel(ctx.id, readyLabel.id);
-        await w.comment(ctx.id, [
-          `**Approved for execution** (recorded by DevFlow)`, '',
-          `- Approved by: ${who} (explicit confirmation in DevFlow)`, `- When: ${when}`,
-          `- Change: state ${ctx.state.name} → ${todo.name}; label "${readyLabel.name}" added`,
-          `- Checks passed: ${ev.checks.filter((c) => c.ok && c.id !== 'write').map((c) => c.label).join('; ')}`,
-          `- Dependencies verified: ${ctx.openBlockers.length === 0 ? 'no unresolved blockers' : 'n/a'}`, '',
-          `<!-- devflow-approval:${nonce} -->`].join('\n'));
-      } catch (e) { failure = e; } // timeout / transport error / rejection: whether it committed is UNKNOWN until Linear is read
-      // Linear is authoritative, not the replies: a lost response after a commit is judged by what Linear now holds.
-      let after: Ctx | undefined;
-      try { after = await this.load(identifier); } catch { after = undefined; }
-      const stateOk = after?.state.id === todo.id, labelOk = !!after && hasReady(after, wf), evidenceOk = !!after?.comments.some((c) => c.includes(`devflow-approval:${nonce}`));
-      if (after && stateOk && labelOk && evidenceOk) {
-        this.unresolved.delete(ctx.identifier);
-        return this.finish(identifier, `${ctx.identifier} approved for execution: ${todo.name} + ${readyLabel.name}, evidence recorded, verified in Linear`);
-      }
-      const why = failure instanceof SourceError ? failure.message : failure ? 'a Linear write failed' : 'Linear did not reflect the approval';
-      const r = await this.restore(w, identifier, wf, prior, readyLabel.id);
-      if (r.verified) {
-        // an evidence comment that may have been committed cannot be deleted: say plainly that it was rolled back
-        if (r.last?.comments.some((c) => c.includes(`devflow-approval:${nonce}`))) {
-          try { await w.comment(ctx.id, `**Approval rolled back** (recorded by DevFlow)\n\nThe approval above did not complete and was reverted: state ${prior.stateId === ctx.state.id ? ctx.state.name : 'restored'}, ${readyLabel.name} label ${prior.hadReady ? 'kept as it was' : 'removed'}.\n\n<!-- devflow-approval-rolledback:${nonce} -->`); } catch { /* the label is off, so nothing is executable */ }
-        }
-        this.unresolved.delete(ctx.identifier);
-        throw new ActionError(502, failure ? 'write-failed' : 'verify-failed', `Approval was not completed (${why}). Changes made so far were rolled back and verified in Linear: state ${ctx.state.name}, ${readyLabel.name} label ${prior.hadReady ? 'kept as it was' : 'absent'}.`);
-      }
-      // Recovery could not be proven: fail closed.
-      this.unresolved.add(ctx.identifier);
-      try { await w.comment(ctx.id, `**Approval incomplete — manual check required** (recorded by DevFlow)\n\nDevFlow could not verify the state of this issue after a failed approval. Check its status and the ${readyLabel.name} label. DevFlow will not start work on it until ${readyLabel.name} is removed or a new approval/revocation is recorded.\n\n<!-- devflow-approval-incomplete:${nonce} -->`); } catch { /* the in-memory block still applies */ }
-      throw new ActionError(502, 'manual-intervention', `Approval of ${ctx.identifier} was not completed (${why}) and DevFlow could NOT verify that it restored the original state (${ctx.state.name}; ${readyLabel.name} ${prior.hadReady ? 'was set' : 'was not set'}). Manual intervention required: check ${ctx.identifier} in Linear. Starting work from DevFlow is blocked until it is resolved.`);
+        if (ctx.state.id !== todo.id) await w.setState(ctx.id, todo.id);
+        if (!hasReady(ctx, wf)) await w.addLabel(ctx.id, readyLabel.id);
+      } catch (e) { failure = e; }
+      const after = await this.tryLoad(identifier);
+      if (after && after.state.id === todo.id && hasReady(after, wf)) return this.finish(identifier, `${ctx.identifier} approved for execution: ${todo.name} + ${readyLabel.name}, verified in Linear`);
+      throw this.notConfirmed('Approval', failure, after);
     });
   }
 
   // ---- protected: revoke ----
-  revoke(identifier: string, confirm: unknown, reason: unknown) {
+  revoke(identifier: string, confirm: unknown) {
     return this.run('revoke', identifier, async () => {
       const w = this.writer();
       if (typeof confirm !== 'string' || low(confirm.trim()) !== low(identifier)) throw new ActionError(400, 'not-confirmed', `Type the issue identifier (${identifier}) to confirm`);
@@ -409,21 +347,14 @@ export class LinearActions {
       const readyLabel = ctx.labels.find((l) => low(l.name) === low(wf.readyLabel))!;
       const backlog = findBacklog(ctx, wf);
       if (!backlog) throw new ActionError(422, 'no-backlog', 'The team has no backlog state to return the issue to');
-      const note = typeof reason === 'string' ? reason.replace(/<!--|-->/g, '').trim().slice(0, 300) : '';
-      const who = await w.viewerName();
-      const nonce = randomUUID();
-      await w.removeLabel(ctx.id, readyLabel.id);
+      let failure: unknown;
       try {
+        await w.removeLabel(ctx.id, readyLabel.id);
         await w.setState(ctx.id, backlog.id);
-        await w.comment(ctx.id, [`**Readiness revoked** (recorded by DevFlow)`, '', `- Revoked by: ${who}`, `- Change: label "${readyLabel.name}" removed; state ${ctx.state.name} → ${backlog.name}`, note ? `- Reason: ${note}` : '', '', `<!-- devflow-revoke:${nonce} -->`].filter((l, i, a) => l !== '' || a[i - 1] !== '').join('\n'));
-      } catch (e) {
-        throw new ActionError(502, 'write-failed', `Revocation was only partly applied (${e instanceof SourceError ? e.message : 'a Linear write failed'}); check ${ctx.identifier} in Linear`);
-      }
-      const after = await this.load(identifier);
-      if (hasReady(after, wf) || after.state.id !== backlog.id || !after.comments.some((c) => c.includes(`devflow-revoke:${nonce}`)))
-        throw new ActionError(502, 'verify-failed', `Linear did not fully reflect the revocation; check ${ctx.identifier} in Linear`);
-      this.unresolved.delete(ctx.identifier);
-      return this.finish(identifier, `Readiness revoked for ${ctx.identifier} and verified in Linear`);
+      } catch (e) { failure = e; }
+      const after = await this.tryLoad(identifier);
+      if (after && !hasReady(after, wf) && after.state.id === backlog.id) return this.finish(identifier, `Readiness revoked for ${ctx.identifier} and verified in Linear`);
+      throw this.notConfirmed('Revocation', failure, after);
     });
   }
 }

@@ -188,7 +188,7 @@ describe('server-side write authorization (never the browser selection)', () => 
     const { actions, ops, service } = await setup();
     await service.getTeam('QAT');
     for (const id of ['ATL-20', 'ATL-21', 'BCN-5', 'QAT-1', 'QAT-2']) {
-      for (const call of [() => actions.labels(id, ['lbl-bug'], []), () => actions.milestone(id, null), () => actions.approve(id, id), () => actions.revoke(id, id, ''), () => actions.status(id, 'st-x')]) {
+      for (const call of [() => actions.labels(id, ['lbl-bug'], []), () => actions.milestone(id, null), () => actions.approve(id, id), () => actions.revoke(id, id), () => actions.status(id, 'st-x')]) {
         const e = await fail(call());
         expect([e.status, e.code], id).toEqual([403, 'not-authorized']);
       }
@@ -232,14 +232,13 @@ describe('server-side write authorization (never the browser selection)', () => 
     expect((await fail(actions.labels('ZED-1', ['lbl-zed-go'], []))).code).toBe('protected-label');
   });
   it('approval under an explicit TEAM policy uses that team\'s vocabulary and thresholds', async () => {
-    const { actions, spec, f } = await setup();
+    const { actions, spec } = await setup();
     const o = await actions.options('ZED-2');
     expect(o.scope).toMatchObject({ policy: 'team', explicitPolicy: true });
     expect(o.approve.eligible).toBe(true);
     expect((await actions.approve('ZED-2', 'ZED-2')).ok).toBe(true);
     expect(spec('ZED-2').state).toBe('Todo');
     expect(spec('ZED-2').labels).toContain('Go'); // ZED's ready label, not "Ready"
-    expect(f.store.comments.get('ZED-2')![0]!.body).toMatch(/label "Go" added/);
     const short = await actions.options('ZED-4'); // 'tbd' is shorter than ZED's minimum of 10
     expect(short.approve.eligible).toBe(false);
     expect(short.approve.checks.find((c) => c.id === 'description')).toMatchObject({ ok: false });

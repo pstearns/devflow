@@ -1,5 +1,5 @@
 // SYNTHETIC in-memory Linear used by DEVFLOW_DEMO=1 and the tests. It models labels (with colors, one group label),
-// workflow states, milestones, comments and the few mutations DevFlow is allowed to send. It is never reachable
+// workflow states, milestones and the few mutations DevFlow is allowed to send. It is never reachable
 // in live mode and contains no real data. Mutations require the separate demo WRITE key, mirroring credential isolation.
 export const DEMO_READ_KEY = 'demo';
 export const DEMO_WRITE_KEY = 'demo-write';
@@ -99,10 +99,10 @@ export interface FakeLinearOpts {
   /** Teams the READ key cannot see (to test inaccessible teams). */
   hideTeams?: string[];
 }
-export interface FakeLinearStore { issues: Record<string, IssueSpec[]>; comments: Map<string, { id: string; body: string; createdAt: string }[]>; mutations: { op: string; vars: Record<string, any> }[]; viewer: string }
+export interface FakeLinearStore { issues: Record<string, IssueSpec[]>; mutations: { op: string; vars: Record<string, any> }[]; viewer: string }
 
 export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
-  const store: FakeLinearStore = { issues: structuredClone(SEED), comments: new Map(), mutations: [], viewer: 'Demo Owner' };
+  const store: FakeLinearStore = { issues: structuredClone(SEED), mutations: [], viewer: 'Demo Owner' };
   const stateId = (team: string, name: string) => `st-${team}-${name.toLowerCase().replace(/\W+/g, '-')}`;
   const stateOf = (team: string, name: string) => { const d = STATE_DEFS.find((s) => s[0] === name) ?? STATE_DEFS[0]!; return { id: stateId(team, d[0]), name: d[0], type: d[1] }; };
   const teamStates = (team: string) => STATE_DEFS.map(([name, type], position) => ({ id: stateId(team, name), name, type, position }));
@@ -164,16 +164,8 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
         }
         return ok({ issueUpdate: { success: true } });
       }
-      if (name === 'CommentCreate') {
-        const { spec } = byUuid(String(v.input?.issueId));
-        if (!spec) return err('Entity not found', 'INVALID_INPUT');
-        const key = String(v.input.issueId).replace(/^uuid-/, '');
-        if (!noop) store.comments.set(key, [...(store.comments.get(key) ?? []), { id: `c-${store.mutations.length}`, body: String(v.input.body), createdAt: new Date(nowMs).toISOString() }]);
-        return ok({ commentCreate: { success: true } });
-      }
       return err('Unknown mutation', 'GRAPHQL_VALIDATION_FAILED');
     }
-    if (name === 'Viewer') return ok({ viewer: { name: store.viewer } });
     if (name === 'Teams') {
       return ok({ teams: { nodes: Object.keys(PROJECTS).filter((k) => !opts.hideTeams?.includes(k)).map((key) => ({ id: `t-${key}`, key, name: key === 'ATL' ? 'Atlas' : key === 'BCN' ? 'Beacon' : key === 'ZED' ? 'Zed' : 'QA', projects: { nodes: PROJECTS[key]!.map((p) => ({ id: p.id, name: p.name, slugId: p.slugId, url: `https://example.invalid/linear/project/${p.slugId}` })) } })), pageInfo: { hasNextPage: false, endCursor: null } } });
     }
@@ -202,8 +194,7 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
       const pj = r.project as { id: string; name: string } | null;
       return ok({ issue: { ...r, team: { id: `t-${team}`, key: team, states: { nodes: teamStates(team) } },
         project: pj ? { id: pj.id, name: pj.name, slugId: PROJECTS[team]!.find((p) => p.id === pj.id)?.slugId, projectMilestones: { nodes: (MILESTONES[team] ?? []).filter((m) => MILESTONE_PROJECT[m.id] === pj.id).map((m) => ({ id: m.id, name: m.name })) } } : null,
-        projectMilestone: spec.ms ? { id: spec.ms, name: MILESTONES[team]?.find((m) => m.id === spec.ms)?.name ?? '?' } : null,
-        comments: { nodes: store.comments.get(`${team}-${spec.n}`) ?? [] } } });
+        projectMilestone: spec.ms ? { id: spec.ms, name: MILESTONES[team]?.find((m) => m.id === spec.ms)?.name ?? '?' } : null } });
     }
     if (name === 'Issues') {
       const key = v.filter?.team?.key?.eq as string;

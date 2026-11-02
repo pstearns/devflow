@@ -8,8 +8,6 @@ const OPS = {
   IssueAddLabel: 'mutation IssueAddLabel($id: String!, $labelId: String!) { issueAddLabel(id: $id, labelId: $labelId) { success } }',
   IssueRemoveLabel: 'mutation IssueRemoveLabel($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }',
   IssueUpdate: 'mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',
-  CommentCreate: 'mutation CommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success } }',
-  Viewer: 'query Viewer { viewer { name } }',
 } as const;
 type OpName = keyof typeof OPS;
 
@@ -33,12 +31,4 @@ export class LinearWriteClient {
   async removeLabel(issueId: string, labelId: string) { return this.run('IssueRemoveLabel', { id: this.id(issueId), labelId: this.id(labelId) }, 'issueRemoveLabel'); }
   async setState(issueId: string, stateId: string) { return this.run('IssueUpdate', { id: this.id(issueId), input: { stateId: this.id(stateId) } }, 'issueUpdate'); }
   async setMilestone(issueId: string, milestoneId: string | null) { return this.run('IssueUpdate', { id: this.id(issueId), input: { projectMilestoneId: milestoneId === null ? null : this.id(milestoneId) } }, 'issueUpdate'); }
-  async comment(issueId: string, body: string) {
-    if (!body.trim() || body.length > 4000) throw new Error('invalid comment');
-    return this.run('CommentCreate', { input: { issueId: this.id(issueId), body } }, 'commentCreate');
-  }
-  async viewerName(): Promise<string> {
-    const d = await this.run('Viewer', {});
-    return isObj(d.viewer) && typeof d.viewer.name === 'string' ? d.viewer.name.slice(0, 100) : 'unknown user';
-  }
 }
