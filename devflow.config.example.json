@@ -4,7 +4,7 @@
   "staleDays": 5,
   "obsidian": {
     "vault": "YourVaultName",
-    "vaultPath": "/mnt/d/AI-Knowledge"
+    "vaultPath": "/mnt/AI-Knowledge"
   },
   "review": {
     "checkName": "",
