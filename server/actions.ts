@@ -75,52 +75,27 @@ export function findBacklog(ctx: Ctx, wf: WorkflowCfg): StateDef | undefined {
 }
 export const hasReady = (ctx: Ctx, wf: WorkflowCfg) => ctx.labels.some((l) => low(l.name) === low(wf.readyLabel));
 
-/** Readiness policy evaluation. Every unverifiable prerequisite is a failed check (approval refused), never a silent pass. */
-export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolean, scope: Pick<Scope, 'policy' | 'explicitPolicy' | 'writeAllowed' | 'writeReason'>): { checks: ActionCheck[]; eligible: boolean; already: boolean } {
-  const p = wf.readiness;
+/**
+ * Technical prerequisites for the Approve action only (it needs a write path, an authorized scope, the Ready label and a Todo
+ * state to point at). DevFlow does not judge the ticket: Linear decides what is allowed, and DevFlow shows the result.
+ */
+export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolean, scope: Pick<Scope, 'writeAllowed' | 'writeReason'>): { checks: ActionCheck[]; eligible: boolean; already: boolean } {
   const c: ActionCheck[] = [];
   const add = (id: string, label: string, ok: boolean, detail: string) => c.push({ id, label, ok, detail });
   const readyDef = ctx.teamLabels.find((l) => low(l.name) === low(wf.readyLabel) && !l.isGroup);
   const todo = findTodo(ctx, wf);
-  const already = hasReady(ctx, wf) && ctx.state.type === 'unstarted';
   add('write', 'Linear write access configured', writeEnabled, writeEnabled ? 'A separate write credential is configured' : 'LINEAR_WRITE_API_KEY is not set');
   add('scope', `DevFlow may write to this ${ctx.project ? 'project' : 'team'}`, scope.writeAllowed, scope.writeAllowed ? `Authorized by configuration (${ctx.teamKey}${ctx.project ? ` / ${ctx.project.name}` : ''})` : (scope.writeReason ?? 'Not authorized'));
-  add('policy', 'An explicit readiness policy applies to this scope', scope.explicitPolicy,
-    scope.explicitPolicy ? `Using the ${scope.policy === 'project' ? 'project' : 'team'} policy configured for ${ctx.project && scope.policy === 'project' ? ctx.project.name : `team ${ctx.teamKey}`}`
-      : `No readiness policy is configured for ${ctx.project ? `project "${ctx.project.name}"` : `unprojected issues`} in team ${ctx.teamKey}; add a teams[] entry with a workflow. Rules from other projects are never inherited.`);
-  add('state', 'Issue is not started, done or canceled', ctx.state.type === 'backlog' || ctx.state.type === 'triage' || ctx.state.type === 'unstarted',
-    `Current state: ${ctx.state.name} (${ctx.state.type})${ctx.state.type === 'started' ? ' — work has already started' : ''}`);
-  add('not-ready', 'Not already approved', !already, already ? `Already ${wf.readyLabel} in ${ctx.state.name}` : 'Not yet approved');
   add('ready-label', `"${wf.readyLabel}" label exists in Linear`, !!readyDef, readyDef ? 'Found in the team/workspace labels' : `No label named "${wf.readyLabel}" was found; DevFlow does not create labels`);
   add('todo-state', `"${wf.todoState}" state exists`, !!todo, todo ? `Will move to ${todo.name}` : 'The team has no unstarted workflow state');
-  if (p.requireDescription) add('description', `Ticket information: description ≥ ${p.minDescriptionChars} characters`, ctx.description.trim().length >= p.minDescriptionChars, `${ctx.description.trim().length} characters`);
-  if (p.requireNoOpenBlockers) {
-    add('deps-readable', 'Dependencies could be fully verified', ctx.depsVerifiable, ctx.depsVerifiable ? 'All relations were read' : 'The relation list is full; dependencies cannot be fully verified');
-    add('deps', 'No unresolved blocking dependencies', ctx.openBlockers.length === 0, ctx.openBlockers.length ? `Blocked by ${ctx.openBlockers.map((b) => `${b.identifier} (${b.stateName})`).join(', ')}` : 'No open blockers');
-  }
-  if (p.requireMilestone) add('milestone', 'Assigned to a milestone', !!ctx.milestone, ctx.milestone ? ctx.milestone.name : 'No milestone');
-  if (p.requirePriority) add('priority', 'Priority set', ctx.priority > 0, ctx.priority > 0 ? `Priority ${ctx.priority}` : 'No priority');
-  if (p.requireClassificationLabel) {
-    const cls = ctx.labels.filter((l) => wf.classificationLabels.map(low).includes(low(l.name)));
-    add('classification', 'Has a classification label', cls.length > 0, cls.length ? cls.map((l) => l.name).join(', ') : `One of: ${wf.classificationLabels.join(', ')}`);
-  }
-  return { checks: c, eligible: c.every((x) => x.ok), already };
+  return { checks: c, eligible: c.every((x) => x.ok), already: hasReady(ctx, wf) && ctx.state.type === 'unstarted' }; // `already` is informational only
 }
 
-/** Which workflow transitions the generic status menu allows. Approval/completion cannot be bypassed through it. */
-export function statusOptions(ctx: Ctx, wf: WorkflowCfg, mergedPr: boolean, writeEnabled: boolean): ActionOptions['states'] {
-  const ready = hasReady(ctx, wf);
+/** The status menu lists the team's workflow states. Linear decides which changes it accepts; DevFlow only skips the current one. */
+export function statusOptions(ctx: Ctx, writeEnabled: boolean): ActionOptions['states'] {
   return ctx.states.sort((a, b) => a.position - b.position).map((s) => {
     const current = s.id === ctx.state.id;
-    let reason: string | undefined;
-    if (!writeEnabled) reason = 'Linear write access is not configured';
-    else if (current) reason = 'Current state';
-    else if (isResolvedType(ctx.state.type)) reason = 'Closed issues are reopened in Linear';
-    else if (s.type === 'canceled') reason = 'Cancel in Linear (not available here)';
-    else if (s.type === 'completed') reason = mergedPr ? undefined : 'Done requires a merged linked PR (verified from GitHub)';
-    else if (s.type === 'started' && ctx.state.type !== 'started' && !ready) reason = `Starting work requires approval: use "Approve for execution" (${wf.readyLabel})`;
-    else if ((s.type === 'backlog' || s.type === 'triage') && ready) reason = `Revoke readiness first (${wf.readyLabel} label is set)`;
-    else if (s.type !== 'backlog' && s.type !== 'unstarted' && s.type !== 'started' && s.type !== 'triage') reason = 'State type not supported here';
+    const reason = !writeEnabled ? 'Linear write access is not configured' : current ? 'Current state' : undefined;
     return { id: s.id, name: s.name, type: s.type, current, allowed: reason === undefined, reason };
   });
 }
@@ -156,14 +131,6 @@ export class LinearActions {
     return { ...first, teamLabels: labels };
   }
 
-  /** CACHED evidence, for display only (the menu). Changing status to Done re-verifies from GitHub. */
-  private mergedPr(identifier: string): boolean {
-    const snap = this.deps.service.peek();
-    const issue = snap?.issues.find((i) => i.identifier === identifier);
-    const pr = issue?.primaryPrKey ? snap?.prs.find((p) => p.key === issue.primaryPrKey) : undefined;
-    return pr?.state === 'merged';
-  }
-
   /** Live options for the action menu (reads only). */
   async options(identifier: string): Promise<ActionOptions> {
     const ctx = await this.load(identifier);
@@ -183,10 +150,10 @@ export class LinearActions {
       writeEnabled: w, reason: w ? undefined : whyNot,
       scope: { teamKey: ctx.teamKey, projectName: ctx.project?.name, policy: sc.policy, explicitPolicy: sc.explicitPolicy },
       identifier: ctx.identifier, title: ctx.title, state: ctx.state, labels,
-      states: statusOptions(ctx, wf, this.mergedPr(ctx.identifier), w), // cached PR data: display only; status() re-verifies before any Done
+      states: statusOptions(ctx, w),
       milestones: { current: ctx.milestone?.id, options: ctx.milestones, canChange: w && !!ctx.project, reason: !w ? whyNot : !ctx.project ? 'The issue is not in a Linear project' : undefined },
       approve: { eligible: ap.eligible, already: ap.already, checks: ap.checks, todoState: findTodo(ctx, wf)?.name },
-      revoke: { possible: w && ready && (ctx.state.type === 'unstarted'), reason: !w ? whyNot : !ready ? `Not marked ${wf.readyLabel}` : ctx.state.type !== 'unstarted' ? 'Work has started; change the state in Linear' : undefined },
+      revoke: { possible: w && ready, reason: !w ? whyNot : !ready ? `Not marked ${wf.readyLabel}` : undefined },
     };
   }
 
@@ -268,29 +235,21 @@ export class LinearActions {
   }
 
   // ---- generic status ----
+  // Sent to Linear as requested; Linear decides whether it is allowed. The issue is read back and the actual result shown.
   status(identifier: string, stateId: string) {
     return this.run('status', identifier, async () => {
       const w = this.writer();
       if (typeof stateId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(stateId)) throw new ActionError(400, 'bad-input', 'Invalid state id');
       const ctx = await this.load(identifier);
-      const wf = this.authorized(ctx).workflow;
-      const toDone = ctx.states.find((s) => s.id === stateId)?.type === 'completed';
-      let merged = false;
-      if (toDone) {
-        // Done needs FRESH GitHub evidence. The cached snapshot is display-only; a failed or malformed re-read is a refusal, not a pass.
-        const since = this.deps.service.nowMs();
-        await this.deps.service.getIssue(identifier, true);
-        const ev = this.deps.service.prEvidence(ctx.identifier, since);
-        if (ev === 'unverified') throw new ActionError(502, 'evidence-unverified', `${ctx.identifier} was not changed: GitHub could not freshly verify the linked PR (unavailable or malformed response). Try again, or complete it in Linear.`);
-        merged = ev === 'merged';
-      }
-      const opt = statusOptions(ctx, wf, merged, true).find((s) => s.id === stateId);
+      this.authorized(ctx);
+      const opt = statusOptions(ctx, true).find((s) => s.id === stateId);
       if (!opt) throw new ActionError(422, 'unknown-state', 'That state does not exist for this team');
       if (!opt.allowed) throw new ActionError(403, 'transition-refused', opt.reason ?? 'Transition not allowed');
-      await w.setState(ctx.id, stateId);
-      const after = await this.load(identifier);
-      if (after.state.id !== stateId) throw new ActionError(502, 'verify-failed', 'Linear did not reflect the state change; check the issue in Linear');
-      return this.finish(identifier, `Status changed to ${opt.name} and verified in Linear`);
+      let failure: unknown;
+      try { await w.setState(ctx.id, stateId); } catch (e) { failure = e; }
+      const after = await this.tryLoad(identifier);
+      if (after && after.state.id === stateId) return this.finish(identifier, `Status changed to ${opt.name} and verified in Linear`);
+      throw this.notConfirmed('Status change', failure, after);
     });
   }
 
@@ -343,7 +302,6 @@ export class LinearActions {
       const ctx = await this.load(identifier);
       const wf = this.authorized(ctx).workflow;
       if (!hasReady(ctx, wf)) throw new ActionError(422, 'not-ready', `${ctx.identifier} is not marked ${wf.readyLabel}`);
-      if (ctx.state.type !== 'unstarted') throw new ActionError(422, 'started', `Work on ${ctx.identifier} has started (${ctx.state.name}); change its state in Linear`);
       const readyLabel = ctx.labels.find((l) => low(l.name) === low(wf.readyLabel))!;
       const backlog = findBacklog(ctx, wf);
       if (!backlog) throw new ActionError(422, 'no-backlog', 'The team has no backlog state to return the issue to');

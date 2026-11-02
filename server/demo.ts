@@ -21,7 +21,7 @@ export function demoConfig(): Config {
       { id: 'beacon', name: 'Beacon Mobile (demo)', linear: { teamKey: 'BCN', projects: [] }, github: { repos: ['demo-org/beacon'] }, knowledge: [] },
     ],
     // explicit team-level entry: its own vocabulary, write allowed, NO GitHub repository
-    teams: [{ key: 'ZED', write: true, workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'], classificationLabels: ['Chore'], readiness: { minDescriptionChars: 10 } } }],
+    teams: [{ key: 'ZED', write: true, workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'], classificationLabels: ['Chore'] } }],
   });
 }
 

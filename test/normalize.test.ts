@@ -139,13 +139,11 @@ describe('config', () => {
     const { readFileSync } = await import('node:fs');
     const c = parseConfig(JSON.parse(readFileSync(new URL('../devflow.config.example.json', import.meta.url), 'utf8')));
     expect(c.projects[0]!.workflow).toMatchObject({ readyLabel: 'Ready', todoState: 'Todo', backlogState: 'Backlog' });
-    expect(c.projects[0]!.workflow.readiness.requireNoOpenBlockers).toBe(true);
   });
   it('workflow settings are per project, validated, and have generic defaults (nothing project-specific built in)', () => {
-    const c = parseConfig({ projects: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B', workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'], readiness: { minDescriptionChars: 5, requireMilestone: true } } }] });
+    const c = parseConfig({ projects: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B', workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'] } }] });
     expect(c.projects[0]!.workflow.readyLabel).toBe('Ready');
     expect(c.projects[1]!.workflow).toMatchObject({ readyLabel: 'Go', discoveryLabels: ['Spike'] });
-    expect(c.projects[1]!.workflow.readiness).toMatchObject({ minDescriptionChars: 5, requireMilestone: true, requireDescription: true });
     expect(() => parseConfig({ projects: [{ id: 'a', name: 'A', workflow: { readyLabel: '  ' } }] })).toThrow(/readyLabel/);
   });
   it('never exits on idle by default (opt-in only)', () => {

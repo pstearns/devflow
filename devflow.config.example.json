@@ -58,15 +58,7 @@
         ],
         "protectedLabels": [],
         "todoState": "Todo",
-        "backlogState": "Backlog",
-        "readiness": {
-          "requireDescription": true,
-          "minDescriptionChars": 40,
-          "requireMilestone": false,
-          "requirePriority": false,
-          "requireClassificationLabel": false,
-          "requireNoOpenBlockers": true
-        }
+        "backlogState": "Backlog"
       }
     }
   ],
@@ -85,10 +77,7 @@
         "classificationLabels": [
           "Idea",
           "Bug"
-        ],
-        "readiness": {
-          "minDescriptionChars": 40
-        }
+        ]
       },
       "github": {
         "repos": []

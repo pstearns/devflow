@@ -181,12 +181,12 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
         {opts && kind === 'approve' && (
           <div className="space-y-2">
             <p className="text-[12px]">Approving authorizes execution: DevFlow will move <b>{issue.identifier}</b> to <b>{opts.approve.todoState ?? 'Todo'}</b>, add the protected <b>Ready</b> label (the same two changes you would make in Linear), then re-read Linear and show what it reports. It does not start any agent.</p>
-            <ul className="space-y-0.5" aria-label="Eligibility checks">
+            <ul className="space-y-0.5" aria-label="Prerequisites">
               {(checks ?? opts.approve.checks).map((c) => (
                 <li key={c.id} className="flex gap-2"><span className={c.ok ? 'text-ok' : 'text-bad'} aria-hidden>{c.ok ? '✓' : '✕'}</span><span><span className={c.ok ? '' : 'font-medium'}>{c.label}</span><span className="block text-[11px] text-muted">{c.detail}</span></span></li>
               ))}
             </ul>
-            {!opts.approve.eligible && <p className="text-bad">Not eligible for approval. Fix the failed checks in Linear, then reopen this dialog.</p>}
+            {!opts.approve.eligible && <p className="text-bad">Approval is not available yet. Fix the failed prerequisites, then reopen this dialog.</p>}
             {opts.approve.eligible && !disabled && (
               <label className="block text-[12px]">Type <span className="mono">{issue.identifier}</span> to confirm
                 <input className={`${select} mt-1 block w-full`} value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" aria-label="Confirmation" />

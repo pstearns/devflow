@@ -3,14 +3,6 @@ import { isObj, str, arr } from './util.ts';
 import type { PromptDef } from '../shared/types.ts';
 
 export interface KnowledgeCfg { title: string; kind: 'obsidian' | 'repo' | 'url'; path?: string; repo?: string; ref?: string; url?: string }
-export interface ReadinessPolicy {
-  requireDescription: boolean;
-  minDescriptionChars: number;
-  requireMilestone: boolean;
-  requirePriority: boolean;
-  requireClassificationLabel: boolean;
-  requireNoOpenBlockers: boolean;
-}
 /** Names of Linear labels/states that carry lifecycle meaning. Configuration, not code: nothing project-specific is built in. */
 export interface WorkflowCfg {
   readyLabel: string;
@@ -19,12 +11,10 @@ export interface WorkflowCfg {
   protectedLabels: string[]; // never editable via the ordinary label menu (readyLabel is always protected)
   todoState: string;
   backlogState: string;
-  readiness: ReadinessPolicy;
 }
 export const DEFAULT_WORKFLOW: WorkflowCfg = {
   readyLabel: 'Ready', discoveryLabels: ['Discovery'], classificationLabels: ['Idea', 'Bug', 'Security', 'Feature', 'Research', 'Tech Debt'],
   protectedLabels: [], todoState: 'Todo', backlogState: 'Backlog',
-  readiness: { requireDescription: true, minDescriptionChars: 40, requireMilestone: false, requirePriority: false, requireClassificationLabel: false, requireNoOpenBlockers: true },
 };
 
 export interface ProjectCfg {
@@ -77,18 +67,11 @@ function bool(v: unknown, d: boolean) { return typeof v === 'boolean' ? v : d; }
 function parseWorkflow(raw: unknown, id: string): WorkflowCfg {
   const d = DEFAULT_WORKFLOW;
   const w = isObj(raw) ? raw : {};
-  const r = isObj(w.readiness) ? w.readiness : {};
   const readyLabel = str(w.readyLabel, 100) ?? d.readyLabel;
   if (!readyLabel.trim()) throw new Error(`Project "${id}": workflow.readyLabel must not be empty`);
   return {
     readyLabel, discoveryLabels: strList(w.discoveryLabels, d.discoveryLabels), classificationLabels: strList(w.classificationLabels, d.classificationLabels),
     protectedLabels: strList(w.protectedLabels, d.protectedLabels), todoState: str(w.todoState, 100) ?? d.todoState, backlogState: str(w.backlogState, 100) ?? d.backlogState,
-    readiness: {
-      requireDescription: bool(r.requireDescription, d.readiness.requireDescription),
-      minDescriptionChars: typeof r.minDescriptionChars === 'number' ? Math.max(0, Math.min(5000, r.minDescriptionChars)) : d.readiness.minDescriptionChars,
-      requireMilestone: bool(r.requireMilestone, d.readiness.requireMilestone), requirePriority: bool(r.requirePriority, d.readiness.requirePriority),
-      requireClassificationLabel: bool(r.requireClassificationLabel, d.readiness.requireClassificationLabel), requireNoOpenBlockers: bool(r.requireNoOpenBlockers, d.readiness.requireNoOpenBlockers),
-    },
   };
 }
 

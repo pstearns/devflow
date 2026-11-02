@@ -195,14 +195,13 @@ describe('server-side write authorization (never the browser selection)', () => 
     }
     expect(ops()).toEqual([]);
   });
-  it('options for a read-only scope explain why, and approval lists the policy check as failed', async () => {
+  it('options for a read-only scope explain why, and approval lists the scope check as failed', async () => {
     const { actions, service } = await setup();
     await service.getTeam('QAT');
     const o = await actions.options('ATL-20');
     expect(o).toMatchObject({ writeEnabled: false, scope: { teamKey: 'ATL', policy: 'default', explicitPolicy: false } });
     expect(o.reason).toMatch(/not covered by any configured project/);
-    expect(o.approve.checks.find((c) => c.id === 'policy')).toMatchObject({ ok: false });
-    expect(o.approve.checks.find((c) => c.id === 'policy')!.detail).toMatch(/never inherited/);
+    expect(o.approve.checks.find((c) => c.id === 'scope')).toMatchObject({ ok: false });
     expect((await actions.options('QAT-1')).reason).toMatch(/not covered/);
   });
   it('the authorization comes from the issue\'s live team/project; extra "team" fields in a request change nothing', async () => {
@@ -239,9 +238,7 @@ describe('server-side write authorization (never the browser selection)', () => 
     expect((await actions.approve('ZED-2', 'ZED-2')).ok).toBe(true);
     expect(spec('ZED-2').state).toBe('Todo');
     expect(spec('ZED-2').labels).toContain('Go'); // ZED's ready label, not "Ready"
-    const short = await actions.options('ZED-4'); // 'tbd' is shorter than ZED's minimum of 10
-    expect(short.approve.eligible).toBe(false);
-    expect(short.approve.checks.find((c) => c.id === 'description')).toMatchObject({ ok: false });
+    expect((await actions.options('ZED-4')).approve.eligible).toBe(true); // a 'tbd' description is not DevFlow's call
   });
   it('a project policy applies only to its own project', async () => {
     const { actions } = await setup();

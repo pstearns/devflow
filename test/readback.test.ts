@@ -72,14 +72,15 @@ describe('approval = Todo + Ready in Linear, confirmed by a read-back', () => {
     expect(ops()).toEqual(['IssueUpdate']);
     expect(spec('ATL-15').labels).toEqual(['Idea', 'Ready']);
   });
-  it('is stateless: a new instance (a restart) just reads Linear; the Ready gate is Linear\'s Ready label', async () => {
+  it('is stateless: a new instance (a restart) simply shows what Linear holds', async () => {
     const { actions, mk, spec } = await setup({ fail: (op) => op === 'IssueAddLabel' });
     await fail(actions.approve('ATL-15', 'ATL-15')); // left Todo without Ready
     const restarted = mk();
-    expect((await restarted.options('ATL-15')).states.find((s) => s.name === 'In Progress')).toMatchObject({ allowed: false });
-    expect((await fail(restarted.status('ATL-15', st('In Progress')))).code).toBe('transition-refused');
+    const o = await restarted.options('ATL-15');
+    expect(o.state.name).toBe('Todo');
+    expect(o.labels.filter((l) => l.applied).map((l) => l.name)).toEqual(['Idea']);
     spec('ATL-15').labels = ['Idea', 'Ready']; // someone adds Ready in Linear itself
-    expect((await restarted.status('ATL-15', st('In Progress'))).ok).toBe(true); // DevFlow follows Linear
+    expect((await restarted.options('ATL-15')).labels.filter((l) => l.applied).map((l) => l.name).sort()).toEqual(['Idea', 'Ready']);
   });
 });
 
@@ -99,53 +100,64 @@ describe('revoke = remove Ready + Backlog in Linear, confirmed by a read-back', 
   });
 });
 
-describe('Done uses FRESH, valid GitHub evidence for the right repository', () => {
-  type Mut = (real: any) => Response | any;
-  const prDetail = /\/repos\/demo-org\/atlas\/pulls\/1$/;
-  const broken = (mut: Mut | 'http500') => (f: typeof fetch) => (async (u: string | URL | Request, i?: RequestInit) => {
+describe('non-code tickets and GitHub: actions never depend on, or call, GitHub', () => {
+  const githubCalls = () => { const urls: string[] = []; return { urls, wrap: (f: typeof fetch) => (async (u: string | URL | Request, i?: RequestInit) => { const h = new URL(String(u instanceof Request ? u.url : u)).hostname; if (h === 'api.github.com') urls.push(String(u)); return f(u, i); }) as typeof fetch }; };
+
+  it('a ticket with no GitHub PR can be approved, started, completed, revoked and reopened', async () => {
+    const gh = githubCalls();
+    const { actions, service, spec } = await setup({}, gh.wrap);
+    await service.get();
+    gh.urls.length = 0; // from here on, only the actions themselves
+    expect(service.peek()!.issues.find((i) => i.identifier === 'ATL-16')!.prKeys).toEqual([]); // documentation ticket: no PR
+    expect((await actions.approve('ATL-17', 'ATL-17')).ok).toBe(true); // 'tbd' description, no PR
+    expect((await actions.status('ATL-17', st('In Progress'))).ok).toBe(true);
+    expect((await actions.status('ATL-17', st('Done'))).ok).toBe(true); // no merged PR needed
+    expect(spec('ATL-17').state).toBe('Done');
+    expect((await actions.status('ATL-16', st('Backlog'))).ok).toBe(true);
+    expect((await actions.approve('ATL-16', 'ATL-16')).ok).toBe(true);
+    expect((await actions.revoke('ATL-16', 'ATL-16')).ok).toBe(true);
+    expect((await actions.status('ATL-17', st('Todo'))).ok).toBe(true); // reopen
+    expect(gh.urls).toEqual([]); // these tickets have no PRs, so not even the post-action issue refresh touches GitHub
+  });
+  it('a merged PR is not required for Done, and an open PR does not block it either', async () => {
+    const { actions, spec } = await setup();
+    expect((await actions.status('ATL-3', st('Done'))).ok).toBe(true); // PR #3 is open with failing CI
+    expect(spec('ATL-3').state).toBe('Done');
+  });
+  it('Ready stays protected from ordinary label edits (only Approve/Revoke change it)', async () => {
+    const { actions, ops } = await setup();
+    expect((await fail(actions.labels('ATL-16', ['lbl-ready'], []))).code).toBe('protected-label');
+    expect((await fail(actions.labels('ATL-7', [], ['lbl-ready']))).code).toBe('protected-label');
+    expect(ops()).toEqual([]);
+  });
+});
+
+describe('GitHub display refresh ignores answers that are not this repository\'s PR (cached data kept)', () => {
+  const prDetail = /\/repos\/demo-org\/atlas\/pulls\/3$/;
+  const mutate = (fn: (r: any) => unknown) => (f: typeof fetch) => (async (u: string | URL | Request, i?: RequestInit) => {
     const url = new URL(String(u instanceof Request ? u.url : u));
     if (url.hostname === 'api.github.com' && prDetail.test(url.pathname)) {
-      if (mut === 'http500') return new Response('{"message":"boom"}', { status: 500 });
       const real = await (await f(u, i)).json();
-      return new Response(JSON.stringify(mut(real)), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify(fn(real)), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return f(u, i);
   }) as typeof fetch;
-  const cases: [string, Mut | 'http500'][] = [
-    ['an empty object ({})', () => ({})],
-    ['HTTP 500', 'http500'],
-    ['a different PR number', (r) => ({ ...r, number: 999 })],
-    ['the same number in ANOTHER repository', (r) => ({ ...r, base: { ...r.base, repo: { full_name: 'other-org/other-repo' } } })],
-    ['no repository identity at all', (r) => ({ ...r, base: { ref: r.base.ref } })],
-    ['merged_at set but merged: false', (r) => ({ ...r, merged: false })],
-    ['merged: true but no merged_at', (r) => ({ ...r, merged_at: null })],
+  const titleAfterRefresh = async (fn: (r: any) => unknown) => {
+    const { service } = await setup({}, mutate(fn));
+    const snap = await service.getIssue('ATL-3', true);
+    return snap!.prs.find((p) => p.key === 'demo-org/atlas#3')!.title;
+  };
+  const original = 'ATL-3 ingest pipeline';
+  it('accepts a fresh answer for the right repository (case-insensitive)', async () => {
+    expect(await titleAfterRefresh((r) => ({ ...r, title: 'ATL-3 renamed' }))).toBe('ATL-3 renamed');
+    expect(await titleAfterRefresh((r) => ({ ...r, title: 'ATL-3 renamed', base: { ...r.base, repo: { full_name: 'DEMO-ORG/Atlas' } } }))).toBe('ATL-3 renamed');
+  });
+  const wrong: [string, (r: any) => unknown][] = [
+    ['an empty object', () => ({})],
+    ['another repository with the same number', (r) => ({ ...r, title: 'EVIL', base: { ...r.base, repo: { full_name: 'other-org/other-repo' } } })],
+    ['no repository identity', (r) => ({ ...r, title: 'EVIL', base: { ref: 'main' } })],
+    ['a different PR number', (r) => ({ ...r, title: 'EVIL', number: 999 })],
+    ['merged_at set but merged: false', (r) => ({ ...r, title: 'EVIL', merged_at: '2026-05-01T00:00:00Z', merged: false })],
   ];
-  for (const [name, mut] of cases) {
-    it(`${name}: cached "merged" is NOT enough and Linear is not changed`, async () => {
-      const { actions, spec, service, ops } = await setup({}, broken(mut));
-      spec('ATL-1').state = 'In Review';
-      await service.get(true);
-      expect(service.peek()!.prs.find((p) => p.key === 'demo-org/atlas#1')?.state).toBe('merged'); // cached, for display
-      const e = await fail(actions.status('ATL-1', 'st-ATL-done'));
-      expect(['evidence-unverified', 'http', 'invalid', 'network']).toContain(e.code);
-      expect([spec('ATL-1').state, ops()]).toEqual(['In Review', []]);
-    });
-  }
-  it('repository comparison ignores case, and valid fresh evidence still lets Done through', async () => {
-    const { actions, spec, service } = await setup({}, broken((r) => ({ ...r, base: { ...r.base, repo: { full_name: 'DEMO-ORG/Atlas' } } })));
-    spec('ATL-1').state = 'In Review';
-    await service.get(true);
-    expect((await actions.status('ATL-1', 'st-ATL-done')).ok).toBe(true);
-  });
-  it('the menu may use cached evidence for display, but the change itself re-verifies', async () => {
-    const { actions, service, spec } = await setup({}, broken(() => ({})));
-    spec('ATL-1').state = 'In Review';
-    await service.get(true);
-    expect((await actions.options('ATL-1')).states.find((s) => s.name === 'Done')?.allowed).toBe(true);
-    expect((await fail(actions.status('ATL-1', 'st-ATL-done'))).code).toBe('evidence-unverified');
-  });
-  it('a fresh "not merged" answer still refuses', async () => {
-    const { actions } = await setup();
-    expect((await fail(actions.status('ATL-3', 'st-ATL-done'))).message).toMatch(/merged linked PR/);
-  });
+  for (const [name, fn] of wrong) it(`rejects ${name}`, async () => { expect(await titleAfterRefresh(fn)).toBe(original); });
 });

@@ -21,7 +21,6 @@ export class SnapshotService {
   private teamInflight = new Map<string, Promise<Snapshot>>();
   private ghCache = new Map<string, Cached<RepoData>>();
   private details = new Map<string, { updatedAt?: string; description: string; at: string }>(); // lazily-fetched descriptions
-  private prVerified = new Map<string, number>(); // PR key -> when it was last RE-READ from GitHub with a valid answer (never set from cache)
   private backoff = new Map<string, number>(); // credential ('linear' | 'github') -> epoch ms until which we make no calls
   private health: SourceHealth[] = [];
   private last?: { snap: Snapshot; at: number };
@@ -88,20 +87,6 @@ export class SnapshotService {
   /** Opening one issue: re-read only that issue (and its PRs' evidence), and only if its detail is missing or stale. */
   /** Latest assembled snapshot without any I/O. */
   peek(): Snapshot | undefined { return this.last?.snap; }
-  nowMs(): number { return this.clock(); }
-
-  /**
-   * Sensitive decisions (marking an issue Done) need FRESH evidence. Cached PR data is for display only:
-   * 'merged' / 'not-merged' are answers only if the issue's primary PR was re-read from GitHub at or after `since` and
-   * the response was valid; otherwise the evidence is 'unverified' and nothing may rely on it.
-   */
-  prEvidence(identifier: string, since: number): 'merged' | 'not-merged' | 'unverified' {
-    const issue = this.last?.snap.issues.find((i) => i.identifier === identifier.toUpperCase());
-    if (!issue) return 'unverified';
-    if (!issue.primaryPrKey) return issue.prKeys.length === 0 ? 'not-merged' : 'unverified';
-    if ((this.prVerified.get(issue.primaryPrKey) ?? -1) < since) return 'unverified';
-    return this.last!.snap.prs.find((p) => p.key === issue.primaryPrKey)?.state === 'merged' ? 'merged' : 'not-merged';
-  }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {
     const base = this.last?.snap ?? (await this.get());
@@ -147,11 +132,10 @@ export class SnapshotService {
         const fresh = normalizePr(await this.github.get(`/repos/${repo}/pulls/${num}`));
         // A malformed answer (e.g. HTTP 200 with {}), another repository's PR, or an inconsistent merged flag is not evidence: the cached PR stays for display only
         // and is NOT marked verified, so nothing sensitive can rely on it.
-        if (!isFreshPrFor(fresh, repo, Number(num))) { this.prVerified.delete(key); continue; }
+        if (!isFreshPrFor(fresh, repo, Number(num))) { continue; }
         const next = await fetchPrDetail(this.github, repo, fresh, denied, true);
         entry.data.prs[idx] = next;
         applyRunFallback([next], entry.data.runs);
-        this.prVerified.set(key, now);
       }
       } catch (e) { this.noteLimit('github', e); throw e; }
     }

@@ -91,25 +91,20 @@ describe('approval eligibility (pure policy)', () => {
     const { actions } = await setup();
     expect((await actions.options('ATL-16')).approve).toMatchObject({ eligible: true, already: false, todoState: 'Todo' });
     expect((await actions.options('ATL-15')).approve.eligible).toBe(true); // backlog issue with a description
-    const short = (await actions.options('ATL-17')).approve; // description 'tbd'
-    expect(short.eligible).toBe(false);
-    expect(short.checks.find((c) => c.id === 'description')).toMatchObject({ ok: false });
-    const blocked = (await actions.options('ATL-18')).approve;
-    expect(blocked.eligible).toBe(false);
-    expect(blocked.checks.find((c) => c.id === 'deps')!.detail).toMatch(/ATL-3 \(In Progress\)/);
-    expect((await actions.options('ATL-3')).approve.eligible).toBe(false); // already started
-    expect((await actions.options('ATL-7')).approve).toMatchObject({ eligible: false, already: true });
+    // DevFlow does not judge the ticket: a 'tbd' description, open blockers or work already started do not make Approve unavailable
+    for (const id of ['ATL-17', 'ATL-18', 'ATL-3']) expect((await actions.options(id)).approve.eligible, id).toBe(true);
+    expect((await actions.options('ATL-7')).approve).toMatchObject({ eligible: true, already: true });
   });
-  it('honours per-project policy and missing prerequisites', () => {
-    const base = { id: 'u', identifier: 'ABC-1', title: 't', description: 'x'.repeat(60), priority: 0, state: { id: 's1', name: 'Backlog', type: 'backlog' as const }, teamKey: 'ABC',
+  it('checks only what the Approve action technically needs (write path, scope, Ready label, Todo state)', () => {
+    const base = { id: 'u', identifier: 'ABC-1', title: 't', description: '', priority: 0, state: { id: 's1', name: 'Backlog', type: 'backlog' as const }, teamKey: 'ABC',
       states: [{ id: 's1', name: 'Backlog', type: 'backlog' as const, position: 0 }, { id: 's2', name: 'Todo', type: 'unstarted' as const, position: 1 }],
-      labels: [], milestones: [], openBlockers: [], depsVerifiable: true, records: [], teamLabels: [{ id: 'r', name: 'Ready', color: '#fff', isGroup: false, scope: 'team' as const }] };
-    expect(evaluateApproval(base, DEFAULT_WORKFLOW, true, OK_SCOPE).eligible).toBe(true);
-    const strict = { ...DEFAULT_WORKFLOW, readiness: { ...DEFAULT_WORKFLOW.readiness, requireMilestone: true, requirePriority: true, requireClassificationLabel: true } };
-    expect(evaluateApproval(base, strict, true, OK_SCOPE).checks.filter((c) => !c.ok).map((c) => c.id).sort()).toEqual(['classification', 'milestone', 'priority']);
+      labels: [], milestones: [], openBlockers: [{ identifier: 'ABC-9', stateName: 'Todo' }], depsVerifiable: false, teamLabels: [{ id: 'r', name: 'Ready', color: '#fff', isGroup: false, scope: 'team' as const }] };
+    const ev = evaluateApproval(base, DEFAULT_WORKFLOW, true, OK_SCOPE); // empty description, an open blocker, unverifiable relations: none of that is DevFlow's call
+    expect([ev.eligible, ev.checks.map((c) => c.id)]).toEqual([true, ['write', 'scope', 'ready-label', 'todo-state']]);
     expect(evaluateApproval({ ...base, teamLabels: [] }, DEFAULT_WORKFLOW, true, OK_SCOPE).checks.find((c) => c.id === 'ready-label')!.ok).toBe(false); // label missing: DevFlow does not create labels
-    expect(evaluateApproval({ ...base, depsVerifiable: false }, DEFAULT_WORKFLOW, true, OK_SCOPE).eligible).toBe(false); // cannot verify dependencies
     expect(evaluateApproval({ ...base, states: [base.states[0]!] }, DEFAULT_WORKFLOW, true, OK_SCOPE).checks.find((c) => c.id === 'todo-state')!.ok).toBe(false);
+    expect(evaluateApproval(base, DEFAULT_WORKFLOW, false, OK_SCOPE).eligible).toBe(false);
+    expect(evaluateApproval(base, DEFAULT_WORKFLOW, true, { writeAllowed: false, writeReason: 'x' }).eligible).toBe(false);
     expect(parseCtx({ issue: { id: 'x' } }, [])).toBeUndefined(); // malformed live data is not trusted
   });
 });
@@ -120,14 +115,17 @@ describe('approve for execution', () => {
     for (const bad of [undefined, true, '', 'ATL-17', 'yes']) expect((await fail(actions.approve('ATL-15', bad))).code).toBe('not-confirmed');
     expect(ops()).toEqual([]);
   });
-  it('refuses ineligible tickets with the failed checks and mutates nothing', async () => {
+  it('refuses only on technical grounds, with the failed checks, and mutates nothing', async () => {
     const { actions, ops } = await setup();
-    for (const id of ['ATL-17', 'ATL-18', 'ATL-3', 'ATL-7', 'ATL-12']) {
-      const e = await fail(actions.approve(id, id));
-      expect([e.code, e.status]).toEqual(['ineligible', 422]);
-      expect(e.checks!.some((c) => !c.ok)).toBe(true);
-    }
+    const e = await fail(actions.approve('ATL-20', 'ATL-20')); // not covered by any write-enabled project/team
+    expect(e.status).toBeGreaterThanOrEqual(400);
     expect(ops()).toEqual([]);
+  });
+  it('approves any ticket Linear accepts: short description, open blockers, already started', async () => {
+    const { actions, spec } = await setup();
+    for (const id of ['ATL-17', 'ATL-18', 'ATL-3']) expect((await actions.approve(id, id)).ok, id).toBe(true);
+    expect([spec('ATL-17').state, spec('ATL-17').labels]).toEqual(['Todo', ['Ready']]);
+    expect(spec('ATL-3').state).toBe('Todo'); // approve = Todo + Ready, exactly like doing it in Linear
   });
   it('moves to Todo + Ready, then re-reads Linear and verifies (no comments, nothing else written)', async () => {
     const { actions, spec, ops, logs } = await setup();
@@ -158,30 +156,41 @@ describe('revoke readiness', () => {
     expect(ops()).toEqual(['IssueRemoveLabel', 'IssueUpdate']);
     expect(r.snapshot.issues.find((i) => i.identifier === 'ATL-7')!.stage).toBe('backlog');
   });
-  it('is refused for issues that are not Ready or already started, and needs confirmation', async () => {
+  it('is refused only when the issue is not Ready, and needs confirmation', async () => {
     const { actions, ops, spec } = await setup();
     expect((await fail(actions.revoke('ATL-16', 'ATL-16'))).code).toBe('not-ready');
     expect((await fail(actions.revoke('ATL-7', 'nope'))).code).toBe('not-confirmed');
-    spec('ATL-6').state = 'In Progress'; // Ready label but work started
-    expect((await fail(actions.revoke('ATL-6', 'ATL-6'))).code).toBe('started');
     expect(ops()).toEqual([]);
+    spec('ATL-6').state = 'In Progress'; // Ready but started: Linear decides, DevFlow does not
+    expect((await actions.revoke('ATL-6', 'ATL-6')).ok).toBe(true);
+    expect(spec('ATL-6').state).toBe('Backlog');
   });
 });
 
 describe('workflow status changes', () => {
-  it('cannot bypass approval or completion requirements', async () => {
-    const { actions, ops, spec } = await setup();
+  it('sends the requested change to Linear and lets Linear decide: no Ready, merged-PR or state-type rules of its own', async () => {
+    const { actions, spec } = await setup();
     const id = (team: string, name: string) => `st-${team}-${name.toLowerCase().replace(/\W+/g, '-')}`;
-    expect((await fail(actions.status('ATL-15', id('ATL', 'In Progress')))).message).toMatch(/requires approval/); // backlog -> started without Ready
-    expect((await fail(actions.status('ATL-16', id('ATL', 'In Progress')))).code).toBe('transition-refused'); // Todo but not Ready
-    expect((await fail(actions.status('ATL-3', id('ATL', 'Done')))).message).toMatch(/merged linked PR/); // PR #3 not merged
-    expect((await fail(actions.status('ATL-3', id('ATL', 'Canceled')))).code).toBe('transition-refused');
-    expect((await fail(actions.status('ATL-7', id('ATL', 'Backlog')))).message).toMatch(/Revoke readiness/); // Ready issue cannot be dropped to backlog silently
-    expect((await fail(actions.status('ATL-2', id('ATL', 'In Progress')))).message).toMatch(/reopened in Linear/);
+    expect((await actions.status('ATL-15', id('ATL', 'In Progress'))).ok).toBe(true); // backlog -> started without Ready
+    expect((await actions.status('ATL-3', id('ATL', 'Done'))).ok).toBe(true); // PR #3 is open, not merged
+    expect((await actions.status('ATL-16', id('ATL', 'Canceled'))).ok).toBe(true);
+    expect((await actions.status('ATL-7', id('ATL', 'Backlog'))).ok).toBe(true); // Ready issue back to backlog
+    expect((await actions.status('ATL-2', id('ATL', 'In Progress'))).ok).toBe(true); // reopening a Done issue
+    expect([spec('ATL-15').state, spec('ATL-3').state, spec('ATL-16').state, spec('ATL-7').state, spec('ATL-2').state]).toEqual(['In Progress', 'Done', 'Canceled', 'Backlog', 'In Progress']);
+  });
+  it('still refuses malformed requests, the current state, and unknown states (no write is sent)', async () => {
+    const { actions, ops } = await setup();
     expect((await fail(actions.status('ATL-3', 'st-ATL-bogus'))).code).toBe('unknown-state');
     expect((await fail(actions.status('ATL-3', 'bad id'))).code).toBe('bad-input');
+    expect((await fail(actions.status('ATL-3', 'st-ATL-in-progress'))).code).toBe('transition-refused'); // already there
     expect(ops()).toEqual([]);
-    expect(spec('ATL-3').state).toBe('In Progress');
+  });
+  it('shows Linear\'s answer when it rejects or ignores the change', async () => {
+    const rejected = await setup({ fail: (op) => op === 'IssueUpdate' });
+    const e = await fail(rejected.actions.status('ATL-3', 'st-ATL-done'));
+    expect(e.message).toMatch(/Linear currently shows status "In Progress"/);
+    const ignored = await setup({ silentNoop: (op) => op === 'IssueUpdate' });
+    expect((await fail(ignored.actions.status('ATL-3', 'st-ATL-done'))).code).toBe('verify-failed');
   });
   it('allows legitimate transitions and verifies them', async () => {
     const { actions, spec } = await setup();
@@ -192,21 +201,17 @@ describe('workflow status changes', () => {
     expect((await actions.status('ATL-15', id('Todo'))).ok).toBe(true); // Todo alone does not authorize execution
     expect(spec('ATL-15').labels).not.toContain('Ready');
   });
-  it('allows Done only with a merged linked PR verified from GitHub', async () => {
-    const { actions, spec, service } = await setup();
-    spec('ATL-1').state = 'In Review'; // PR #1 for ATL-1 is merged in the GitHub fixtures
-    await service.get(true);
-    expect((await actions.status('ATL-1', 'st-ATL-done')).ok).toBe(true);
-    expect(spec('ATL-1').state).toBe('Done');
+  it('Done works with or without a merged PR (non-code tickets have none)', async () => {
+    const { actions, spec } = await setup();
+    expect((await actions.status('ATL-16', 'st-ATL-done')).ok).toBe(true); // a documentation ticket: no PR at all
+    expect(spec('ATL-16').state).toBe('Done');
   });
-  it('options explain every disabled transition', async () => {
+  it('the menu offers every state except the current one', async () => {
     const { actions } = await setup();
     const o = await actions.options('ATL-15');
-    const s = (n: string) => o.states.find((x) => x.name === n)!;
-    expect(s('In Progress')).toMatchObject({ allowed: false, reason: expect.stringMatching(/approval/) });
-    expect(s('Done').reason).toMatch(/merged/);
-    expect(s('Backlog')).toMatchObject({ current: true, allowed: false });
-    expect(statusOptions({ ...parseCtx({ issue: { id: 'i', identifier: 'ABC-1', state: { id: 'a', type: 'started', name: 'S' }, team: { key: 'ABC', states: { nodes: [] } } } }, [])!, states: [] }, DEFAULT_WORKFLOW, false, true)).toEqual([]);
+    expect(o.states.filter((x) => !x.allowed).map((x) => [x.name, x.reason])).toEqual([['Backlog', 'Current state']]);
+    expect(o.states.map((x) => x.name)).toEqual(expect.arrayContaining(['In Progress', 'Done', 'Canceled']));
+    expect(statusOptions({ ...parseCtx({ issue: { id: 'i', identifier: 'ABC-1', state: { id: 'a', type: 'started', name: 'S' }, team: { key: 'ABC', states: { nodes: [] } } } }, [])!, states: [] }, true)).toEqual([]);
   });
 });
 
@@ -287,11 +292,10 @@ describe('HTTP security boundary (behind authentication)', () => {
   });
   it('surfaces controlled refusals as JSON with the failed checks', async () => {
     const w = await web();
-    const r = await w.post('approve', { identifier: 'ATL-17', confirm: 'ATL-17' });
-    expect(r.statusCode).toBe(422);
+    const r = await w.post('approve', { identifier: 'ATL-20', confirm: 'ATL-20' }); // not in a write-enabled project/team
+    expect(r.statusCode).toBe(403);
     const j = r.json();
-    expect([j.ok, j.code]).toEqual([false, 'ineligible']);
-    expect(j.checks.some((c: { ok: boolean }) => !c.ok)).toBe(true);
+    expect([j.ok, j.code]).toEqual([false, 'not-authorized']);
     const o = await w.sess.get('/api/issue-actions/ATL-16');
     expect(o.json()).toMatchObject({ writeEnabled: true });
     expect(JSON.stringify(o.json())).not.toMatch(/csrf/i); // the CSRF token comes from the session endpoint only

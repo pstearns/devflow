@@ -80,7 +80,7 @@ Teams named in config are read when the dashboard opens; any other accessible te
 Approving for execution requires an **explicit** policy for the exact scope; unprojected issues never inherit a project's rules. Per-team entries look like:
 
 ```json
-"teams": [{ "key": "ABC", "write": true, "workflow": { "readyLabel": "Ready", "readiness": { "minDescriptionChars": 40 } }, "github": { "repos": ["org/repo"] } }]
+"teams": [{ "key": "ABC", "write": true, "workflow": { "readyLabel": "Ready" }, "github": { "repos": ["org/repo"] } }]
 ```
 
 **Migrating an existing config:** nothing breaks. `projects[]` entries keep working unchanged (their issues keep their rules, repos and write access). What changes: issues **outside** the covered projects (unprojected issues, other projects) are now visible, read-only, and do not inherit the project's workflow; add a `teams[]` entry (with `write: true` and a `workflow`) to enable approval/edits for them.
@@ -92,10 +92,10 @@ With a separate **`LINEAR_WRITE_API_KEY`** (a different personal API key from `L
 | Action | Rules |
 |---|---|
 | Edit labels | Add/remove ordinary labels (atomic add/remove: other labels are never replaced). Group labels and **protected workflow labels (the Ready label)** cannot be edited here. |
-| Change status | Only allowed transitions: starting work needs approval; **Done needs a merged linked PR** (verified from GitHub); cancel and reopening are done in Linear; a Ready issue cannot be dropped to Backlog without revoking readiness. |
+| Change status | Sent to Linear as requested; **Linear decides** what is allowed. DevFlow has no rules of its own (no Ready requirement, no merged-PR requirement, no blocked transitions), reads the issue back and shows the actual result. |
 | Set milestone | Only milestones of the issue's own Linear project; can be removed. |
-| **Approve for execution** | Checks the project's readiness policy against live Linear (state, Ready label exists, description, unresolved dependencies fully verified, optional milestone/priority/classification). Needs typed confirmation. Then does what you would do in Linear: moves to **Todo** and adds the **Ready** label, re-reads Linear and shows what Linear reports. If a step fails or Linear's answer differs, DevFlow shows the state Linear actually has; it keeps no record of its own and does not roll anything back. If a prerequisite cannot be verified, approval is refused and the failed checks are shown. |
-| Revoke readiness | Removes Ready, returns an unstarted issue to Backlog, re-reads Linear and shows what it reports. Started work is refused. |
+| **Approve for execution** | An explicit action with typed confirmation. Needs only what it technically requires: write access, an authorized team/project, the Ready label and a Todo state in Linear. It does not judge the ticket (description, blockers, milestone and so on are Linear's and your business). It does what you would do in Linear: **Todo** + the **Ready** label, re-reads Linear and shows what Linear reports. If a step fails or Linear's answer differs, DevFlow shows the state Linear actually has; it keeps no record of its own and does not roll anything back. Works the same for tickets with no GitHub PR. |
+| Revoke readiness | Removes Ready and returns the issue to Backlog, re-reads Linear and shows what it reports. |
 
 Without the write key, or for a team/project that config does not authorize, every action stays visible but disabled, with the reason. DevFlow never merges PRs, deletes or bulk-edits issues, starts agents, or writes to GitHub. Every action re-reads the issue, team labels and states from live Linear before acting; it never trusts cached data or browser-supplied names.
 
@@ -111,7 +111,7 @@ Without the write key, or for a team/project that config does not authorize, eve
 
 ## Configuration (`devflow.config.json`)
 
-See `devflow.config.example.json`. Per project: `linear.teamKey` (+ optional `linear.projects`), `github.repos`, `knowledge` (Obsidian path, repo file, or URL). Per project `workflow` (all optional; defaults shown in the example): `readyLabel`, `discoveryLabels`, `classificationLabels`, `protectedLabels`, `todoState`, `backlogState`, and the `readiness` policy used by *Approve for execution*. Top level: `staleAfterMinutes`, `staleDays`, `idleExitMinutes`, `obsidian.vault`/`vaultPath`, `prompts` (`{{project}}`, `{{ticket}}`, `{{milestone}}`), `review`.
+See `devflow.config.example.json`. Per project: `linear.teamKey` (+ optional `linear.projects`), `github.repos`, `knowledge` (Obsidian path, repo file, or URL). Per project `workflow` (all optional; defaults shown in the example): `readyLabel`, `discoveryLabels`, `classificationLabels`, `protectedLabels`, `todoState`, `backlogState`. (Older `readiness` settings in a config are ignored.) Top level: `staleAfterMinutes`, `staleDays`, `idleExitMinutes`, `obsidian.vault`/`vaultPath`, `prompts` (`{{project}}`, `{{ticket}}`, `{{milestone}}`), `review`.
 
 **Independent review (Codex) evidence** is never assumed: it is *Passed* only if you configure where it is recorded (`review.checkName`, `review.passedLabel`, `review.findingsLabel`); otherwise *Unknown*.
 
