@@ -1,7 +1,7 @@
 import type { Issue, Snapshot } from '../../../shared/types.ts';
 import { AttentionList } from '../components/Detail.tsx';
 import { Card, Empty, Ext, Pill, Tag, Time } from '../components/ui.tsx';
-import { attentionInSel, eventInSel, prInSel, type Route, type Sel } from '../lib.ts';
+import { READY_TILE_FILTER, attentionInSel, eventInSel, matchesStatusFilter, prInSel, type Route, type Sel } from '../lib.ts';
 
 export function Overview({ snap, issues, sel, go, now }: {
   snap: Snapshot; issues: Issue[]; sel: Sel; go: (p: Partial<Route>, replace?: boolean) => void; now: number;
@@ -9,10 +9,11 @@ export function Overview({ snap, issues, sel, go, now }: {
   const open = (id: string) => go({ ticket: id, panel: undefined });
   const weekAgo = now - 7 * 86400000;
   const tiles: { label: string; n: number; sub?: string; params: Record<string, string>; tone?: 'bad' }[] = [
-    { label: 'Ready', n: issues.filter((i) => i.stage === 'ready' && i.readiness === 'ready').length, sub: 'unblocked, not started', params: { status: 'ready' } },
+    // the count and the link use the same filter as the Milestones view, so the list the tile opens is exactly this count
+    { label: 'Ready', n: issues.filter((i) => matchesStatusFilter(i, READY_TILE_FILTER)).length, sub: 'unblocked, not started', params: { ...READY_TILE_FILTER } },
     { label: 'In progress', n: issues.filter((i) => i.stage === 'implementation' || i.stage === 'ci').length, sub: 'implementation / CI', params: { status: 'progress' } },
     { label: 'In review', n: issues.filter((i) => i.stage === 'review' || i.stage === 'merge').length, sub: 'review / awaiting merge', params: { status: 'review' } },
-    { label: 'Blocked', n: issues.filter((i) => i.readiness === 'blocked').length, sub: 'unresolved blocker', params: { blocked: '1' }, tone: 'bad' },
+    { label: 'Blocked', n: issues.filter((i) => i.readiness === 'blocked').length, sub: 'blocker, blocked state or label', params: { blocked: '1' }, tone: 'bad' },
     { label: 'Done', n: issues.filter((i) => i.stage === 'done').length, sub: `${issues.filter((i) => i.completedAt && Date.parse(i.completedAt) > weekAgo).length} in last 7d`, params: { status: 'done' } },
   ];
   const attention = snap.attention.filter((a) => attentionInSel(sel, a));

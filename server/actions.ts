@@ -5,7 +5,7 @@
 import type { ActionCheck, ActionOptions, Issue, StateType } from '../shared/types.ts';
 import type { Config, WorkflowCfg } from './config.ts';
 import { resolveScope, type Scope } from './scope.ts';
-import { Q_LABELS, normalizeLabel, stateType, type LinearClient, type RawLabel } from './linear.ts';
+import { Q_LABELS, normalizeLabel, paginate, stateType, type LinearClient, type RawLabel } from './linear.ts';
 import type { LinearWriteClient } from './linear-write.ts';
 import type { SnapshotService } from './service.ts';
 import { SourceError, arr, isObj, nodes, str } from './util.ts';
@@ -32,6 +32,8 @@ export interface Ctx {
   milestones: { id: string; name: string }[]; milestone?: { id: string; name: string };
   openBlockers: { identifier: string; stateName: string }[]; depsVerifiable: boolean;
   teamLabels: RawLabel[];
+  /** False when the team's label list could not be read completely (page cap or missing cursor): label-dependent actions fail closed. */
+  labelsComplete?: boolean;
 }
 
 export function parseCtx(data: Record<string, unknown>, teamLabels: RawLabel[]): Ctx | undefined {
@@ -58,13 +60,17 @@ export function parseCtx(data: Record<string, unknown>, teamLabels: RawLabel[]):
       return t === 'completed' || t === 'canceled' ? [] : [{ identifier: str(r.issue.identifier, 40) ?? '?', stateName: isObj(r.issue.state) ? str(r.issue.state.name, 100) ?? '?' : '?' }];
     }),
     depsVerifiable: inv.length < 50 && nodes(i.relations, 100).length < 50, // a full page may hide more relations
-    teamLabels,
+    teamLabels, labelsComplete: true,
   };
 }
 
 const low = (s: string) => s.toLowerCase();
 export const isResolvedType = (t: StateType) => t === 'completed' || t === 'canceled';
 const isProtected = (name: string, wf: WorkflowCfg) => [wf.readyLabel, ...wf.protectedLabels].map(low).includes(low(name));
+const LABELS_INCOMPLETE = 'DevFlow could not read the full label list for this team from Linear, so label changes and approval are unavailable. Nothing was changed.';
+/** Approve/Revoke change only the configured readiness label; any other protected label has to be edited in Linear. */
+const protectedHint = (name: string, wf: WorkflowCfg, applied: boolean) =>
+  low(name) === low(wf.readyLabel) ? `use ${applied ? 'Revoke readiness' : 'Approve for execution'}` : 'edit it in Linear';
 
 export function findTodo(ctx: Ctx, wf: WorkflowCfg): StateDef | undefined {
   const unstarted = ctx.states.filter((s) => s.type === 'unstarted').sort((a, b) => a.position - b.position);
@@ -121,15 +127,26 @@ export class LinearActions {
     return sc;
   }
 
-  private async load(identifier: string): Promise<Ctx> {
+  /**
+   * Reads the issue (and, when `withLabels`, its team's full label list, paginated). Only label-dependent actions need the
+   * label list; read-backs and status/milestone changes skip it. An incomplete list sets `labelsComplete: false`.
+   */
+  private async load(identifier: string, withLabels = true): Promise<Ctx> {
     if (!/^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/.test(identifier)) throw new ActionError(400, 'bad-identifier', 'Invalid issue identifier');
     const data = await this.deps.read.query(Q_ACTION_ISSUE, { id: identifier.toUpperCase() });
     const first = parseCtx(data, []);
     if (!first) throw new ActionError(404, 'not-found', `Issue ${identifier} was not found in Linear`);
+    if (!withLabels) return first;
     // The label set is the issue's OWN team's (from Linear's answer), not anything derived from the request.
-    const ld = await this.deps.read.query(Q_LABELS, { key: first.teamKey, after: null });
-    const labels = arr(isObj(ld.issueLabels) ? ld.issueLabels.nodes : [], 200).map(normalizeLabel).filter((x): x is RawLabel => !!x);
-    return { ...first, teamLabels: labels };
+    const warnings: string[] = [];
+    const raw = await paginate(this.deps.read, Q_LABELS, { key: first.teamKey }, (d) => d.issueLabels, warnings, 'labels');
+    const labels = raw.map(normalizeLabel).filter((x): x is RawLabel => !!x);
+    return { ...first, teamLabels: labels, labelsComplete: warnings.length === 0 };
+  }
+
+  /** Label edits and Approve depend on the complete label list (protection, existence, the Ready label): refuse on a partial one. */
+  private requireLabels(ctx: Ctx) {
+    if (ctx.labelsComplete === false) throw new ActionError(502, 'labels-incomplete', LABELS_INCOMPLETE);
   }
 
   /** Live options for the action menu (reads only). */
@@ -140,21 +157,23 @@ export class LinearActions {
     const w = this.enabled && sc.writeAllowed;
     const whyNot = !this.enabled ? 'Linear write access is not configured' : sc.writeReason ?? 'Writes are not enabled for this team/project';
     const ready = hasReady(ctx, wf);
+    const backlog = findBacklog(ctx, wf);
     const ap = evaluateApproval(ctx, wf, this.enabled, sc);
+    if (ctx.labelsComplete === false) ap.checks.push({ id: 'labels', label: 'Team label list read completely', ok: false, detail: LABELS_INCOMPLETE }), ap.eligible = false;
     const labels = ctx.teamLabels.filter((l) => !l.isGroup || ctx.labels.some((x) => x.id === l.id)).map((l) => {
       const applied = ctx.labels.some((x) => x.id === l.id);
       const prot = isProtected(l.name, wf);
-      const reason = !w ? whyNot : l.isGroup ? 'Group labels cannot be applied' : prot ? `Protected: use ${applied ? 'Revoke readiness' : 'Approve for execution'}` : undefined;
+      const reason = !w ? whyNot : ctx.labelsComplete === false ? LABELS_INCOMPLETE : l.isGroup ? 'Group labels cannot be applied' : prot ? `Protected: ${protectedHint(l.name, wf, applied)}` : undefined;
       return { id: l.id, name: l.name, color: l.color, scope: l.scope, applied, editable: reason === undefined, reason, classification: wf.classificationLabels.map(low).includes(low(l.name)), group: l.parent };
     });
     return {
       writeEnabled: w, reason: w ? undefined : whyNot,
       scope: { teamKey: ctx.teamKey, projectName: ctx.project?.name, policy: sc.policy, explicitPolicy: sc.explicitPolicy },
-      identifier: ctx.identifier, title: ctx.title, state: ctx.state, labels,
+      identifier: ctx.identifier, title: ctx.title, state: ctx.state, names: { ready: wf.readyLabel, backlog: findBacklog(ctx, wf)?.name }, labels,
       states: statusOptions(ctx, w),
       milestones: { current: ctx.milestone?.id, options: ctx.milestones, canChange: w && !!ctx.project, reason: !w ? whyNot : !ctx.project ? 'The issue is not in a Linear project' : undefined },
       approve: { eligible: ap.eligible, already: ap.already, checks: ap.checks, todoState: findTodo(ctx, wf)?.name },
-      revoke: { possible: w && ready, reason: !w ? whyNot : !ready ? `Not marked ${wf.readyLabel}` : undefined },
+      revoke: { possible: w && ready && !!backlog, reason: !w ? whyNot : !ready ? `Not marked ${wf.readyLabel}` : !backlog ? 'The team has no backlog state to return the issue to' : undefined },
     };
   }
 
@@ -190,7 +209,7 @@ export class LinearActions {
 
   /** A read that reports failure as "unknown" instead of throwing. */
   private async tryLoad(identifier: string): Promise<Ctx | undefined> {
-    try { return await this.load(identifier); } catch { return undefined; }
+    try { return await this.load(identifier, false); } catch { return undefined; }
   }
 
   /** The action was sent but Linear's own answer does not show the intended result: say what Linear shows, claim nothing else. */
@@ -206,6 +225,7 @@ export class LinearActions {
       const w = this.writer();
       const ctx = await this.load(identifier);
       const wf = this.authorized(ctx).workflow;
+      this.requireLabels(ctx);
       const idOk = (x: unknown): x is string => typeof x === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(x);
       if (![...add, ...remove].every(idOk) || add.length + remove.length === 0 || add.length + remove.length > 20) throw new ActionError(400, 'bad-input', 'Provide 1–20 valid label ids');
       if (add.some((a) => remove.includes(a))) throw new ActionError(400, 'bad-input', 'A label cannot be both added and removed');
@@ -215,19 +235,19 @@ export class LinearActions {
         const l = live.get(id);
         if (!l) throw new ActionError(422, 'unknown-label', 'That label does not exist for this team in Linear');
         if (l.isGroup) throw new ActionError(422, 'group-label', `"${l.name}" is a label group and cannot be applied`);
-        if (isProtected(l.name, wf)) throw new ActionError(403, 'protected-label', `"${l.name}" is a protected workflow label; use Approve for execution`);
+        if (isProtected(l.name, wf)) throw new ActionError(403, 'protected-label', `"${l.name}" is a protected workflow label; ${protectedHint(l.name, wf, false)}`);
       }
       for (const id of remove) {
         const l = live.get(id) ?? ctx.labels.find((x) => x.id === id);
         if (!l) throw new ActionError(422, 'unknown-label', 'That label does not exist for this team in Linear');
         if (!applied.has(id)) throw new ActionError(422, 'not-applied', `"${l.name}" is not on this issue`);
-        if (isProtected(l.name, wf)) throw new ActionError(403, 'protected-label', `"${l.name}" is a protected workflow label; use Revoke readiness`);
+        if (isProtected(l.name, wf)) throw new ActionError(403, 'protected-label', `"${l.name}" is a protected workflow label; ${protectedHint(l.name, wf, true)}`);
       }
       const toAdd = add.filter((id) => !applied.has(id)), toRemove = remove;
       for (const id of toAdd) await w.addLabel(ctx.id, id);
       for (const id of toRemove) await w.removeLabel(ctx.id, id);
       // verify: exactly (previous − removed + added); unrelated labels untouched
-      const after = await this.load(identifier);
+      const after = await this.load(identifier, false);
       const expected = new Set([...applied].filter((x) => !toRemove.includes(x)).concat(toAdd));
       const got = new Set(after.labels.map((l) => l.id));
       if (expected.size !== got.size || [...expected].some((x) => !got.has(x))) throw new ActionError(502, 'verify-failed', 'Linear did not reflect the label change; check the issue in Linear');
@@ -241,7 +261,7 @@ export class LinearActions {
     return this.run('status', identifier, async () => {
       const w = this.writer();
       if (typeof stateId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(stateId)) throw new ActionError(400, 'bad-input', 'Invalid state id');
-      const ctx = await this.load(identifier);
+      const ctx = await this.load(identifier, false);
       this.authorized(ctx);
       const opt = statusOptions(ctx, true).find((s) => s.id === stateId);
       if (!opt) throw new ActionError(422, 'unknown-state', 'That state does not exist for this team');
@@ -258,14 +278,14 @@ export class LinearActions {
   milestone(identifier: string, milestoneId: string | null) {
     return this.run('milestone', identifier, async () => {
       const w = this.writer();
-      const ctx = await this.load(identifier);
+      const ctx = await this.load(identifier, false);
       this.authorized(ctx);
       if (!ctx.project) throw new ActionError(422, 'no-project', 'The issue is not in a Linear project, so it cannot have a milestone');
       if (milestoneId !== null && (typeof milestoneId !== 'string' || !ctx.milestones.some((m) => m.id === milestoneId)))
         throw new ActionError(422, 'foreign-milestone', "That milestone does not belong to this issue's project");
       if ((ctx.milestone?.id ?? null) === milestoneId) throw new ActionError(422, 'no-change', 'The issue already has that milestone');
       await w.setMilestone(ctx.id, milestoneId);
-      const after = await this.load(identifier);
+      const after = await this.load(identifier, false);
       if ((after.milestone?.id ?? null) !== milestoneId) throw new ActionError(502, 'verify-failed', 'Linear did not reflect the milestone change; check the issue in Linear');
       return this.finish(identifier, milestoneId === null ? 'Milestone removed and verified in Linear' : 'Milestone assigned and verified in Linear');
     });
@@ -280,6 +300,7 @@ export class LinearActions {
       const ctx = await this.load(identifier);
       const sc = this.authorized(ctx);
       const wf = sc.workflow;
+      this.requireLabels(ctx);
       const ev = evaluateApproval(ctx, wf, true, sc);
       if (!ev.eligible) throw new ActionError(422, 'ineligible', `Cannot approve ${ctx.identifier}: ${ev.checks.filter((c) => !c.ok).map((c) => c.label).join('; ')}`, ev.checks);
       const todo = findTodo(ctx, wf)!;
@@ -300,7 +321,7 @@ export class LinearActions {
     return this.run('revoke', identifier, async () => {
       const w = this.writer();
       if (typeof confirm !== 'string' || low(confirm.trim()) !== low(identifier)) throw new ActionError(400, 'not-confirmed', `Type the issue identifier (${identifier}) to confirm`);
-      const ctx = await this.load(identifier);
+      const ctx = await this.load(identifier, false);
       const wf = this.authorized(ctx).workflow;
       if (!hasReady(ctx, wf)) throw new ActionError(422, 'not-ready', `${ctx.identifier} is not marked ${wf.readyLabel}`);
       const readyLabel = ctx.labels.find((l) => low(l.name) === low(wf.readyLabel))!;

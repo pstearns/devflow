@@ -6,7 +6,14 @@
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 
-PORT="${DEVFLOW_PORT:-4317}"
+# Find node even when launched from a non-interactive shell (nvm is not loaded there).
+NODE="${NODE_BIN:-$(command -v node || true)}"
+if [ -z "${NODE}" ]; then NODE="$(ls -d "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1 || true)"; fi
+
+# Use the port the server will actually listen on (DEVFLOW_PORT from the environment or .env, else the config `port`, else 4317).
+PORT=""
+if [ -x "${NODE:-}" ] && [ -f dist-server/server/port-cli.js ]; then PORT="$("${NODE}" dist-server/server/port-cli.js 2>/dev/null || true)"; fi
+case "${PORT}" in ''|*[!0-9]*) PORT="${DEVFLOW_PORT:-4317}" ;; esac
 URL="http://devflow.localhost:${PORT}"
 # /api/* now requires a session, so "is DevFlow up?" is answered by the public sign-in page
 # The probe goes to the loopback address with the exact Host header the server requires, so it needs no name resolution.
@@ -25,9 +32,6 @@ if ready; then
   exit 0
 fi
 
-# Find node even when launched from a non-interactive shell (nvm is not loaded there).
-NODE="${NODE_BIN:-$(command -v node || true)}"
-if [ -z "${NODE}" ]; then NODE="$(ls -d "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1 || true)"; fi
 [ -x "${NODE:-}" ] || { echo "node not found. Install Node 24.7+ or set NODE_BIN." >&2; exit 1; }
 
 [ -f dist-server/server/index.js ] && [ -f dist/index.html ] || { echo "DevFlow is not built. Run: npm run build" >&2; exit 1; }

@@ -164,22 +164,34 @@ export const Q_TEAMS = `query Teams($after: String) {
 export interface ProjectRef { id: string; name: string; slugId?: string; url?: string }
 export interface TeamRef { id: string; key: string; name: string; projects: ProjectRef[] }
 
-async function paginate(
+export async function paginate(
   client: LinearClient, query: string, vars: Record<string, unknown>, pick: (d: Record<string, unknown>) => unknown, warnings: string[], what: string,
 ): Promise<unknown[]> {
   const out: unknown[] = [];
   let after: string | undefined;
+  const seen = new Set<string>();
+  const partial = (reason: string) => {
+    warnings.push(`Linear ${what}: ${reason}; data is partial`);
+    return out;
+  };
   for (let page = 0; page < MAX_PAGES; page++) {
     const conn = pick(await client.query(query, { ...vars, after }));
     if (!isObj(conn)) throw new SourceError('invalid', `Linear ${what}: unexpected response shape`);
-    out.push(...arr(conn.nodes, 100));
-    const pi = isObj(conn.pageInfo) ? conn.pageInfo : {};
-    if (pi.hasNextPage !== true) return out;
-    after = str(pi.endCursor, 200);
-    if (!after) break;
+    if (!Array.isArray(conn.nodes) || conn.nodes.length > 100) return partial('invalid nodes');
+    out.push(...conn.nodes);
+    const pi = conn.pageInfo;
+    if (!isObj(pi) || typeof pi.hasNextPage !== 'boolean' ||
+        !(pi.endCursor === null || (typeof pi.endCursor === 'string' && pi.endCursor.trim().length > 0 && pi.endCursor.length <= 200)))
+      return partial('invalid pagination metadata');
+    if (typeof pi.endCursor === 'string') {
+      if (seen.has(pi.endCursor)) return partial('pagination cursor did not progress');
+      seen.add(pi.endCursor);
+    }
+    if (!pi.hasNextPage) return out;
+    if (pi.endCursor === null || conn.nodes.length === 0) return partial('pagination did not progress');
+    after = pi.endCursor;
   }
-  warnings.push(`Linear ${what}: stopped after ${MAX_PAGES} pages; data is partial`);
-  return out;
+  return partial(`stopped after ${MAX_PAGES} pages`);
 }
 
 /** Teams (and their projects) this READ key can see. Nothing about teams is hard-coded. */

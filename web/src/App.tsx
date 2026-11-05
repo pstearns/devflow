@@ -123,7 +123,7 @@ export function App() {
 
       {notice && <div role="status" className="border-b border-ok/50 bg-ok/10 px-4 py-1 text-ok">{notice}</div>}
       {snap?.mode === 'demo' && <div className="border-b border-warn/50 bg-warn/10 px-4 py-1 text-warn">DEMO MODE — all data is synthetic test fixtures. Nothing here comes from Linear or GitHub.</div>}
-      {live.error && <div className="border-b border-bad/50 bg-bad/10 px-4 py-1 text-bad">{live.error}. {snap ? `Showing data read ${relTime(snap.dataAt, now)}. Press Refresh to retry.` : 'Is the DevFlow server running? (It exits after being idle; relaunch it.)'}</div>}
+      {live.error && <div className="border-b border-bad/50 bg-bad/10 px-4 py-1 text-bad">{live.error}. {snap ? `Showing data read ${relTime(snap.dataAt, now)}. Press Refresh to retry.` : 'Is the DevFlow server running? (Start it again if it has stopped.)'}</div>}
 
       {showHealth && snap && (
         <div className="border-b border-line bg-panel px-4 py-2">

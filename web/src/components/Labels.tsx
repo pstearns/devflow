@@ -7,7 +7,7 @@ const hex = (c: string) => (/^#[0-9a-fA-F]{3,8}$/.test(c) ? c : '#8b97a7');
 /** A Linear label with its real name and color. `lock` marks protected workflow labels (e.g. Ready). */
 export function LabelChip({ l, lock }: { l: LabelRef; lock?: boolean }) {
   return (
-    <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-sm border border-line px-1 text-[11px] leading-4" title={lock ? `${l.name}: protected workflow label (set via Approve for execution)` : l.name}>
+    <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-sm border border-line px-1 text-[11px] leading-4" title={lock ? `${l.name}: protected workflow label (not editable in the label menu)` : l.name}>
       <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: hex(l.color) }} aria-hidden />
       {l.name}{lock && <svg viewBox="0 0 12 12" className="h-2.5 w-2.5 text-muted" aria-label="protected" role="img"><path d="M3 5.5V4a3 3 0 0 1 6 0v1.5M2.5 5.5h7v5h-7z" fill="none" stroke="currentColor" strokeWidth="1.2" /></svg>}
     </span>

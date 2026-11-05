@@ -57,6 +57,9 @@ export function inSel(sel: Sel, e: { teamKey: string; linearProjectId?: string }
   if (sel.project === 'none') return !e.linearProjectId;
   return e.linearProjectId === sel.project;
 }
+/** Blocked filter: '1' = only blocked issues, '0' = only issues that are not blocked, anything else = no filter. */
+export const matchesBlocked = (i: Pick<Issue, 'readiness'>, mode: string | undefined): boolean =>
+  mode === '1' ? i.readiness === 'blocked' : mode === '0' ? i.readiness !== 'blocked' : true;
 export function prInSel(sel: Sel, s: PrScope): boolean {
   if (!sel.team) return true;
   if (s.teamKey !== sel.team) return false;
@@ -195,7 +198,7 @@ export function useSnapshot(): Live {
       if (!r.ok) throw new Error(await readError(r));
       setSnap((await r.json()) as Snapshot); setError(undefined);
     } catch (e) {
-      setError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server (it may have stopped after being idle)');
+      setError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server (it may have stopped)');
     } finally { busy.current = false; setLoading(false); }
   }, []);
 
@@ -260,6 +263,10 @@ export function bucketOf(i: Issue): Bucket {
     default: return 'other';
   }
 }
+
+/** The status + blocked part of the Milestones filter. The Overview tiles link with these same params, so a tile's count is the list it opens. */
+export const matchesStatusFilter = (i: Issue, f: { status?: string; blocked?: string }): boolean => (!f.status || bucketOf(i) === f.status) && matchesBlocked(i, f.blocked);
+export const READY_TILE_FILTER = { status: 'ready', blocked: '0' } as const;
 
 export function fillPrompt(p: PromptDef, ctx: { project?: string; ticket?: string; milestone?: string }): string {
   return p.template
