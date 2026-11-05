@@ -2,7 +2,7 @@
 
 Local-first engineering dashboard for Linear, GitHub, and AI-assisted development workflows.
 
-DevFlow gives one person a consolidated view of tickets (Linear), pull requests, CI and review evidence (GitHub), and a lifecycle pipeline derived from both. It adds a small set of narrowly scoped Linear actions. It was built to make the *process* around AI-assisted development visible before automating any of it; see the article [Why I built the process before the automation](https://peter.logixforgeai.com/blog/process-before-automation).
+DevFlow shows where engineering work stands across Linear and GitHub: tickets, pull requests, CI and review evidence, and a lifecycle stage derived from both. It adds a few narrowly scoped Linear actions. I built it to get visibility, authority and verification right before automating any handoffs between AI coding agents. See [Why I built the process before the automation](https://peter.logixforgeai.com/blog/process-before-automation).
 
 ![Pipeline overview (synthetic demo data)](docs/screenshots/pipeline-overview.png)
 ![Ticket detail (synthetic demo data)](docs/screenshots/ticket-detail.png)
@@ -15,7 +15,7 @@ DevFlow gives one person a consolidated view of tickets (Linear), pull requests,
 - **GitHub is authoritative** for pull requests, CI and review state. DevFlow only reads GitHub.
 - DevFlow provides consolidated visibility and a few scoped operations. It does not run agents, merge PRs, delete or bulk-edit issues, or write to GitHub.
 - "Ready", "independent review" and "completion" are engineering workflow concepts shown in the UI. DevFlow does **not** enforce every ticket transition: status changes are sent to Linear, and Linear decides what is allowed.
-- Consequential actions (for example *Approve for execution*) need explicit human confirmation in the UI. Nothing runs without a person pressing the button.
+- Approve for execution and Revoke readiness require typing the issue identifier. Every other action is an explicit click. Nothing runs on its own.
 
 ## Architecture
 
@@ -78,7 +78,7 @@ npm audit         # including dev dependencies
 
 `npm run dev:server` (tsx watch) and `npm run dev:web` (Vite on :5173; no sign-in page, so use `npm start` to exercise authentication).
 
-Tests use synthetic upstream services. Some need a loopback socket and the `git` executable, so run them in a normal checkout. Passing synthetic tests does not establish compatibility with live Linear writes.
+Automated tests run against synthetic Linear and GitHub services; some need a loopback socket and the `git` executable, so run them in a normal checkout. I use DevFlow day to day with live data, running full workflows: it reads Linear issues and GitHub pull requests and CI evidence, and updates Linear labels and statuses, which change in Linear. GitHub access is read-only.
 
 ## Security model
 
@@ -89,16 +89,15 @@ Tests use synthetic upstream services. Some need a loopback socket and the `git`
 - Linear read client sends queries only; the write client exposes exactly `issueAddLabel`, `issueRemoveLabel` and `issueUpdate` (state or milestone only). Actions re-read live Linear first and are serialized.
 - Credentials stay server-side and are not logged or returned in errors.
 
-Not covered: a compromised OS account that can read your credentials, the auth database or process memory; MFA; multi-user; HTTPS. These properties come from the code and the synthetic tests, not an independent security audit.
+Not covered: a compromised OS account that can read your credentials, the auth database or process memory; MFA; multi-user; HTTPS. The design has not had an independent security audit.
 
 ## Known limitations
 
-- **Live-write evidence is limited.** The automated tests exercise every action against an in-memory fake Linear only; no test or recorded verification in this repository sends a write to real Linear. The author reports using DevFlow against a real Linear workspace to read issues and to update labels and statuses. That is operational use by the author, not independently reproducible evidence, and it is not documented per operation. Milestone changes and Approve/Revoke have no reported live use. Live Linear compatibility of every write path should be treated as unverified.
-- **Write failure handling differs by action.** Status, Approve and Revoke re-read Linear after a failed or ambiguous write and report the observed (or unknown) state. Label and milestone changes read back only after their writes return; if a write request itself throws, they report a generic failure without a readback, and a multi-label change sends one mutation per label, so it can be partially applied. Nothing is rolled back automatically. Check the issue in Linear after any reported failure.
-- GitHub: newest 100 PRs per repo; full evidence for open PRs and PRs updated in the last 14 days (max 30); up to 300 items per resource. Check-run details are shown as Unavailable with the documented token permissions.
-- Descriptions over 10,000 characters are truncated; Linear history shows the last 5 state transitions per issue.
+- **Write failures.** Status, Approve and Revoke re-read Linear after a failed or ambiguous write and report what Linear shows. Label and milestone changes verify after the writes succeed; if a write itself fails, the error is reported without a readback. A multi-label change sends one mutation per label, so it can be partially applied. Nothing is rolled back automatically, so check the issue in Linear after any reported failure.
+- **GitHub.** DevFlow reads the 100 most recently updated PRs per repo. Full CI and review evidence is fetched for open PRs and PRs updated in the last 14 days (up to 30 per repo), and up to 300 items per resource. Anything beyond that, or any missing evidence, shows as Unknown. CI comes from workflow runs; individual check-run details show as Unavailable with the recommended token permissions.
+- **Linear.** Descriptions over 10,000 characters are truncated. Each issue reads five history entries and shows the state transitions among them.
+- The server keeps running after you close the browser tab unless `idleExitMinutes` is set.
 - `node:sqlite` and `crypto.argon2` may print experimental warnings depending on the Node release.
-- Closing the browser tab does not stop the server.
 
 ## Status and license
 
