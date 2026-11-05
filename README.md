@@ -4,8 +4,8 @@ Local-first engineering dashboard for Linear, GitHub, and AI-assisted developmen
 
 DevFlow shows where engineering work stands across Linear and GitHub: tickets, pull requests, CI and review evidence, and a lifecycle stage derived from both. It adds a few narrowly scoped Linear actions. I built it to get visibility, authority and verification right before automating any handoffs between AI coding agents. See [Why I built the process before the automation](https://peter.logixforgeai.com/blog/process-before-automation).
 
-![Pipeline overview (synthetic demo data)](docs/screenshots/pipeline-overview.png)
-![Ticket detail (synthetic demo data)](docs/screenshots/ticket-detail.png)
+![Pipeline view showing tickets by lifecycle stage](docs/screenshots/pipeline-overview.png)
+![Ticket detail with lifecycle, gates and evidence](docs/screenshots/ticket-detail.png)
 
 *Screenshots use the built-in synthetic demo data. Nothing in them comes from a real Linear or GitHub account.*
 
@@ -19,7 +19,7 @@ DevFlow shows where engineering work stands across Linear and GitHub: tickets, p
 
 ## Architecture
 
-React + Vite + Tailwind frontend, Fastify backend, loopback-only (`127.0.0.1`, port 4317). Dashboard data is cached in memory; a local SQLite file stores authentication state only.
+React + Vite + Tailwind frontend, Fastify backend, loopback-only (`127.0.0.1`, default port 4317). Dashboard data is cached in memory; a local SQLite file stores authentication state only.
 
 - `web/`: views, issue detail, action UI, prompt library.
 - `server/linear.ts`, `server/github.ts`: read clients; upstream data is treated as untrusted and normalized.
@@ -63,7 +63,7 @@ Startup is strict: missing config, missing build or an occupied port exits non-z
 
 ### Optional launchers
 
-- `scripts/devflow-start.sh` / `scripts/devflow-stop.sh` (Linux/WSL; set `DEVFLOW_NO_BROWSER=1` to skip opening a browser). Logs go to `logs/devflow.log`.
+- `scripts/devflow-start.sh` / `scripts/devflow-stop.sh` (Linux/WSL; set `DEVFLOW_NO_BROWSER=1` to skip opening a browser). Logs go to `logs/devflow.log`. The launcher uses the server's port: `DEVFLOW_PORT` (environment or `.env`), else `port` in the config, else 4317. With `DEVFLOW_DEMO=1` in the environment, both skip `.env` and normal config, using the environment port or 4317.
 - `windows/DevFlow.cmd` starts DevFlow inside WSL from Windows. It needs `DEVFLOW_WSL_PATH` (the checkout path inside WSL) and optionally `DEVFLOW_WSL_DISTRO`; see the comments in the file. It has not been tested on every Windows/WSL setup. Neither launcher is required.
 
 ## Develop and verify
@@ -78,7 +78,7 @@ npm audit         # including dev dependencies
 
 `npm run dev:server` (tsx watch) and `npm run dev:web` (Vite on :5173; no sign-in page, so use `npm start` to exercise authentication).
 
-Automated tests run against synthetic Linear and GitHub services; some need a loopback socket and the `git` executable, so run them in a normal checkout. I use DevFlow day to day with live data, running full workflows: it reads Linear issues and GitHub pull requests and CI evidence, and updates Linear labels and statuses, which change in Linear. GitHub access is read-only.
+Automated tests use synthetic Linear and GitHub services; some require a loopback socket and `git`. DevFlow is also used day to day with live Linear and GitHub data, including updates to Linear labels and statuses. GitHub access is read-only.
 
 ## Security model
 
@@ -93,8 +93,8 @@ Not covered: a compromised OS account that can read your credentials, the auth d
 
 ## Known limitations
 
-- **Write failures.** Status, Approve and Revoke re-read Linear after a failed or ambiguous write and report what Linear shows. Label and milestone changes verify after the writes succeed; if a write itself fails, the error is reported without a readback. A multi-label change sends one mutation per label, so it can be partially applied. Nothing is rolled back automatically, so check the issue in Linear after any reported failure.
-- **GitHub.** DevFlow reads the 100 most recently updated PRs per repo. Full CI and review evidence is fetched for open PRs and PRs updated in the last 14 days (up to 30 per repo), and up to 300 items per resource. Anything beyond that, or any missing evidence, shows as Unknown. CI comes from workflow runs; individual check-run details show as Unavailable with the recommended token permissions.
+- **Write failures.** Status, Approve and Revoke re-read Linear after a failed or ambiguous write and report what Linear shows. Label and milestone changes verify after the writes succeed; if a write itself fails, the error is reported without a readback. A multi-label change sends one mutation per label, so it can be partially applied. Nothing is rolled back automatically, so check the issue in Linear after any reported failure. Label edits and Approve are refused, and nothing is sent, if Linear's label list cannot be read completely.
+- **GitHub.** DevFlow reads the 100 most recently updated PRs per repo. Full CI and review evidence is fetched for open PRs and PRs updated in the last 14 days (up to 30 per repo), and up to 300 items per resource. Anything beyond that, or any missing evidence, shows as Unknown. CI uses check runs where the token can read them. Otherwise it comes from the latest run of each workflow for the head commit, within the repo's 40 most recent runs, and check-run details show as Unavailable.
 - **Linear.** Descriptions over 10,000 characters are truncated. Each issue reads five history entries and shows the state transitions among them.
 - The server keeps running after you close the browser tab unless `idleExitMinutes` is set.
 - `node:sqlite` and `crypto.argon2` may print experimental warnings depending on the Node release.

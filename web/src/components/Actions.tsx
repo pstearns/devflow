@@ -9,10 +9,10 @@ type Kind = 'labels' | 'status' | 'milestone' | 'approve' | 'revoke';
 
 const ITEMS: { kind: Kind; label: string; hint: string }[] = [
   { kind: 'labels', label: 'Edit labels…', hint: 'Add or remove ordinary labels' },
-  { kind: 'status', label: 'Change status…', hint: 'Allowed workflow transitions only' },
+  { kind: 'status', label: 'Change status…', hint: 'Linear decides what is allowed' },
   { kind: 'milestone', label: 'Set milestone…', hint: 'Assign or remove a project milestone' },
-  { kind: 'approve', label: 'Approve for execution…', hint: 'Todo + Ready, with approval recorded in Linear' },
-  { kind: 'revoke', label: 'Revoke readiness…', hint: 'Remove Ready and return to Backlog' },
+  { kind: 'approve', label: 'Approve for execution…', hint: 'Set the execution state and add the ready label' },
+  { kind: 'revoke', label: 'Revoke readiness…', hint: 'Remove the ready label and return to backlog' },
 ];
 
 /** Contextual menu for one issue. Every change is validated and verified server-side against live Linear. */
@@ -127,7 +127,7 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
 
         {opts && kind === 'labels' && (
           <div className="space-y-2">
-            <p className="text-[12px] text-muted">Current state: {opts.state.name}. Only the labels you change are touched; others are preserved. Workflow labels such as the Ready label are protected.</p>
+            <p className="text-[12px] text-muted">Current state: {opts.state.name}. Only the labels you change are touched; others are preserved. Protected workflow labels are locked: <b>{opts.names.ready}</b> changes only through Approve and Revoke, any other protected label is edited in Linear.</p>
             <ul className="max-h-72 space-y-0.5 overflow-auto">
               {opts.labels.map((l) => (
                 <li key={l.id}>
@@ -151,7 +151,7 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
 
         {opts && kind === 'status' && (
           <div className="space-y-2">
-            <p className="text-[12px] text-muted">Done requires a merged linked PR; starting work requires approval; closed issues are reopened in Linear.</p>
+            <p className="text-[12px] text-muted">The change is sent to Linear as chosen. Linear decides what is allowed, and DevFlow reads the issue back to show the result.</p>
             <ul className="space-y-0.5">
               {opts.states.map((s) => (
                 <li key={s.id}>
@@ -180,7 +180,7 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
 
         {opts && kind === 'approve' && (
           <div className="space-y-2">
-            <p className="text-[12px]">Approving authorizes execution: DevFlow will move <b>{issue.identifier}</b> to <b>{opts.approve.todoState ?? 'Todo'}</b>, add the protected <b>Ready</b> label (the same two changes you would make in Linear), then re-read Linear and show what it reports. It does not start any agent.</p>
+            <p className="text-[12px]">Approving authorizes execution: DevFlow will move <b>{issue.identifier}</b> to <b>{opts.approve.todoState ?? 'Todo'}</b>, add the protected <b>{opts.names.ready}</b> label (the same two changes you would make in Linear), then re-read Linear and show what it reports. It does not start any agent.</p>
             <ul className="space-y-0.5" aria-label="Prerequisites">
               {(checks ?? opts.approve.checks).map((c) => (
                 <li key={c.id} className="flex gap-2"><span className={c.ok ? 'text-ok' : 'text-bad'} aria-hidden>{c.ok ? '✓' : '✕'}</span><span><span className={c.ok ? '' : 'font-medium'}>{c.label}</span><span className="block text-[11px] text-muted">{c.detail}</span></span></li>
@@ -198,7 +198,7 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
 
         {opts && kind === 'revoke' && (
           <div className="space-y-2">
-            <p className="text-[12px]">Revoking removes the protected <b>Ready</b> label, returns <b>{issue.identifier}</b> to Backlog, then re-reads Linear and shows what it reports.</p>
+            <p className="text-[12px]">{opts.names.backlog ? <>Revoking removes the protected <b>{opts.names.ready}</b> label, returns <b>{issue.identifier}</b> to <b>{opts.names.backlog}</b>, then re-reads Linear and shows what it reports.</> : <>Revocation is unavailable because this team has no backlog state. Nothing will be changed.</>}</p>
             {!opts.revoke.possible && opts.revoke.reason && <p className="text-warn">{opts.revoke.reason}</p>}
             {opts.revoke.possible && !disabled && (
               <>

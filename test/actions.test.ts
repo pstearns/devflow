@@ -301,3 +301,47 @@ describe('HTTP security boundary (behind authentication)', () => {
     expect(JSON.stringify(o.json())).not.toMatch(/csrf/i); // the CSRF token comes from the session endpoint only
   });
 });
+
+describe('dialog names and protected-label guidance', () => {
+  it('options carry the issue scope\'s own readiness label (Ready vs Go) and its backlog state', async () => {
+    const { actions } = await setup();
+    expect((await actions.options('ATL-3')).names).toEqual({ ready: 'Ready', backlog: 'Backlog' });
+    expect((await actions.options('ZED-1')).names).toEqual({ ready: 'Go', backlog: 'Backlog' });
+  });
+  it('only the readiness label points to Approve/Revoke; any other protected label is edited in Linear', async () => {
+    const { actions, cfg, ops } = await setup();
+    cfg.projects[0]!.workflow.protectedLabels = ['Feature'];
+    const o = await actions.options('ATL-6'); // carries both Ready and Feature
+    const by = (n: string) => o.labels.find((l) => l.name === n)!;
+    expect(by('Ready')).toMatchObject({ editable: false, reason: 'Protected: use Revoke readiness' });
+    expect(by('Feature')).toMatchObject({ editable: false, reason: 'Protected: edit it in Linear' });
+    const e = await fail(actions.labels('ATL-6', [], [LBL.feature]));
+    expect(e.code).toBe('protected-label');
+    expect(e.message).toMatch(/edit it in Linear/);
+    expect(e.message).not.toMatch(/Approve|Revoke/);
+    expect(ops()).toEqual([]); // nothing was sent
+  });
+});
+
+
+describe('Revoke without a backlog state', () => {
+  it('options explain why it is unavailable and execution refuses without mutations', async () => {
+    const { f, service, cfg, ops } = await setup();
+    const read = new LinearClient(DEMO_READ_KEY, f);
+    const query = read.query.bind(read);
+    read.query = async (q, vars) => {
+      const data = await query(q, vars);
+      if (q.includes('query ActionIssue(')) {
+        const issue = data.issue as any;
+        issue.team.states.nodes = issue.team.states.nodes.filter((s: any) => s.type !== 'backlog');
+      }
+      return data;
+    };
+    const actions = new LinearActions({ cfg, read, write: new LinearWriteClient(DEMO_WRITE_KEY, f), service });
+    const options = await actions.options('ATL-6');
+    expect(options.names.backlog).toBeUndefined();
+    expect(options.revoke).toEqual({ possible: false, reason: 'The team has no backlog state to return the issue to' });
+    expect((await fail(actions.revoke('ATL-6', 'ATL-6'))).code).toBe('no-backlog');
+    expect(ops()).toEqual([]);
+  });
+});

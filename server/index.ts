@@ -2,7 +2,7 @@ import './node-check.ts'; // must stay first: refuses unsupported Node versions 
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, loadEnvFile, type Config } from './config.ts';
+import { effectivePort, loadConfig, loadEnvFile, type Config } from './config.ts';
 import { demoConfig, demoFetch } from './demo.ts';
 import { APP_HOSTNAME, buildApp } from './app.ts';
 import { SnapshotService } from './service.ts';
@@ -80,7 +80,7 @@ auth = auth!;
 if (!auth.hasAdmin) console.warn('DevFlow: no admin account yet. Everything is locked until you run "npm run auth:setup" in a terminal.');
 
 const HOST = '127.0.0.1'; // loopback only; never exposed to the LAN
-const PORT = Number(process.env.DEVFLOW_PORT) || cfg.port; // exactly one port: no scanning, no silent drift
+const PORT = effectivePort(process.env, cfg); // exactly one port: no scanning, no silent drift
 const app = await buildApp(service, {
   auth, port: PORT,
   actions, distDir: distDir!, onRequest: (m, u) => { lastRequest = Date.now(); if (accessLog) console.log(`${new Date().toISOString()} ${m} ${u.split('?')[0]}`); } });

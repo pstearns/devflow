@@ -98,18 +98,28 @@ export interface FakeLinearOpts {
   silentNoop?: (op: string) => boolean;
   /** Teams the READ key cannot see (to test inaccessible teams). */
   hideTeams?: string[];
+  /** Labels per page for the Labels query (default 100, the page size the real query asks for). */
+  labelPageSize?: number;
+  /** Extra synthetic team labels per team, named `Extra label 1..N` (ids `lbl-extra-N`), to exercise label pagination. */
+  extraLabels?: number;
+  /** Report `hasNextPage: true` but no cursor on non-final label pages (a malformed page). */
+  labelsMissingCursor?: boolean;
 }
+/** Total labels the fake serves for a team (team + workspace + extras). Tests derive expected page counts from this. */
+export const fakeLabelTotal = (team: string, extra = 0) => labelsOf(team).length + extra;
 export interface FakeLinearStore { issues: Record<string, IssueSpec[]>; mutations: { op: string; vars: Record<string, any> }[]; viewer: string }
 
 export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
   const store: FakeLinearStore = { issues: structuredClone(SEED), mutations: [], viewer: 'Demo Owner' };
+  const extras: LabelSpec[] = Array.from({ length: opts.extraLabels ?? 0 }, (_, k) => ({ id: `lbl-extra-${k + 1}`, name: `Extra label ${k + 1}`, color: '#8b97a7' }));
+  const teamLabels = (team: string): LabelSpec[] => [...(TEAM_LABELS[team] ?? []), ...extras, ...WORKSPACE];
   const stateId = (team: string, name: string) => `st-${team}-${name.toLowerCase().replace(/\W+/g, '-')}`;
   const stateOf = (team: string, name: string) => { const d = STATE_DEFS.find((s) => s[0] === name) ?? STATE_DEFS[0]!; return { id: stateId(team, d[0]), name: d[0], type: d[1] }; };
   const teamStates = (team: string) => STATE_DEFS.map(([name, type], position) => ({ id: stateId(team, name), name, type, position }));
   const find = (ident: string) => { const m = /^([A-Z]+)-(\d+)$/.exec(ident); return m ? { team: m[1]!, spec: store.issues[m[1]!]?.find((x) => x.n === Number(m[2])) } : { team: '', spec: undefined }; };
   const byUuid = (id: string) => find(id.replace(/^uuid-/, ''));
   const projectOf = (team: string, s: IssueSpec): string | null => (s.project === undefined ? defaultProject(team) : s.project);
-  const labelNodes = (team: string, s: IssueSpec) => (s.labels ?? []).map((n) => findLabel(team, n)).filter(Boolean).map((l) => ({ id: l!.id, name: l!.name, color: l!.color }));
+  const labelNodes = (team: string, s: IssueSpec) => (s.labels ?? []).map((n) => teamLabels(team).find((l) => l.name === n)).filter(Boolean).map((l) => ({ id: l!.id, name: l!.name, color: l!.color }));
   const ref = (team: string, n: number) => { const s = store.issues[team]!.find((x) => x.n === n)!; const st = stateOf(team, s.state); return { identifier: `${team}-${n}`, title: s.title, url: `https://example.invalid/linear/${team}-${n}`, state: { name: st.name, type: st.type } }; };
 
   const raw = (team: string, s: IssueSpec, withDescription: boolean) => {
@@ -147,7 +157,7 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
       if (opts.fail?.(name, v)) return err('synthetic failure', 'INTERNAL_SERVER_ERROR');
       const noop = opts.silentNoop?.(name) === true;
       if (name === 'IssueAddLabel' || name === 'IssueRemoveLabel') {
-        const { team, spec } = byUuid(String(v.id)); const l = labelsOf(team).find((x) => x.id === v.labelId); // labels of ANOTHER team are rejected, as Linear does
+        const { team, spec } = byUuid(String(v.id)); const l = teamLabels(team).find((x) => x.id === v.labelId); // labels of ANOTHER team are rejected, as Linear does
         if (!spec || !l) return err('Entity not found', 'INVALID_INPUT');
         if (!noop) spec.labels = name === 'IssueAddLabel' ? [...new Set([...(spec.labels ?? []), l.name])] : (spec.labels ?? []).filter((x) => x !== l.name);
         return ok({ [name === 'IssueAddLabel' ? 'issueAddLabel' : 'issueRemoveLabel']: { success: true } });
@@ -176,7 +186,10 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
     }
     if (name === 'Labels') {
       const key = String(v.key);
-      return ok({ issueLabels: { nodes: [...(TEAM_LABELS[key] ?? []).map((l) => ({ ...l, team: { key } })), ...WORKSPACE.map((l) => ({ ...l, team: null }))].map((l) => ({ id: l.id, name: l.name, color: l.color, isGroup: !!(l as LabelSpec).isGroup, parent: (l as LabelSpec).parent ? { name: (l as LabelSpec).parent } : null, team: l.team })), pageInfo: { hasNextPage: false, endCursor: null } } });
+      const all = [...[...(TEAM_LABELS[key] ?? []), ...extras].map((l) => ({ ...l, team: { key } })), ...WORKSPACE.map((l) => ({ ...l, team: null }))]
+        .map((l) => ({ id: l.id, name: l.name, color: l.color, isGroup: !!(l as LabelSpec).isGroup, parent: (l as LabelSpec).parent ? { name: (l as LabelSpec).parent } : null, team: l.team }));
+      const size = opts.labelPageSize ?? 100, start = Number(v.after ?? 0), more = start + size < all.length;
+      return ok({ issueLabels: { nodes: all.slice(start, start + size), pageInfo: { hasNextPage: more, endCursor: more && !opts.labelsMissingCursor ? String(start + size) : null } } });
     }
     if (name === 'Milestones') {
       const pid = String(v.id);

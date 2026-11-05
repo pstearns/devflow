@@ -160,6 +160,15 @@ export function loadConfig(env = process.env, cwd = process.cwd()): { config: Co
   return { config: parseConfig(JSON.parse(readFileSync(p, 'utf8'))), path: p, found: true };
 }
 
+/**
+ * The port DevFlow listens on. Precedence is fixed: `DEVFLOW_PORT` (environment, or `.env` when the environment does not set it),
+ * then `port` in the config file, then 4317. A DEVFLOW_PORT that is not a positive number falls through to the config port.
+ * The server and the launcher both call this, so they cannot disagree.
+ */
+export function effectivePort(env: NodeJS.ProcessEnv, cfg: Pick<Config, 'port'>): number {
+  return Number(env.DEVFLOW_PORT) || cfg.port;
+}
+
 /** Loads KEY=VALUE pairs into process.env. Returns a warning (never a value) if the file exists but is unusable. */
 export function loadEnvFile(path = '.env'): string | undefined {
   if (!existsSync(path)) return undefined;

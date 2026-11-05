@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { attentionInSel, eventInSel, inSel, parseHash, prInSel, toHash, selOf } from '../web/src/lib.ts';
+import { READY_TILE_FILTER, attentionInSel, eventInSel, inSel, matchesBlocked, matchesStatusFilter, parseHash, prInSel, toHash, selOf } from '../web/src/lib.ts';
+import type { Issue } from '../shared/types.ts';
 
 const E = (teamKey: string, linearProjectId?: string) => ({ teamKey, linearProjectId });
 
@@ -53,5 +54,22 @@ describe('route <-> URL', () => {
   });
   it('selOf drops everything except the selection (so a switch cannot carry a ticket, panel or filters)', () => {
     expect(selOf(parseHash('#/milestones?team=ZED&p=none&t=ZED-1&labels=Go&milestone=z1'))).toEqual({ team: 'ZED', project: 'none' });
+  });
+});
+
+describe('Overview tiles open the list they count', () => {
+  const mk = (identifier: string, stage: string, readiness: string, type = 'unstarted') => ({ identifier, stage, readiness, state: { type } }) as unknown as Issue;
+  const issues = [mk('A-1', 'ready', 'ready'), mk('A-2', 'ready', 'blocked'), mk('A-3', 'backlog', 'not-ready', 'backlog'), mk('A-4', 'implementation', 'blocked', 'started'), mk('A-5', 'ready', 'ready'), mk('A-6', 'done', 'na', 'completed')];
+  it('the Ready tile is Ready-stage issues that are not blocked: the filter its link applies returns exactly those', () => {
+    const counted = issues.filter((i) => matchesStatusFilter(i, READY_TILE_FILTER)).map((i) => i.identifier);
+    expect(counted).toEqual(['A-1', 'A-5']); // the blocked Ready-stage issue (A-2) is in neither the count nor the list
+    expect(READY_TILE_FILTER).toEqual({ status: 'ready', blocked: '0' });
+  });
+  it('the blocked filter is tri-state: only, not blocked, or no filter; unknown values do not filter', () => {
+    const ids = (mode?: string) => issues.filter((i) => matchesBlocked(i, mode)).map((i) => i.identifier);
+    expect(ids('1')).toEqual(['A-2', 'A-4']);
+    expect(ids('0')).toEqual(['A-1', 'A-3', 'A-5', 'A-6']);
+    expect(ids()).toHaveLength(6);
+    expect(ids('x')).toHaveLength(6);
   });
 });

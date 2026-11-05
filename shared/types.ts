@@ -282,6 +282,8 @@ export interface ActionOptions {
   identifier: string;
   title: string;
   state: { id: string; name: string; type: StateType };
+  /** The issue scope's own workflow names, so dialogs never assume "Ready" / "Backlog". */
+  names: { ready: string; backlog?: string };
   labels: { id: string; name: string; color: string; scope: 'team' | 'workspace'; applied: boolean; editable: boolean; reason?: string; classification: boolean; group?: string }[];
   states: { id: string; name: string; type: StateType; current: boolean; allowed: boolean; reason?: string }[];
   milestones: { current?: string; options: { id: string; name: string }[]; canChange: boolean; reason?: string };

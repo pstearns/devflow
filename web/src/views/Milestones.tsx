@@ -4,7 +4,7 @@ import { IssueActions } from '../components/Actions.tsx';
 import { IssueLabels, LabelFilter } from '../components/Labels.tsx';
 import { Prompts } from '../components/Prompts.tsx';
 import { Card, Empty, Ext, Pill, Tag, select } from '../components/ui.tsx';
-import { BUCKETS, PRIORITIES, bucketOf, inSel, matchesLabels, parseLabelParam, type Route, type Sel } from '../lib.ts';
+import { BUCKETS, PRIORITIES, inSel, matchesLabels, matchesStatusFilter, parseLabelParam, type Route, type Sel } from '../lib.ts';
 
 function Progress({ m }: { m: Milestone }) {
   if (m.progress === null) return <span className="text-muted">no countable tasks</span>;
@@ -57,9 +57,9 @@ export function Milestones({ snap, issues, sel, route, go, onOpen, onResult }: {
   const issueBy = useMemo(() => new Map(snap.issues.map((i) => [i.identifier, i])), [snap]);
   const selectedLabels = parseLabelParam(f.labels);
   const match = (i: Issue) =>
-    matchesLabels(i.labels, selectedLabels) && (!f.status || bucketOf(i) === f.status) && (!f.priority || String(i.priority) === f.priority) && (f.blocked !== '1' || i.readiness === 'blocked') &&
+    matchesLabels(i.labels, selectedLabels) && matchesStatusFilter(i, f) && (!f.priority || String(i.priority) === f.priority) &&
     (f.human !== '1' || i.awaitingHuman.length > 0) && (!q || `${i.identifier} ${i.title}`.toLowerCase().includes(q.toLowerCase()));
-  const filtering = !!(f.labels || f.status || f.priority || f.blocked === '1' || f.human === '1' || q);
+  const filtering = !!(f.labels || f.status || f.priority || f.blocked === '1' || f.blocked === '0' || f.human === '1' || q);
 
   const pname = (m: { teamKey: string; linearProjectId?: string }) => {
     const t = snap.teams.find((x) => x.key === m.teamKey);
@@ -98,7 +98,9 @@ export function Milestones({ snap, issues, sel, route, go, onOpen, onResult }: {
           <option value="">Any priority</option>{PRIORITIES.map((p) => <option key={p.v} value={p.v}>{p.l}</option>)}
         </select>
         <LabelFilter labels={snap.labels.filter((l) => !sel.team || l.teamKey === sel.team)} selected={selectedLabels} onChange={(n) => set('labels', n.join(','))} />
-        <label className="flex items-center gap-1"><input type="checkbox" checked={f.blocked === '1'} onChange={(e) => set('blocked', e.target.checked ? '1' : '')} /> Blocked only</label>
+        <select aria-label="Blocked" className={select} value={f.blocked === '1' || f.blocked === '0' ? f.blocked : ''} onChange={(e) => set('blocked', e.target.value)}>
+          <option value="">Blocked: any</option><option value="1">Blocked only</option><option value="0">Not blocked</option>
+        </select>
         <label className="flex items-center gap-1"><input type="checkbox" checked={f.human === '1'} onChange={(e) => set('human', e.target.checked ? '1' : '')} /> Awaiting me</label>
         <input aria-label="Search" placeholder="Search id or title" className={`${select} w-44`} value={q} onChange={(e) => setQ(e.target.value)} />
         {(filtering || f.milestone) && <button className="text-accent" onClick={() => { setQ(''); go({ params: {} }); }}>Clear filters</button>}
