@@ -1,6 +1,7 @@
 // Controlled Linear actions. Every action: (1) re-reads the issue and its team's labels/states from LIVE Linear using the
-// READ credential, (2) validates against that live data and the project's configured policy, (3) sends only allowlisted
-// mutations with the separate WRITE credential, (4) re-reads Linear and verifies the result, (5) rolls back on failure.
+// READ credential, (2) validates against that live data and the configured scope, (3) sends only allowlisted
+// mutations with the separate WRITE credential, (4) re-reads Linear to verify the result. Approval/revoke and status
+// changes report observed or unknown state after ambiguous writes; nothing is automatically rolled back.
 import type { ActionCheck, ActionOptions, Issue, StateType } from '../shared/types.ts';
 import type { Config, WorkflowCfg } from './config.ts';
 import { resolveScope, type Scope } from './scope.ts';

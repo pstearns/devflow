@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Read-only engineering dashboard over Linear and GitHub",
+  "description": "Local-first Linear and GitHub engineering dashboard with CI evidence and controlled Linear actions",
+  "license": "MIT",
   "engines": {
     "node": ">=24.7"
   },
