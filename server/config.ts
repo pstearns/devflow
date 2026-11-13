@@ -24,6 +24,8 @@ export interface ProjectCfg {
   linear?: { teamKey: string; projects: string[] };
   repos: string[]; // owner/repo
   knowledge: KnowledgeCfg[];
+  /** Human-approved, ordered gate sequence. `deferred` entries are obligations that must be done eventually but do not gate the next step. */
+  criticalPath: { ticket: string; deferred: boolean }[];
 }
 /** Explicit team-level entry: authorizes writes for the team's issues that no config project covers, and carries the team-level policy. */
 export interface TeamCfg {
@@ -73,6 +75,18 @@ function parseWorkflow(raw: unknown, id: string): WorkflowCfg {
     readyLabel, discoveryLabels: strList(w.discoveryLabels, d.discoveryLabels), classificationLabels: strList(w.classificationLabels, d.classificationLabels),
     protectedLabels: strList(w.protectedLabels, d.protectedLabels), todoState: str(w.todoState, 100) ?? d.todoState, backlogState: str(w.backlogState, 100) ?? d.backlogState,
   };
+}
+
+const TICKET_RE = /^[A-Z][A-Z0-9]*-\d+$/;
+function parseCriticalPath(raw: unknown, id: string): { ticket: string; deferred: boolean }[] {
+  const out: { ticket: string; deferred: boolean }[] = [];
+  for (const e of arr(raw, 200)) {
+    const ticket = (typeof e === 'string' ? e : isObj(e) ? str(e.ticket, 40) ?? '' : '').trim().toUpperCase();
+    if (!TICKET_RE.test(ticket)) throw new Error(`Project "${id}": criticalPath entry "${ticket}" must be a ticket identifier like ABC-12`);
+    if (out.some((x) => x.ticket === ticket)) throw new Error(`Project "${id}": criticalPath lists ${ticket} twice`);
+    out.push({ ticket, deferred: isObj(e) && e.deferred === true });
+  }
+  return out;
 }
 
 function parseKnowledge(v: unknown): KnowledgeCfg[] {
@@ -131,7 +145,7 @@ export function parseConfig(raw: unknown): Config {
       if (!kind || !title) return [];
       return [{ title, kind, path: str(k.path, 500), repo: str(k.repo, 200), ref: str(k.ref, 100), url: str(k.url, 2048) }];
     });
-    projects.push({ id, name, workflow: parseWorkflow(p.workflow, id), linear, repos, knowledge });
+    projects.push({ id, name, workflow: parseWorkflow(p.workflow, id), linear, repos, knowledge, criticalPath: parseCriticalPath(p.criticalPath, id) });
   }
   const ob = isObj(raw.obsidian) && str(raw.obsidian.vault, 200) ? { vault: str(raw.obsidian.vault, 200)!, vaultPath: str(raw.obsidian.vaultPath, 500) } : undefined;
   const rv = isObj(raw.review) ? raw.review : {};

@@ -24,6 +24,11 @@
           "your-org/your-repo"
         ]
       },
+      "criticalPath": [
+        "ABC-1",
+        { "ticket": "ABC-2" },
+        { "ticket": "ABC-3", "deferred": true }
+      ],
       "knowledge": [
         {
           "title": "Project index",
