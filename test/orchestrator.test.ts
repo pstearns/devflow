@@ -16,6 +16,7 @@ const FAKE_CODEX = join(import.meta.dirname, 'fixtures', 'fake-codex.mjs');
 const worlds: ReturnType<typeof makeWorld>[] = [];
 const world = (...a: Parameters<typeof makeWorld>) => { const w = makeWorld(...a); worlds.push(w); return w; };
 afterEach(() => { while (worlds.length) worlds.pop()!.dispose(); });
+const PASS_POSTED = (w: ReturnType<typeof makeWorld>) => w.comments().some((b) => /Milestone 4\/6/.test(b) && b.includes('**PASS**'));
 const stateOf = (w: ReturnType<typeof makeWorld>) => w.issue().state;
 const runDir = (w: ReturnType<typeof makeWorld>, id: string) => join(w.runsDir, `${id}-${w.store().runsFor(id)[0]!.runId}`);
 
@@ -48,22 +49,40 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
     expect(repairPrompt).toContain('trailing dash');
     expect(repairPrompt).toContain('Repair attempt 1 of 3');
 
-    // Linear: FAIL comment with the finding, then PASS comment; ticket moved to the owner-approval state; nothing completed
+    // Linear audit trail: six-milestone, same ticket, structured. 8 comments for a run with one repair.
     const c = w.comments();
-    expect(c).toHaveLength(2);
-    expect(c[0]).toContain('review FAIL');
-    expect(c[0]).toContain(first!.headSha!);
-    expect(c[0]).toContain('slugify("Hello, World!") returned');
-    expect(c[1]).toContain('review PASS');
-    expect(c[1]).toContain(second!.headSha!);
-        expect(stateOf(w)).toBe('In Review');
-    expect(w.f.store.mutations.map((x) => x.op)).toEqual(['IssueUpdate', 'CommentCreate', 'CommentCreate', 'IssueUpdate']);
+    expect(c).toHaveLength(8);
+    expect(c.every((b) => b.startsWith(`### DevFlow run \`${m.runId}\``))).toBe(true);
+    expect(c[0]).toContain('Milestone 1/6 — Execution authorized and started');
+    expect(c[0]).toContain('Authorized by: **Demo Owner**');
+    expect(c[0]).toContain('Agents (all inside a bubblewrap sandbox');
+    expect(c[0]).toContain(`policy digest \`${m.policyDigest.slice(0, 16)}\``);
+    expect(c[1]).toContain('Milestone 2/6 — Implementation completed');
+    expect(c[1]).toContain(first!.headSha!);
+    expect(c[2]).toContain('Milestone 3/6 — CI verified');
+    expect(c[2]).toContain('CI passed');
+    expect(c[3]).toContain('Milestone 4/6 — Independent review completed');
+    expect(c[3]).toContain('**FAIL**');
+    expect(c[3]).toContain('slugify(\"Hello, World!\") returned'.replace(/\\/g, ''));
+    expect(c[3]).toContain('Milestone 5/6 — Repair requested');
+    expect(c[3]).toContain('> '); // agent prose is quoted, never presented as controller fact
+    expect(c[4]).toContain('Milestone 2/6 — Repair 1 completed');
+    expect(c[4]).toContain(second!.headSha!);
+    expect(c[6]).toContain('**PASS**');
+    expect(c[6]).toContain('✅ review is for this SHA');
+    expect(c[6]).toContain('✅ trusted policy intact');
+    expect(c[7]).toContain('Milestone 6/6 — Awaiting owner approval');
+    expect(c[7]).toContain('Owner action required');
+    expect(c[7]).toContain('| repair 1 |');
+    expect(stateOf(w)).toBe('In Review');
+    expect(w.f.store.mutations.map((x) => x.op)).toEqual(['IssueUpdate', ...Array(7).fill('CommentCreate'), 'IssueUpdate', 'CommentCreate']);
     // one DRAFT PR, created on the first push, verified against each pushed SHA, referenced from the Linear record
     expect(w.prs.created).toEqual([{ branch: m.branch, base: 'main', title: 'ATL-22: Add slugify helper', draft: true }]);
     expect(m.pr).toMatchObject({ number: 7, draft: true });
-    expect(w.prs.headCalls).toBe(2);
-    expect(c[1]).toContain('draft PR https://example.invalid/gh/demo-org/atlas/pull/7');
-    expect(c[1]).toContain('DevFlow will not mark it ready or merge');
+    expect(w.prs.headCalls).toBeGreaterThanOrEqual(4); // each push + each gate
+    expect(c[1]).toContain('PR [#7](https://example.invalid/gh/demo-org/atlas/pull/7) (draft)');
+    // the audit comments never carry host paths, env or credentials
+    expect(c.join('\n')).not.toMatch(/\/tmp\/|\/home\/|devflow-m1-|TOKEN|API_KEY/);
 
     // never merged or touched the base branch; lock released; clean worktree safely removed
     expect(w.mainHead()).toBe(mainBefore);
@@ -91,7 +110,7 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
     const m = await w.orch.run('ATL-22');
     expect(m.outcome).toBe('PASS');
     expect(m.attempts).toHaveLength(1);
-    expect(w.comments()).toHaveLength(1);
+    expect(w.comments()).toHaveLength(5); // start, implemented, CI, review, final
   });
 
   it('red CI is repaired from the CI failure and never reaches the reviewer until green', async () => {
@@ -99,7 +118,8 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
     const m = await w.orch.run('ATL-22');
     expect(m.attempts[0]!.ci!.state).toBe('failure');
     expect(m.attempts[0]!.review).toBeUndefined();
-    expect(w.comments()[0]).toContain('CI FAILED');
+    expect(w.comments()[2]).toContain('CI failed');
+    expect(w.comments()[2]).toContain('Milestone 5/6 — Repair requested');
     expect(readFileSync(join(runDir(w, 'ATL-22'), 'attempt-1', 'claude-prompt.txt'), 'utf8')).toContain('CI FAILED');
     expect(m.outcome).toBe('PASS');
     expect(w.calls.review).toBe(1);
@@ -114,9 +134,11 @@ describe('three failed repairs escalate', () => {
     expect(m.attempts).toHaveLength(4);
     expect(w.calls).toEqual({ implement: 4, review: 4 });
     const c = w.comments();
-    expect(c).toHaveLength(5);
-    expect(c.slice(0, 4).every((b) => b.includes('review FAIL'))).toBe(true);
-    expect(c[4]).toContain('ESCALATED');
+    expect(c.filter((b) => /Milestone 4\/6/.test(b) && b.includes('**FAIL**'))).toHaveLength(4);
+    expect(c.at(-1)).toContain('Milestone 6/6 — Escalated to the owner');
+    expect(c.at(-1)).toContain('repairs-exhausted');
+    expect(c.at(-1)).toContain('Repair attempts used: 3/3');
+    expect(c.at(-2)).toContain('No repair available');
     expect(stateOf(w)).toBe('Blocked'); // recorded in Linear, never handed over
     expect(m.blockedConfirmed).toBe(true);
     expect(m.reasonClass).toBe('repairs-exhausted');
@@ -130,7 +152,7 @@ describe('three failed repairs escalate', () => {
     const w = world({ scenario: 'no-commit' });
     const m = await w.orch.run('ATL-22');
     expect(m.state).toBe('escalated');
-    expect(m.reason).toMatch(/uncommitted|nothing reviewable/);
+    expect(m.reason).toMatch(/no new commit|nothing acceptable/);
     expect(w.calls.review).toBe(0);
   });
 
@@ -157,7 +179,7 @@ describe('fabricated, stale and tampered reviews are rejected', () => {
       const m = await w.orch.run('ATL-22');
       expect(m.state).toBe('escalated');
       expect(m.reason).toMatch(reason);
-      expect(w.comments().some((b) => b.includes('review PASS'))).toBe(false);
+      expect(PASS_POSTED(w)).toBe(false);
       expect(stateOf(w)).toBe('Blocked');
     });
   }
@@ -168,7 +190,7 @@ describe('fabricated, stale and tampered reviews are rejected', () => {
     expect(m.state).toBe('escalated');
     expect(m.reasonClass).toBe('reviewer-tamper');
     expect(m.reason).toMatch(/modified its read-only environment/);
-    expect(w.comments().some((b) => b.includes('review PASS'))).toBe(false);
+    expect(PASS_POSTED(w)).toBe(false);
     expect(w.calls.review).toBe(0); // (the counted wrapper was bypassed, so this is 0) ...
     expect(m.attempts[0]!.review).toBeUndefined(); // ... and no review was ever accepted
   });
@@ -190,8 +212,9 @@ describe('fabricated, stale and tampered reviews are rejected', () => {
     const w2 = w;
     const m = await w.orch.run('ATL-22');
     expect(m.state).toBe('escalated');
-    expect(m.reason).toMatch(/stale commit/);
-    expect(w.comments().some((b) => b.includes('review PASS'))).toBe(false);
+    expect(m.reasonClass).toBe('stale-commit');
+    expect(m.reason).toMatch(/Controller verification failed.*remote branch at this SHA/);
+    expect(PASS_POSTED(w)).toBe(false);
     expect(stateOf(w)).toBe('Blocked');
   });
 });
@@ -287,7 +310,8 @@ describe('hardening: draft PR, retries, infrastructure vs repair, Blocked state'
     expect(w.calls.implement).toBe(3); // 1 + infraRetries(2)
     expect(w.calls.review).toBe(0);
     expect(w.comments().at(-1)).toContain('infrastructure');
-    expect(w.comments().at(-1)).toContain('no repair attempt was consumed');
+    expect(w.comments().at(-1)).toContain('Repair attempts used: 0/3');
+    expect(w.comments().at(-1)).toContain('infrastructure retries: 3 (claude)');
     expect(stateOf(w)).toBe('Blocked');
   });
   it('invalid reviewer output is retried ONCE with a fresh nonce; a clean retry can pass, and the invalid output is never turned into PASS', async () => {
@@ -300,7 +324,7 @@ describe('hardening: draft PR, retries, infrastructure vs repair, Blocked state'
     expect(prompts).toHaveLength(2);
     const nonce = (p: string) => /"nonce":"([0-9a-f]+)"/.exec(p)![1];
     expect(nonce(prompts[0]!)).not.toBe(nonce(prompts[1]!));
-    expect(w.comments().filter((b) => b.includes('review PASS'))).toHaveLength(1); // exactly one PASS, from the real second review
+    expect(w.comments().filter((b) => /Milestone 4\/6/.test(b) && b.includes('**PASS**'))).toHaveLength(1); // exactly one PASS, from the real second review
   });
   it('invalid reviewer output twice escalates as review-invalid (no third try, no PASS)', async () => {
     const w = world({ scenario: 'prose' });
@@ -308,13 +332,13 @@ describe('hardening: draft PR, retries, infrastructure vs repair, Blocked state'
     expect(m.reasonClass).toBe('review-invalid');
     expect(m.reason).toMatch(/rejected twice/);
     expect(w.calls.review).toBe(2);
-    expect(w.comments().some((b) => b.includes('review PASS'))).toBe(false);
+    expect(PASS_POSTED(w)).toBe(false);
     expect(stateOf(w)).toBe('Blocked');
   });
   it('a commit that edits .github/ is rejected as an implementation failure (the implementer may not rewrite its own CI)', async () => {
     const w = world({ scenario: 'touch-ci' });
     const m = await w.orch.run('ATL-22');
-    expect(m.attempts[0]!.failure).toMatch(/protected CI configuration/);
+    expect(m.attempts[0]!.failure).toMatch(/protected configuration\/CI\/agent-instruction files/);
     expect(m.state).toBe('escalated'); // attempt 0 produced nothing acceptable
     expect(w.ci.calls).toEqual([]);
     expect(w.prs.created).toEqual([]);
@@ -326,7 +350,7 @@ describe('hardening: draft PR, retries, infrastructure vs repair, Blocked state'
     const ev = JSON.parse(readFileSync(join(runDir(w, 'ATL-22'), 'escalation.json'), 'utf8'));
     expect(ev).toMatchObject({ class: 'repairs-exhausted', repairsUsed: 3, ticket: 'ATL-22' });
     expect(w.comments().at(-1)).toContain(m.escalationEvidence!);
-    expect(w.comments().at(-1)).toContain('draft PR');
+    expect(w.comments().at(-1)).toContain('(draft)');
     expect(stateOf(w)).toBe('Blocked');
   });
   it('refuses to start when the Blocked state does not exist (an escalation must always be recordable)', async () => {
@@ -389,11 +413,14 @@ describe('CI evaluation (unit)', () => {
 describe('orchestration config', () => {
   const base = { id: 'p', name: 'P', linear: { teamKey: 'ABC', projects: [] }, github: { repos: ['o/r'] } };
   it('requires absolute paths, a listed repo and single-token binaries', () => {
-    const o = { repo: 'o/r', repoPath: '/x/repo', runsDir: '/x/runs' };
+    const o = { repo: 'o/r', repoPath: '/x/repo', runsDir: '/x/runs', claude: { bin: '/x/claude' }, codex: { bin: '/x/codex' } };
     expect(parseConfig({ projects: [{ ...base, orchestration: o }] }).projects[0]!.orchestration!.approvalState).toBe('In Review');
     expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, repoPath: 'rel' } }] })).toThrow(/absolute/);
     expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, repo: 'o/other' } }] })).toThrow(/listed/);
-    expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, codex: { bin: 'codex --yolo' } } }] })).toThrow(/single path/);
+    expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, codex: { bin: 'codex --yolo' } } }] })).toThrow(/explicit absolute path/);
+    expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, codex: { bin: 'codex' } } }] })).toThrow(/explicit absolute path/); // no PATH lookup
+    expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, claude: { bin: '/x/claude', allowedTools: ['Read', '--dangerously-skip-permissions'] } } }] })).toThrow(/plain tool pattern/);
+    expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, claude: { bin: '/x/claude', allowedTools: ['Bash(git status:*),Bash(rm -rf /)'] } } }] })).toThrow(/plain tool pattern/);
   });
   it('is absent unless configured', () => expect(parseConfig({ projects: [base] }).projects[0]!.orchestration).toBeUndefined());
 });

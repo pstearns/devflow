@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 // Scripted stand-in for `claude`. Runs INSIDE the real sandbox (cwd /work). Behaviour is chosen by "SCENARIO: x" in the ticket text
 // (it reaches us through the prompt), so there is no side channel between the test and the agent.
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, symlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
+if (argv[0] === '--help') { console.log('Usage: claude [options]\n  -p, --print\n  --output-format <f>\n  --permission-mode <m>\n  --no-session-persistence\n  --allowedTools <t>'); process.exit(0); }
 if (argv[0] === '--version') { console.log('0.0.0-fake (Claude Code)'); process.exit(0); }
 if (argv[0] === 'auth') { console.log(JSON.stringify({ loggedIn: existsSync(`${process.env.HOME}/.claude/.credentials.json`) })); process.exit(0); }
 
 const prompt = readFileSync(0, 'utf8');
 const scenario = /SCENARIO: ([\w-]+)/.exec(prompt)?.[1] ?? 'defect-then-fix';
 const repair = /Repair attempt (\d)/.test(prompt);
-writeFileSync('claude-env.json', JSON.stringify({ keys: Object.keys(process.env), argv })); // untracked: never committed
+writeFileSync('claude-env.json', JSON.stringify({ keys: Object.keys(process.env), argv, script: process.argv[1] })); // untracked: never committed
 const git = (...a) => execFileSync('git', a, { stdio: 'pipe' });
 
 if (scenario === 'infra-claude-always') { console.error('Error: ECONNRESET talking to the API'); process.exit(1); }
@@ -23,7 +24,7 @@ const test = (expect) => `import { test } from 'node:test'; import assert from '
 
 mkdirSync('src', { recursive: true }); mkdirSync('test', { recursive: true });
 if (!repair) {
-  writeFileSync('src/slugify.mjs', scenario === 'correct-first' || scenario.startsWith('infra') || scenario.startsWith('invalid') || scenario.startsWith('pr-') ? FIXED : BUGGY);
+  writeFileSync('src/slugify.mjs', scenario === 'correct-first' || scenario === 'symlink-clone' || scenario === 'symlink-out' || scenario.startsWith('infra') || scenario.startsWith('invalid') || scenario.startsWith('pr-') ? FIXED : BUGGY);
   writeFileSync('test/slugify.test.mjs', test(scenario === 'red-ci' ? 'WRONG' : 'hello-world'));
   if (scenario === 'touch-ci') { mkdirSync('.github/workflows', { recursive: true }); writeFileSync('.github/workflows/ci.yml', 'name: ci\non: push\njobs: {}\n'); }
 } else if (scenario === 'never-fixes') {
@@ -33,6 +34,7 @@ if (!repair) {
   writeFileSync('test/slugify.test.mjs', test('hello-world'));
   if (scenario === 'touch-ci') { /* second attempt behaves: no CI edit */ }
 }
+if (scenario === 'symlink-clone') { symlinkSync('..', 'escape-link'); symlinkSync('/etc', 'abs-link'); } // untracked links out of the clone
 if (scenario === 'no-commit') process.exit(0);
 git('add', 'src', 'test', ...(scenario === 'touch-ci' && !repair ? ['.github'] : []));
 git('commit', '-q', '-m', repair ? 'ATL-22: repair slugify' : 'ATL-22: add slugify');

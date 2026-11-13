@@ -2,7 +2,7 @@
 // runs `node --test` on the pushed SHA, and scripted Claude/Codex stand-ins started through the REAL subprocess runner.
 // Nothing here touches GitHub, Linear, or a real model.
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { demoFetch, DEMO_READ_KEY, DEMO_WRITE_KEY } from '../server/demo.ts';
@@ -13,6 +13,7 @@ import { CliAgents, type AgentRunner } from '../server/orchestrator/agents.ts';
 import type { PullRequests } from '../server/orchestrator/pr.ts';
 import type { CiProvider } from '../server/orchestrator/ci.ts';
 import { Orchestrator } from '../server/orchestrator/controller.ts';
+import { PolicyGuard } from '../server/orchestrator/policy.ts';
 import { RunStore } from '../server/orchestrator/manifest.ts';
 
 const FIX = resolve(import.meta.dirname, 'fixtures');
@@ -58,7 +59,7 @@ export class FakePrs implements PullRequests {
 
 export interface WorldOpts {
   scenario?: string; labels?: string[]; state?: string; blockedBy?: number[]; project?: string | null; omitOrchestration?: boolean;
-  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean;
+  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>;
   /** Real agents: run the REAL claude/codex binaries with the user's real logins (staged into the sandbox as copies). Synthetic repo/ticket only. */
   live?: { claudeBin: string; codexBin: string; description: string }; wrapAgents?: (inner: AgentRunner, w: { origin: string; repo: string }) => AgentRunner; secrets?: boolean;
 }
@@ -66,13 +67,14 @@ export interface WorldOpts {
 export function makeWorld(o: WorldOpts = {}) {
   const root = mkdtempSync(join(tmpdir(), 'devflow-m1-'));
   const origin = join(root, 'origin.git'), repo = join(root, 'repo'), runsDir = join(root, 'runs');
-  mkdirSync(origin); sh(origin, 'init', '-q', '--bare', '-b', 'main');
+  mkdirSync(runsDir); mkdirSync(origin); sh(origin, 'init', '-q', '--bare', '-b', 'main');
   mkdirSync(repo); sh(repo, 'init', '-q', '-b', 'main'); sh(repo, 'remote', 'add', 'origin', origin);
   writeFileSync(join(repo, 'README.md'), '# synthetic repo\n'); mkdirSync(join(repo, 'test'));
   writeFileSync(join(repo, 'test', 'smoke.test.mjs'), "import { test } from 'node:test'; test('smoke', () => {});\n");
+  for (const [f, body] of Object.entries(o.seed ?? {})) { mkdirSync(join(repo, f, '..'), { recursive: true }); writeFileSync(join(repo, f), body); }
   sh(repo, 'add', '-A'); sh(repo, 'commit', '-q', '-m', 'init'); sh(repo, 'push', '-q', 'origin', 'main');
 
-  const cfg = parseConfig({
+  const cfgObj = {
     projects: [{
       id: 'atlas', name: 'Atlas', linear: { teamKey: 'ATL', projects: ['Atlas'] }, github: { repos: ['demo-org/atlas'] },
       orchestration: o.omitOrchestration ? undefined : {
@@ -81,7 +83,11 @@ export function makeWorld(o: WorldOpts = {}) {
         codex: { bin: o.live ? o.live.codexBin : join(FIX, 'fake-codex.mjs') }, ...(o.live ? { agentTimeoutMinutes: 15 } : {}),
       },
     }],
-  });
+  };
+  // The owner's trusted config: its own file, outside the repo and the runs directory, owner-only. This is what the PolicyGuard pins.
+  const trustedDir = join(root, 'trusted'); mkdirSync(trustedDir, { mode: 0o700 });
+  const configPath = join(trustedDir, 'devflow.config.json'); writeFileSync(configPath, JSON.stringify(cfgObj), { mode: 0o600 }); chmodSync(configPath, 0o600);
+  const cfg = parseConfig(cfgObj);
   const f = demoFetch(Date.parse('2026-06-01T12:00:00Z'));
   f.store.issues.ATL!.push({ n: 22, title: 'Add slugify helper', state: o.state ?? 'Todo', project: o.project, ageH: 1, labels: o.labels ?? ['Ready', 'Feature'], blockedBy: o.blockedBy, desc: o.live ? o.live.description : `${DESCRIPTION}\n\nSCENARIO: ${o.scenario ?? 'defect-then-fix'}` });
   const ci = new LocalCi(origin, root, o.ci);
@@ -97,10 +103,11 @@ export function makeWorld(o: WorldOpts = {}) {
   };
   const agents = o.wrapAgents ? o.wrapAgents(counted, { origin, repo }) : counted;
   const logs: string[] = [];
-  const mk = () => new Orchestrator({ cfg, read: new LinearClient(DEMO_READ_KEY, f), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, agents, sleep: async () => {}, log: (l) => logs.push(l) });
+  const policy = new PolicyGuard(() => cfg.projects[0]!.orchestration!, configPath);
+  const mk = () => new Orchestrator({ cfg, policy, read: new LinearClient(DEMO_READ_KEY, f), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, agents, sleep: async () => {}, log: (l) => logs.push(l) });
   const issue = () => f.store.issues.ATL!.find((x) => x.n === 22)!;
   return {
-    root, origin, repo, runsDir, cfg, f, ci, prs, hostHome, calls, logs, mk, orch: mk(), issue, store: () => new RunStore(runsDir),
+    root, origin, repo, runsDir, cfg, configPath, policy, f, ci, prs, hostHome, calls, logs, mk, orch: mk(), issue, store: () => new RunStore(runsDir),
     comments: () => f.store.comments.filter((c) => c.issue === TICKET).map((c) => c.body),
     remoteHead: (branch: string) => sh(origin, 'rev-parse', `refs/heads/${branch}`),
     mainHead: () => sh(origin, 'rev-parse', 'refs/heads/main'),

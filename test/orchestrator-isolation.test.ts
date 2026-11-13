@@ -203,33 +203,60 @@ describe('untrusted clone cannot execute code in the controller', () => {
   });
 });
 
+describe('git push surface: feature branches only', () => {
+  it('refuses any destination that is not a devflow run branch, and any source that is not a private run ref', async () => {
+    const src = sourceRepo();
+    for (const branch of ['main', 'master', 'release/1', 'devflow/x', 'devflow/atl-1', 'HEAD', 'refs/heads/main', 'devflow/atl-1-abcdef1 --force'])
+      expect(() => G.pushRef(src, 'refs/devflow/abc123/attempt-0', branch), branch).toThrow(/not a DevFlow run branch/);
+    for (const ref of ['refs/heads/main', 'HEAD', 'refs/devflow/abc/attempt-0 --delete', '+refs/devflow/abc/attempt-0'])
+      expect(() => G.pushRef(src, ref, 'devflow/atl-1-abcdef1'), ref).toThrow(/private refs\/devflow/);
+  });
+  it('a real push goes only to the run branch and never touches main', async () => {
+    const src = sourceRepo(), bare = uniq('bare.git');
+    mkdirSync(bare); sh(bare, 'init', '-q', '--bare', '-b', 'main'); sh(src, 'remote', 'add', 'origin', bare); sh(src, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+    const main = sh(bare, 'rev-parse', 'refs/heads/main');
+    writeFileSync(join(src, 'n.txt'), 'n'); sh(src, 'add', '-A'); sh(src, 'commit', '-q', '-m', 'work'); sh(src, 'update-ref', 'refs/devflow/abc123/attempt-0', 'HEAD');
+    await G.pushRef(src, 'refs/devflow/abc123/attempt-0', 'devflow/atl-1-abcdef1');
+    expect(sh(bare, 'rev-parse', 'refs/heads/main')).toBe(main);
+    expect(sh(bare, 'rev-parse', 'refs/heads/devflow/atl-1-abcdef1')).toBe(sh(src, 'rev-parse', 'HEAD'));
+    expect(sh(bare, 'for-each-ref', '--format=%(refname)').split('\n').sort()).toEqual(['refs/heads/devflow/atl-1-abcdef1', 'refs/heads/main']);
+  });
+});
+
 describe('GitHub write surface: draft PR only', () => {
   const READ = (rows: unknown) => ({ get: async () => rows }) as never;
   const reply = (status: number, body: unknown) => { const calls: { url: string; init: RequestInit }[] = []; const f = (async (url: string, init: RequestInit) => { calls.push({ url, init }); return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }); }) as unknown as typeof fetch; return { f, calls }; };
   it('creates exactly one POST, with draft:true, using the WRITE token', async () => {
     const { f, calls } = reply(201, { number: 9, html_url: 'https://github.com/o/r/pull/9', draft: true });
-    const pr = await new GithubPrs(READ([]), 'write-token', f).ensureDraft('o/r', { branch: 'devflow/atl-1-x', base: 'main', title: 'T', body: 'B' });
+    const pr = await new GithubPrs(READ([]), 'write-token', f).ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1', base: 'main', title: 'T', body: 'B' });
     expect(pr).toEqual({ number: 9, url: 'https://github.com/o/r/pull/9' });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe('https://api.github.com/repos/o/r/pulls');
     expect(calls[0]!.init.method).toBe('POST');
-    expect(JSON.parse(String(calls[0]!.init.body))).toMatchObject({ draft: true, head: 'devflow/atl-1-x', base: 'main', maintainer_can_modify: false });
+    expect(JSON.parse(String(calls[0]!.init.body))).toMatchObject({ draft: true, head: 'devflow/atl-1-abcdef1', base: 'main', maintainer_can_modify: false });
     expect(new Headers(calls[0]!.init.headers).get('authorization')).toBe('Bearer write-token');
   });
   it('reuses an existing open PR instead of creating a second one', async () => {
     const { f, calls } = reply(201, {});
-    const pr = await new GithubPrs(READ([{ number: 3, html_url: 'https://github.com/o/r/pull/3' }]), 't', f).ensureDraft('o/r', { branch: 'b', base: 'main', title: 'T', body: 'B' });
+    const pr = await new GithubPrs(READ([{ number: 3, html_url: 'https://github.com/o/r/pull/3' }]), 't', f).ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1', base: 'main', title: 'T', body: 'B' });
     expect(pr.number).toBe(3); expect(calls).toHaveLength(0);
   });
   it('refuses to continue if GitHub hands back a non-draft PR, rejects a bad write token, and rejects hostile repo/branch names', async () => {
-    await expect(new GithubPrs(READ([]), 't', reply(201, { number: 1, html_url: 'https://github.com/o/r/pull/1', draft: false }).f).ensureDraft('o/r', { branch: 'b', base: 'main', title: 'T', body: 'B' })).rejects.toThrow(/non-draft/);
-    await expect(new GithubPrs(READ([]), 't', reply(403, {}).f).ensureDraft('o/r', { branch: 'b', base: 'main', title: 'T', body: 'B' })).rejects.toBeInstanceOf(SourceError);
+    await expect(new GithubPrs(READ([]), 't', reply(201, { number: 1, html_url: 'https://github.com/o/r/pull/1', draft: false }).f).ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1', base: 'main', title: 'T', body: 'B' })).rejects.toThrow(/non-draft/);
+    await expect(new GithubPrs(READ([]), 't', reply(403, {}).f).ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1', base: 'main', title: 'T', body: 'B' })).rejects.toBeInstanceOf(SourceError);
     const { f, calls } = reply(201, {});
-    await expect(new GithubPrs(READ([]), 't', f).ensureDraft('o/r/../../x', { branch: 'b', base: 'main', title: 'T', body: 'B' })).rejects.toThrow(/invalid/);
-    await expect(new GithubPrs(READ([]), 't', f).ensureDraft('o/r', { branch: 'b; rm -rf', base: 'main', title: 'T', body: 'B' })).rejects.toThrow(/invalid/);
+    await expect(new GithubPrs(READ([]), 't', f).ensureDraft('o/r/../../x', { branch: 'devflow/atl-1-abcdef1', base: 'main', title: 'T', body: 'B' })).rejects.toThrow(/invalid/);
+    await expect(new GithubPrs(READ([]), 't', f).ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1; rm -rf', base: 'main', title: 'T', body: 'B' })).rejects.toThrow(/invalid/);
+    expect(calls).toHaveLength(0);
+  });
+  it('feature-branch-only: a PR can only come from a devflow/<ticket>-<run> branch, and never target one', async () => {
+    const { f, calls } = reply(201, { number: 1, html_url: 'https://github.com/o/r/pull/1', draft: true });
+    const prs = new GithubPrs(READ([]), 't', f);
+    for (const branch of ['main', 'release/1.0', 'devflow/x', 'feature/atl-1-abcdef1', 'devflow/../main']) await expect(prs.ensureDraft('o/r', { branch, base: 'main', title: 'T', body: 'B' }), branch).rejects.toThrow(/invalid/);
+    await expect(prs.ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1', base: 'devflow/atl-2-abcdef1', title: 'T', body: 'B' })).rejects.toThrow(/invalid/);
     expect(calls).toHaveLength(0);
   });
   it('exposes no way to mark ready, merge, close, comment or edit', () => {
-    expect(Object.getOwnPropertyNames(GithubPrs.prototype).sort()).toEqual(['constructor', 'ensureDraft', 'headSha']);
+    expect(Object.getOwnPropertyNames(GithubPrs.prototype).sort()).toEqual(['baseProtected', 'constructor', 'ensureDraft', 'headSha']);
   });
 });

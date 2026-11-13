@@ -1,6 +1,9 @@
 // `npm run orchestrate -- run ABC-12`  /  `npm run orchestrate -- release ABC-12`
 // Runs one ticket to a terminal state (awaiting owner approval, or escalated) and prints the manifest summary. No daemon, no polling.
 import '../node-check.ts';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, loadEnvFile, type Config, type OrchestrationCfg } from '../config.ts';
 import { LinearClient } from '../linear.ts';
 import { LinearWriteClient } from '../linear-write.ts';
@@ -9,6 +12,7 @@ import { CliAgents } from './agents.ts';
 import { GithubCi } from './ci.ts';
 import { GithubPrs } from './pr.ts';
 import { Orchestrator, Rejected } from './controller.ts';
+import { PolicyGuard } from './policy.ts';
 import { DuplicateRun, RunStore } from './manifest.ts';
 import { TERMINAL } from './types.ts';
 
@@ -18,9 +22,14 @@ const [cmd, ticketRaw] = process.argv.slice(2);
 if ((cmd !== 'run' && cmd !== 'release') || !ticketRaw) die('usage: orchestrate run <ISSUE> | orchestrate release <ISSUE>', 2);
 const ticket = ticketRaw!.toUpperCase();
 
-const warn = loadEnvFile('.env');
+// Trusted inputs (.env, devflow.config.json) come from DevFlow's OWN directory, never from the current directory: running this command from
+// inside a target repository must not let that repository supply credentials or policy. Works from source (server/orchestrator/) and from dist-server.
+const here = dirname(fileURLToPath(import.meta.url));
+const root = [resolve(here, '../..'), resolve(here, '../../..')].find((d) => existsSync(resolve(d, 'package.json')) && existsSync(resolve(d, 'server'))) ?? die('cannot locate the DevFlow directory');
+process.chdir(root);
+const warn = loadEnvFile(resolve(root, '.env'));
 if (warn) console.warn(`DevFlow warning: ${warn}`);
-const loaded = loadConfig();
+const loaded = loadConfig(process.env, root);
 if (!loaded.found) die(`no configuration at ${loaded.path}`);
 const cfg: Config = loaded.config;
 
@@ -43,12 +52,18 @@ if (writeKey === readKey) die('LINEAR_WRITE_API_KEY must differ from LINEAR_API_
 if (ghWrite === ghToken) die('GITHUB_WRITE_TOKEN must differ from GITHUB_TOKEN (the read token never creates pull requests)');
 
 const gh = new GithubClient(ghToken!);
+const policyFor = (): PolicyGuard => {
+  const oc = firstOrchestration(cfg);
+  if (!oc) return die(`no orchestration configured for ${ticket}'s team`);
+  return new PolicyGuard(() => firstOrchestration(loadConfigFresh())!, loaded.path);
+};
 const orch = new Orchestrator({
   cfg,
   read: new LinearClient(readKey!),
   write: new LinearWriteClient(writeKey!),
   ci: new GithubCi(gh),
   prs: new GithubPrs(gh, ghWrite!),
+  policy: policyFor(),
   agents: new CliAgents(firstOrchestration(cfg) ?? { claude: { bin: 'claude', allowedTools: [] }, codex: { bin: 'codex' } }), // credentials are staged per role by the sandbox, never inherited
   log: (l) => console.log(`DevFlow ${l}`),
 });
@@ -62,6 +77,8 @@ try {
 }
 
 /** Binary names/tools come from the ticket's project, resolved per run in the controller; the CLI only needs one set for the runner. */
+/** Re-read from disk each time so a changed config changes the policy digest (and stops the run) instead of being silently ignored. */
+function loadConfigFresh(): Config { return loadConfig(process.env, root).config; }
 function firstOrchestration(c: Config): OrchestrationCfg | undefined {
   const team = ticket.split('-')[0]!;
   return c.projects.find((p) => p.linear?.teamKey === team && p.orchestration)?.orchestration;

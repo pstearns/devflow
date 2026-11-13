@@ -2,6 +2,7 @@
 // ready, merge, close, comment or edit. It uses its own token (GITHUB_WRITE_TOKEN), never the read token and never an ambient `gh` login.
 import type { GithubClient } from '../github.ts';
 import { SourceError, fetchJson, isObj, safeUrl, str } from '../util.ts';
+import { RUN_BRANCH_RE } from './types.ts';
 
 export interface PullRequest { number: number; url: string }
 export interface PullRequests {
@@ -9,6 +10,8 @@ export interface PullRequests {
   ensureDraft(repo: string, o: { branch: string; base: string; title: string; body: string }): Promise<PullRequest>;
   /** Head commit SHA GitHub currently shows for the PR. */
   headSha(repo: string, number: number): Promise<string>;
+  /** Whether the base branch is protected on GitHub (undefined if unreadable). Recorded as evidence; DevFlow's own writes never target it. */
+  baseProtected?(repo: string, base: string): Promise<boolean | undefined>;
 }
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -19,6 +22,7 @@ export class GithubPrs implements PullRequests {
 
   async ensureDraft(repo: string, o: { branch: string; base: string; title: string; body: string }): Promise<PullRequest> {
     if (!REPO_RE.test(repo) || !BRANCH_RE.test(o.branch) || !BRANCH_RE.test(o.base)) throw new Error('invalid repo or branch name');
+    if (!RUN_BRANCH_RE.test(o.branch) || RUN_BRANCH_RE.test(o.base)) throw new Error('invalid: pull requests may only be opened from a devflow/<ticket>-<run> branch');
     const owner = repo.split('/')[0]!;
     const open = await this.read.get(`/repos/${repo}/pulls`, { state: 'open', head: `${owner}:${o.branch}`, per_page: 5 });
     if (Array.isArray(open) && isObj(open[0]) && typeof open[0].number === 'number') return { number: open[0].number, url: safeUrl(open[0].html_url) ?? '' };
@@ -31,6 +35,12 @@ export class GithubPrs implements PullRequests {
     if (!res.ok || !isObj(res.json) || typeof res.json.number !== 'number') throw new SourceError('http', `GitHub did not create the pull request (HTTP ${res.status})`);
     if (res.json.draft !== true) throw new Error('GitHub created a non-draft pull request; refusing to continue'); // never silently accept a ready PR
     return { number: res.json.number, url: safeUrl(str(res.json.html_url, 500)) ?? '' };
+  }
+
+  async baseProtected(repo: string, base: string): Promise<boolean | undefined> {
+    if (!REPO_RE.test(repo) || !BRANCH_RE.test(base)) return undefined;
+    const b = await this.read.get(`/repos/${repo}/branches/${base}`);
+    return isObj(b) && typeof b.protected === 'boolean' ? b.protected : undefined;
   }
 
   async headSha(repo: string, number: number): Promise<string> {

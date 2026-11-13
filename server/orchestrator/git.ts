@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { RUN_BRANCH_RE } from './types.ts';
 
 export function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env, maxBuffer = 64 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -62,7 +63,12 @@ export async function importBranch(repo: string, clone: string, branch: string, 
 }
 export const deleteRef = (repo: string, ref: string) => git(repo, ['update-ref', '-d', ref]).catch(() => '');
 /** Non-force push of one private ref to one branch. Runs in the controller only, with the user's own git credentials. */
-export const pushRef = (repo: string, ref: string, branch: string) => git(repo, ['push', 'origin', `${ref}:refs/heads/${branch}`]);
+export function pushRef(repo: string, ref: string, branch: string) {
+  // Feature-branch-only writes, enforced here and not just by remote protection: no other destination name can be pushed, ever.
+  if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to push: "${branch.slice(0, 80)}" is not a DevFlow run branch (devflow/<ticket>-<run>)`);
+  if (!/^refs\/devflow\/[A-Za-z0-9]+\/attempt-\d$/.test(ref)) throw new Error('refusing to push: source must be a private refs/devflow/<run>/attempt-N ref');
+  return git(repo, ['push', '--no-follow-tags', 'origin', `${ref}:refs/heads/${branch}`]); // never --force
+}
 
 /**
  * Exports the exact tree of `sha` (no .git, no history) into dest. Uses a temporary index + checkout-index rather than `git archive`,

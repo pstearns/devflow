@@ -73,7 +73,9 @@
         "startedState": "In Progress",
         "approvalState": "In Review",
         "blockedState": "Blocked",
-        "ciChecks": ["build"]
+        "ciChecks": ["build"],
+        "claude": { "bin": "/home/you/.local/bin/claude" },
+        "codex": { "bin": "/path/to/codex/bin/codex" }
       }
     }
   ],

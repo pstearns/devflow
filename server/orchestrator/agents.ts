@@ -3,7 +3,7 @@
 //  - the implementer sees only its own clone (own .git, no remote, no credentials); the reviewer sees only a read-only snapshot;
 //  - neither receives any Linear/GitHub/DevFlow credential, and the reviewer has no git metadata at all.
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, closeSync, readSync, fstatSync, rmSync, constants as fsc } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { OrchestrationCfg } from '../config.ts';
@@ -42,7 +42,11 @@ export function infraProblem(r: ProcResult): string | undefined {
   return m ? `agent environment failure (${m[1]!.trim().slice(0, 40)})` : `the agent exited abnormally (${r.exitCode ?? r.signal ?? 'no status'}) without delivering`;
 }
 
-export interface Preflight { ok: boolean; problems: string[]; detail: string[] }
+/** Flags this controller passes. If a binary's own --help does not list every one of them, it is refused (fail closed). */
+export const CLAUDE_FLAGS = ['--print', '--output-format', '--permission-mode', '--no-session-persistence', '--allowedTools'];
+export const CODEX_FLAGS = ['--sandbox', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--output-schema', '--cd', '--output-last-message', '--config'];
+
+export interface Preflight { ok: boolean; problems: string[]; detail: string[]; versions?: { claude?: string; codex?: string } }
 export interface AgentRunner {
   /** Proves the sandbox starts and both CLIs run and are logged in, from inside the sandbox, before any ticket is touched. */
   preflight(): Promise<Preflight>;
@@ -84,36 +88,71 @@ export async function runInSandbox(rs: RoleSandbox, cmd: string, args: string[],
   } finally { rs.staged.finish(); }
 }
 
+/**
+ * Reads a file the AGENT could have written. The path sits in a directory the agent controls, so it may be a symlink to anything on the host
+ * (a controller file, a credential). O_NOFOLLOW + a regular-file check + a size cap mean the controller only ever reads bytes the agent
+ * itself put in that exact file; anything else is treated as "no output".
+ */
+export function readAgentFile(path: string, maxBytes: number): string | undefined {
+  try {
+    if (!lstatSync(path).isFile()) return undefined;
+    const fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > maxBytes) return undefined;
+      const buf = Buffer.alloc(st.size);
+      let off = 0;
+      while (off < st.size) { const n = readSync(fd, buf, off, st.size - off, off); if (n <= 0) break; off += n; }
+      return buf.toString('utf8', 0, off);
+    } finally { closeSync(fd); }
+  } catch { return undefined; }
+}
+
 export class CliAgents implements AgentRunner {
   constructor(private cfg: Pick<OrchestrationCfg, 'claude' | 'codex'>, private o: { hostHome?: string; env?: NodeJS.ProcessEnv } = {}) {}
   private get home() { return this.o.hostHome ?? homedir(); }
   private get env() { return this.o.env ?? process.env; }
 
   async preflight(): Promise<Preflight> {
-    const problems: string[] = [], detail: string[] = [];
+    const problems: string[] = [], detail: string[] = [], versions: { claude?: string; codex?: string } = {};
     if (!bwrapUsable()) return { ok: false, problems: ['bubblewrap (bwrap) is missing or user namespaces are disabled: refusing to run agents without isolation'], detail };
-    const probe = async (what: string, rs: RoleSandbox, args: string[]) => {
+    const tmp = mkdtempSync(join(tmpdir(), 'devflow-pf-'));
+    const out = join(tmp, 'out'); mkdirSync(out, { recursive: true });
+    const probe = async (what: string, mk: () => RoleSandbox, args: string[]) => {
+      const rs = mk();
       const r = await runInSandbox(rs, rs.cmdPath, args, { timeoutMs: 60_000 });
       detail.push(`${what}: exit ${r.exitCode}: ${(r.stdout + r.stderr).trim().split('\n')[0]?.slice(0, 120)}`);
       return r;
     };
-    const tmp = mkdtempSync(join(tmpdir(), 'devflow-pf-'));
+    // Fail closed on a missing, non-executable, unparseable or flag-incompatible binary: the exact flags this controller passes must exist.
+    const check = async (name: string, mk: () => RoleSandbox, versionArgs: string[], versionRe: RegExp, helpArgs: string[], flags: string[], auth: () => Promise<string | undefined>) => {
+      try { mk().staged.finish(); } catch (e) { problems.push(`${name}: binary unusable (${e instanceof Error ? e.message.slice(0, 160) : 'cannot resolve'})`); return; }
+      const v = await probe(`${name} --version`, mk, versionArgs);
+      if (v.exitCode !== 0) { problems.push(`${name} does not start inside the sandbox`); return; }
+      const ver = versionRe.exec(v.stdout + v.stderr);
+      if (!ver) { problems.push(`${name}: version output not recognised ("${(v.stdout + v.stderr).trim().slice(0, 60)}"); refusing an unknown binary`); return; }
+      detail.push(`${name} version ${ver[1]}`); versions[name as 'claude' | 'codex'] = ver[1];
+      const h = await probe(`${name} help`, mk, helpArgs);
+      const missing = flags.filter((f) => !(h.stdout + h.stderr).includes(f));
+      if (h.exitCode !== 0 || missing.length) { problems.push(`${name} ${ver[1]} is incompatible: missing ${missing.length ? missing.join(', ') : 'help output'}`); return; }
+      const bad = await auth();
+      if (bad) problems.push(bad);
+    };
     try {
       const claude = () => implementerSandbox(this.cfg, tmp, this.home, this.env);
-      const v = await probe('claude --version', claude(), ['--version']);
-      if (v.exitCode !== 0) problems.push('Claude Code does not start inside the sandbox');
-      const a = await probe('claude auth status', claude(), ['auth', 'status']);
-      let loggedIn = false;
-      try { loggedIn = (JSON.parse(a.stdout) as { loggedIn?: unknown }).loggedIn === true; } catch { /* not JSON */ }
-      if (!loggedIn && !this.env.ANTHROPIC_API_KEY && !this.env.CLAUDE_CODE_OAUTH_TOKEN) problems.push('Claude Code is not authenticated (run `claude auth login`, or set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)');
-      const out = join(tmp, 'out'); mkdirSync(out, { recursive: true });
+      await check('claude', claude, ['--version'], /^(\d+\.\d+\.\d+)/m, ['--help'], CLAUDE_FLAGS, async () => {
+        const a = await probe('claude auth status', claude, ['auth', 'status']);
+        let loggedIn = false;
+        try { loggedIn = (JSON.parse(a.stdout) as { loggedIn?: unknown }).loggedIn === true; } catch { /* not JSON */ }
+        return !loggedIn && !this.env.ANTHROPIC_API_KEY && !this.env.CLAUDE_CODE_OAUTH_TOKEN ? 'Claude Code is not authenticated (run `claude auth login`, or set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)' : undefined;
+      });
       const codex = () => reviewerSandbox(this.cfg, tmp, out, undefined, this.home, this.env);
-      const cv = await probe('codex --version', codex(), ['--version']);
-      if (cv.exitCode !== 0) problems.push('Codex does not start inside the sandbox');
-      const cl = await probe('codex login status', codex(), ['login', 'status']);
-      if ((cl.exitCode !== 0 || !/^logged in/im.test(cl.stdout + cl.stderr)) && !this.env.OPENAI_API_KEY) problems.push('Codex is not authenticated (run `codex login`, or set OPENAI_API_KEY)');
+      await check('codex', codex, ['--version'], /codex-cli\s+(\d+\.\d+\.\d+\S*)/, ['exec', '--help'], CODEX_FLAGS, async () => {
+        const cl = await probe('codex login status', codex, ['login', 'status']);
+        return (cl.exitCode !== 0 || !/^logged in/im.test(cl.stdout + cl.stderr)) && !this.env.OPENAI_API_KEY ? 'Codex is not authenticated (run `codex login`, or set OPENAI_API_KEY)' : undefined;
+      });
     } finally { rmSync(tmp, { recursive: true, force: true }); }
-    return { ok: problems.length === 0, problems, detail };
+    return { ok: problems.length === 0, problems, detail, versions };
   }
 
   implement(o: { clone: string; prompt: string; timeoutMs: number }) {
@@ -127,7 +166,6 @@ export class CliAgents implements AgentRunner {
     // Flags verified against `codex exec --help` (codex-cli 0.169). The inner Codex sandbox stays on read-only as a second layer.
     const args = ['exec', '--sandbox', 'read-only', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--output-schema', '/schema.json', '--cd', '/review', '-c', 'approval_policy="never"', '-o', '/out/last-message.txt', '-'];
     const r = await runInSandbox(rs, rs.cmdPath, args, { stdin: o.prompt, timeoutMs: o.timeoutMs });
-    const f = join(o.outDir, 'last-message.txt');
-    return { ...r, finalMessage: existsSync(f) ? readFileSync(f, 'utf8') : undefined };
+    return { ...r, finalMessage: readAgentFile(join(o.outDir, 'last-message.txt'), 1024 * 1024) };
   }
 }

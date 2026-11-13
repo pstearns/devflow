@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { isObj, str, arr } from './util.ts';
 import type { PromptDef } from '../shared/types.ts';
+import { TOOL_RE } from './orchestrator/policy.ts';
 
 export interface KnowledgeCfg { title: string; kind: 'obsidian' | 'repo' | 'url'; path?: string; repo?: string; ref?: string; url?: string }
 /** Names of Linear labels/states that carry lifecycle meaning. Configuration, not code: nothing project-specific is built in. */
@@ -141,15 +142,16 @@ function parseOrchestration(raw: unknown, id: string, repos: string[]): Orchestr
     return v.replace(/\/+$/, '') || '/';
   };
   const mins = (k: string, d: number, max: number) => (typeof raw[k] === 'number' && raw[k] >= 1 ? Math.min(max, raw[k] as number) : d);
+  const tools = (v: unknown) => strList(v, DEFAULT_CLAUDE_TOOLS).map((t) => { if (!TOOL_RE.test(t)) throw new Error(`${at}.claude.allowedTools entry "${t.slice(0, 60)}" is not a plain tool pattern like Read or Bash(git commit:*)`); return t; });
   const claude = isObj(raw.claude) ? raw.claude : {};
   const codex = isObj(raw.codex) ? raw.codex : {};
-  const bin = (v: unknown, d: string) => { const b = str(v, 500) ?? d; if (/\s/.test(b)) throw new Error(`${at}: binary "${b}" must be a single path or command name (no arguments)`); return b; };
+  const bin = (v: unknown, what: string) => { const b = str(v, 500) ?? ''; if (!b.startsWith('/') || /\s/.test(b)) throw new Error(`${at}.${what}.bin must be an explicit absolute path to the executable (no PATH lookup, no arguments)`); return b; };
   return {
     repo, repoPath: abs('repoPath'), baseBranch: str(raw.baseBranch, 100) ?? 'main', runsDir: abs('runsDir'),
     startedState: str(raw.startedState, 100) ?? 'In Progress', approvalState: str(raw.approvalState, 100) ?? 'In Review',
     blockedState: str(raw.blockedState, 100) ?? 'Blocked', infraRetries: typeof raw.infraRetries === 'number' ? Math.min(5, Math.max(0, Math.floor(raw.infraRetries))) : 2,
     ciChecks: strList(raw.ciChecks, []), ciTimeoutMinutes: mins('ciTimeoutMinutes', 20, 120), agentTimeoutMinutes: mins('agentTimeoutMinutes', 30, 240),
-    claude: { bin: bin(claude.bin, 'claude'), allowedTools: strList(claude.allowedTools, DEFAULT_CLAUDE_TOOLS) },
+    claude: { bin: bin(claude.bin, 'claude'), allowedTools: tools(claude.allowedTools) },
     codex: { bin: bin(codex.bin, 'codex') },
   };
 }

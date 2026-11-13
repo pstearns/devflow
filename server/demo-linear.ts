@@ -203,6 +203,10 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
       const team = Object.keys(PROJECTS).find((k) => PROJECTS[k]!.some((p) => p.id === pid)) ?? '';
       return ok({ project: { projectMilestones: { nodes: (MILESTONES[team] ?? []).filter((m) => MILESTONE_PROJECT[m.id] === pid).map((m) => ({ id: m.id, name: m.name, description: m.description, targetDate: day(m.off, nowMs) })), pageInfo: { hasNextPage: false, endCursor: null } } } });
     }
+    if (name === 'Authorizer') {
+      const { spec } = find(String(v.id));
+      return ok({ issue: spec ? { history: { nodes: (spec.labels ?? []).includes('Ready') ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }] : [] } } : null });
+    }
     if (name === 'IssueDetail') {
       const { team, spec } = find(String(v.id));
       return ok({ issue: spec ? raw(team, spec, true) : null });
