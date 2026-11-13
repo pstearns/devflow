@@ -13,7 +13,7 @@ DevFlow shows where engineering work stands across Linear and GitHub: tickets, p
 
 - **Linear is authoritative** for tickets, labels, milestones and workflow state.
 - **GitHub is authoritative** for pull requests, CI and review state. DevFlow only reads GitHub.
-- DevFlow provides consolidated visibility and a few scoped operations. It does not run agents, merge PRs, delete or bulk-edit issues, or write to GitHub.
+- The dashboard provides consolidated visibility and a few scoped operations. It does not run agents, merge PRs, delete or bulk-edit issues, or write to GitHub. The separate, opt-in `orchestrate` command (below) runs sandboxed agents, pushes one run branch per ticket and opens a draft PR; it never marks a PR ready and never merges.
 - "Ready", "independent review" and "completion" are engineering workflow concepts shown in the UI. DevFlow does **not** enforce every ticket transition: status changes are sent to Linear, and Linear decides what is allowed.
 - Approve for execution and Revoke readiness require typing the issue identifier. Every other action is an explicit click. Nothing runs on its own.
 
@@ -28,6 +28,21 @@ React + Vite + Tailwind frontend, Fastify backend, loopback-only (`127.0.0.1`, d
 - `server/auth.ts`, `server/app.ts`: single local admin, sessions, request guards, static serving.
 
 There is no background polling. With no browser connected DevFlow makes no Linear or GitHub requests.
+
+## Agent orchestration (M1)
+
+`npm run orchestrate -- run ABC-12` takes one explicitly approved ticket (Ready label, unstarted, unblocked, in a write-authorized project that has an `orchestration` block) through a governed loop, then stops for the owner. It is a CLI, not part of the dashboard, and starts nothing on its own.
+
+1. **Preflight** from inside the sandbox: bubblewrap works, both CLIs start, both are logged in. Failure refuses the run before the ticket is touched.
+2. Under an atomic per-ticket lock, re-read the ticket from live Linear, authorize it, and move it to `startedState`.
+3. **Claude Code** implements in its own standalone git clone (own `.git`, no remote) inside a bubblewrap sandbox and must commit. The controller imports that one branch through a hardened `git fetch`, judges the commit in *its own* repo, pushes it, and opens a **draft** PR (once). The PR head must equal the pushed SHA.
+4. GitHub CI must be green on that exact SHA.
+5. **Codex** reviews an exported snapshot of that SHA in a second sandbox: read-only root, no `.git`, no credentials except its own login. Its reply must be one JSON object that passes strict validation (exact SHA, per-review nonce, every changed file accounted for on PASS). Malformed output gets **one** retry with a fresh nonce and is never turned into PASS.
+6. The controller, not the agent, posts the validated result to Linear. FAIL (or red CI) sends the findings back to Claude; CI and review rerun on the new SHA.
+7. Initial attempt plus three **repairs** at most. **Infrastructure** failures (sandbox, login, API, push, PR, timeouts) have their own retry budget and never consume a repair. Any stop moves the ticket to `blockedState` with a comment and a hashed `escalation.json`.
+8. PASS moves the ticket to `approvalState` and stops. The PR stays a draft; nothing is merged.
+
+Every run writes `manifest.json`, `events.jsonl` and per-attempt evidence under `runsDir`. A crashed run leaves its lock; inspect, then `npm run orchestrate -- release ABC-12`. Configuration and the full security notes are in [docs/REFERENCE.md](docs/REFERENCE.md#agent-orchestration-m1). `npx tsx scripts/m1-demo.ts` replays the planted-defect scenario hermetically; `DEVFLOW_LIVE=1 npx tsx scripts/m1-live.ts` runs the real CLIs against a synthetic fixture only (spends model tokens).
 
 ## Requirements
 

@@ -151,3 +151,43 @@ Without the write key, or outside an authorized scope, actions are visible but d
 - **Human review** uses the latest decisive review per reviewer. Changes requested fails it; an approval passes it.
 - **Independent review** is *Passed* only from evidence you configure in `review.*`: a findings label fails it, a named check or a passed label passes it. Otherwise it is *Unknown* (pending on an open PR with sources configured).
 - **Milestone progress** = completed / (issues − canceled).
+
+
+## Agent orchestration (M1)
+
+Per project, in `devflow.config.json` (omit the block to forbid orchestration for that project):
+
+```json
+"orchestration": {
+  "repo": "your-org/your-repo",          // must be in the project's github.repos
+  "repoPath": "/abs/path/to/clone",      // the controller's own clone; `origin` must be that repo
+  "runsDir": "/abs/path/to/devflow-runs",
+  "baseBranch": "main",
+  "startedState": "In Progress",         // started-type state
+  "approvalState": "In Review",          // PASS lands here; must NOT be completed/canceled
+  "blockedState": "Blocked",             // every escalation lands here; must exist (checked before work starts)
+  "infraRetries": 2,                     // per environment step; never consumes a repair
+  "ciChecks": ["build"],                 // required check names; empty = all reported checks, green on two polls
+  "ciTimeoutMinutes": 20, "agentTimeoutMinutes": 30,
+  "claude": { "bin": "claude", "allowedTools": ["Read", "Edit", "Bash(git commit:*)"] },
+  "codex": { "bin": "/path/to/codex" }   // the directory containing it is mounted read-only (Codex needs its sibling helper binaries)
+}
+```
+
+**Credentials.** `LINEAR_API_KEY` (read), `LINEAR_WRITE_API_KEY` (a different key; the write client has create-only `commentCreate`), `GITHUB_TOKEN` (read; CI and PR-head polling), `GITHUB_WRITE_TOKEN` (a different token with *Pull requests: write*; the only GitHub write, `POST /pulls` with `draft:true`, no ready/merge/close/comment methods exist). The controller pushes one `devflow/<ticket>-<run>` branch with your own git credentials. Agents get none of these. Agent logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`) are **copied** into a throw-away home per invocation (nothing else from `~/.claude` or `~/.codex`: no settings, hooks, MCP servers, history). If the agent refreshed its token and the host file was unchanged meanwhile, the refreshed file is written back atomically. `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` or `OPENAI_API_KEY` in the controller's environment are passed through to the matching agent only.
+
+**Isolation (bubblewrap, no image, no daemon).** Both agents: new user/mount/pid/ipc/uts namespaces, cleared environment, read-only root, read-only `/usr`, own tmpfs `/tmp` and home, network on (see limits). The implementer additionally gets its clone at `/work` (read-write) and nothing of the host: not `$HOME`, not `repoPath`, not `.env`, not `~/.ssh`, not `/mnt`, not the Docker socket. The clone is a standalone repository seeded by `git fetch` from the base commit, with no remote and objects copied, so it cannot alter or push to the real repository. Commits cross back via `git fetch` of one named branch with hooks and fsmonitor disabled on the command line; the commit is then verified in the controller's repo (ancestry, non-empty diff, no edits under `.github/`). The reviewer gets only an exported tree of the SHA, read-only, with no `.git` (exported with `checkout-index`, because `git archive` honours `export-ignore`), plus one writable `/out` for its final message. The snapshot is hashed before and after; any change discards the review as tampering (no retry). A sandbox is a hard requirement: without working bubblewrap the preflight fails and nothing runs.
+
+**Failure classes.** *Repair* (counts toward the limit of 3): review FAIL, red CI, no usable commit, a commit that edits `.github/`. *Infrastructure* (retried `infraRetries` times, never counts): sandbox/CLI/login failure, agent timeout or abnormal exit without delivering, push, PR creation or head mismatch, GitHub/Linear API errors. Other stops: `review-invalid` (malformed output twice), `reviewer-tamper`, `stale-commit`, `ticket-changed`, `ci-timeout`. Every stop writes `escalation.json` (class, reason, attempts, infra events, PR, branch), comments its hash on the ticket and moves it to `blockedState`.
+
+**Run directory** `<runsDir>/<ISSUE>-<runId>/`: `manifest.json`, `events.jsonl`, `escalation.json` (if any), `clone/` (kept unless PASS), `attempt-N/{claude-prompt,claude-output,ci.json,codex-prompt,codex-output[-tryK],review.json,changes.patch,review*/context/}`. Locks: `<runsDir>/locks/<ISSUE>.lock`.
+
+**Cleanup.** Review snapshots and scratch `out*` dirs are deleted after validation (the SHA reproduces them). Staged credential homes are deleted after every invocation. After PASS the clone and the private `refs/devflow/<run>/*` refs are removed, but only when the approved SHA is on the remote branch. Evidence is never deleted. `runsDir` is outside the repository; prune old run directories yourself.
+
+**Known limits (M1).**
+- Network egress is not filtered: both agents must reach their model API, so the sandbox cannot be network-isolated. A prompt-injected agent could send what it can read (its own clone/snapshot and its own login copy) elsewhere. It cannot read anything else of yours.
+- The agent logins are copies, and the reviewer/implementer each hold *their own* login for the duration of a call. Treat a compromised agent as having its own subscription token.
+- Reviewer honesty is not verifiable: the controller checks format, SHA, nonce and coverage, not that the reviewer reasoned well.
+- Bubblewrap needs unprivileged user namespaces (works under WSL2; may not in some CI containers, where the sandbox tests skip and the run refuses).
+- If CI only runs on `pull_request`, the draft PR created by the first push is what triggers it; with no CI at all the run escalates as `ci-timeout`.
+- Node (and npm) are mounted read-only from the controller's own toolchain prefix so agents can run tests; other toolchains need an equivalent mount (not configurable yet).

@@ -26,7 +26,26 @@ export interface ProjectCfg {
   knowledge: KnowledgeCfg[];
   /** Human-approved, ordered gate sequence. `deferred` entries are obligations that must be done eventually but do not gate the next step. */
   criticalPath: { ticket: string; deferred: boolean }[];
+  /** M1 agent orchestration. Absent => `orchestrate` refuses every ticket of this project. */
+  orchestration?: OrchestrationCfg;
 }
+/** Everything the orchestrator needs to know about ONE repository. Names of Linear states are configuration, not code. */
+export interface OrchestrationCfg {
+  repo: string; // owner/repo; must also be listed in the project's github.repos
+  repoPath: string; // absolute path of a local clone whose `origin` is that repo
+  baseBranch: string;
+  runsDir: string; // absolute; manifests, evidence and worktrees live here
+  startedState: string; // Linear state the ticket moves to when a run is accepted
+  approvalState: string; // Linear state that means "waiting for the owner" (PASS)
+  blockedState: string; // Linear state for escalations; must exist so a failure can always be recorded
+  infraRetries: number; // retries of an infrastructure step; never consumes a repair attempt
+  ciChecks: string[]; // check/workflow names that must be green on the SHA (empty = at least one check, all green)
+  ciTimeoutMinutes: number;
+  agentTimeoutMinutes: number;
+  claude: { bin: string; allowedTools: string[] };
+  codex: { bin: string };
+}
+export const DEFAULT_CLAUDE_TOOLS = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(npm test:*)', 'Bash(npm run:*)', 'Bash(npx tsc:*)'];
 /** Explicit team-level entry: authorizes writes for the team's issues that no config project covers, and carries the team-level policy. */
 export interface TeamCfg {
   key: string;
@@ -110,6 +129,31 @@ function parseCriticalPath(raw: unknown, id: string): { ticket: string; deferred
   return out;
 }
 
+function parseOrchestration(raw: unknown, id: string, repos: string[]): OrchestrationCfg | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const at = `Project "${id}": orchestration`;
+  if (!isObj(raw)) throw new Error(`${at} must be an object`);
+  const repo = str(raw.repo, 200) ?? '';
+  if (!REPO_RE.test(repo) || !repos.includes(repo)) throw new Error(`${at}.repo "${repo}" must be owner/repo and listed in this project's github.repos`);
+  const abs = (k: string) => {
+    const v = str(raw[k], 500) ?? '';
+    if (!v.startsWith('/') || v.includes('\0')) throw new Error(`${at}.${k} must be an absolute path`);
+    return v.replace(/\/+$/, '') || '/';
+  };
+  const mins = (k: string, d: number, max: number) => (typeof raw[k] === 'number' && raw[k] >= 1 ? Math.min(max, raw[k] as number) : d);
+  const claude = isObj(raw.claude) ? raw.claude : {};
+  const codex = isObj(raw.codex) ? raw.codex : {};
+  const bin = (v: unknown, d: string) => { const b = str(v, 500) ?? d; if (/\s/.test(b)) throw new Error(`${at}: binary "${b}" must be a single path or command name (no arguments)`); return b; };
+  return {
+    repo, repoPath: abs('repoPath'), baseBranch: str(raw.baseBranch, 100) ?? 'main', runsDir: abs('runsDir'),
+    startedState: str(raw.startedState, 100) ?? 'In Progress', approvalState: str(raw.approvalState, 100) ?? 'In Review',
+    blockedState: str(raw.blockedState, 100) ?? 'Blocked', infraRetries: typeof raw.infraRetries === 'number' ? Math.min(5, Math.max(0, Math.floor(raw.infraRetries))) : 2,
+    ciChecks: strList(raw.ciChecks, []), ciTimeoutMinutes: mins('ciTimeoutMinutes', 20, 120), agentTimeoutMinutes: mins('agentTimeoutMinutes', 30, 240),
+    claude: { bin: bin(claude.bin, 'claude'), allowedTools: strList(claude.allowedTools, DEFAULT_CLAUDE_TOOLS) },
+    codex: { bin: bin(codex.bin, 'codex') },
+  };
+}
+
 function parseKnowledge(v: unknown): KnowledgeCfg[] {
   return arr(v, 50).flatMap((k) => {
     if (!isObj(k)) return [];
@@ -166,7 +210,7 @@ export function parseConfig(raw: unknown): Config {
       if (!kind || !title) return [];
       return [{ title, kind, path: str(k.path, 500), repo: str(k.repo, 200), ref: str(k.ref, 100), url: str(k.url, 2048) }];
     });
-    projects.push({ id, name, workflow: parseWorkflow(p.workflow, id), linear, repos, knowledge, criticalPath: parseCriticalPath(p.criticalPath, id) });
+    projects.push({ id, name, workflow: parseWorkflow(p.workflow, id), linear, repos, knowledge, criticalPath: parseCriticalPath(p.criticalPath, id), orchestration: parseOrchestration(p.orchestration, id, repos) });
   }
   const ob = isObj(raw.obsidian) && str(raw.obsidian.vault, 200) ? { vault: str(raw.obsidian.vault, 200)!, vaultPath: str(raw.obsidian.vaultPath, 500) } : undefined;
   const rv = isObj(raw.review) ? raw.review : {};

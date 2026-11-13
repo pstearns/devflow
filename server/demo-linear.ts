@@ -9,7 +9,7 @@ const ago = (hours: number, now: number) => new Date(now - hours * H).toISOStrin
 const day = (offsetDays: number, now: number) => new Date(now + offsetDays * 86400_000).toISOString().slice(0, 10);
 
 type StateType = 'backlog' | 'unstarted' | 'started' | 'completed' | 'canceled';
-const STATE_DEFS: [name: string, type: StateType][] = [['Backlog', 'backlog'], ['Todo', 'unstarted'], ['In Progress', 'started'], ['In Review', 'started'], ['Done', 'completed'], ['Canceled', 'canceled']];
+const STATE_DEFS: [name: string, type: StateType][] = [['Backlog', 'backlog'], ['Todo', 'unstarted'], ['In Progress', 'started'], ['In Review', 'started'], ['Blocked', 'started'], ['Done', 'completed'], ['Canceled', 'canceled']];
 
 interface LabelSpec { id: string; name: string; color: string; isGroup?: boolean; parent?: string }
 // Workspace labels are shared by every team (same ids); each team also has its own label set with its own ids/names.
@@ -107,10 +107,10 @@ export interface FakeLinearOpts {
 }
 /** Total labels the fake serves for a team (team + workspace + extras). Tests derive expected page counts from this. */
 export const fakeLabelTotal = (team: string, extra = 0) => labelsOf(team).length + extra;
-export interface FakeLinearStore { issues: Record<string, IssueSpec[]>; mutations: { op: string; vars: Record<string, any> }[]; viewer: string }
+export interface FakeLinearStore { issues: Record<string, IssueSpec[]>; mutations: { op: string; vars: Record<string, any> }[]; comments: { id: string; issue: string; body: string }[]; viewer: string }
 
 export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
-  const store: FakeLinearStore = { issues: structuredClone(SEED), mutations: [], viewer: 'Demo Owner' };
+  const store: FakeLinearStore = { issues: structuredClone(SEED), mutations: [], comments: [], viewer: 'Demo Owner' };
   const extras: LabelSpec[] = Array.from({ length: opts.extraLabels ?? 0 }, (_, k) => ({ id: `lbl-extra-${k + 1}`, name: `Extra label ${k + 1}`, color: '#8b97a7' }));
   const teamLabels = (team: string): LabelSpec[] => [...(TEAM_LABELS[team] ?? []), ...extras, ...WORKSPACE];
   const stateId = (team: string, name: string) => `st-${team}-${name.toLowerCase().replace(/\W+/g, '-')}`;
@@ -173,6 +173,13 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
           }
         }
         return ok({ issueUpdate: { success: true } });
+      }
+      if (name === 'CommentCreate') {
+        const input = v.input ?? {}; const { spec } = byUuid(String(input.issueId));
+        if (!spec || typeof input.body !== 'string') return err('Entity not found', 'INVALID_INPUT');
+        const id = `cmt-${store.comments.length + 1}`;
+        if (!noop) store.comments.push({ id, issue: String(input.issueId).replace(/^uuid-/, ''), body: input.body });
+        return ok({ commentCreate: { success: true, comment: { id } } });
       }
       return err('Unknown mutation', 'GRAPHQL_VALIDATION_FAILED');
     }

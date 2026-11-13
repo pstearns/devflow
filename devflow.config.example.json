@@ -64,6 +64,16 @@
         "protectedLabels": [],
         "todoState": "Todo",
         "backlogState": "Backlog"
+      },
+      "orchestration": {
+        "repo": "your-org/your-repo",
+        "repoPath": "/path/to/your/clone",
+        "runsDir": "/path/to/devflow-runs",
+        "baseBranch": "main",
+        "startedState": "In Progress",
+        "approvalState": "In Review",
+        "blockedState": "Blocked",
+        "ciChecks": ["build"]
       }
     }
   ],
