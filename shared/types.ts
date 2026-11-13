@@ -111,6 +111,7 @@ export interface MilestoneGate {
   state: 'blocked' | 'needs-authorization' | 'executable' | 'in-flight' | 'unknown' | 'clear';
   gate?: string; // the path ticket that is the earliest unresolved gate
   advanceTicket?: string; // the ticket that can advance the milestone (the gate itself, or its first open blocker)
+  advanceUrl?: string; // Linear URL of advanceTicket (from the relation), so a blocker outside the loaded data is still reachable
   title?: string; // title of advanceTicket when known
   reason: string;
   deferred: string[]; // unresolved deferred obligations, shown separately: they do not block

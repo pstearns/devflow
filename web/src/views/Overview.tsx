@@ -52,7 +52,10 @@ export function Overview({ snap, issues, sel, go, now }: {
             <div className="space-y-1 px-3 py-2">
               <div className="flex flex-wrap items-center gap-2">
                 <Tag tone={GATE_TONE[g.state]}>{GATE_LABEL[g.state]}</Tag>
-                {g.advanceTicket && <button className="mono text-accent" onClick={() => open(g.advanceTicket!)}>{g.advanceTicket}</button>}
+                {g.advanceTicket && (ticketName(g.advanceTicket)
+                  ? <button className="mono text-accent" onClick={() => open(g.advanceTicket!)}>{g.advanceTicket}</button>
+                  // a blocker in a team/project that is not loaded has no detail panel to open: link to its Linear page instead
+                  : <Ext href={g.advanceUrl} className="mono text-accent" title={g.advanceUrl ? 'Not in the loaded data: opens in Linear' : 'Not in the loaded data and no source link available'}>{g.advanceTicket}</Ext>)}
                 {g.title && <span className="min-w-0 truncate">{g.title}</span>}
               </div>
               <div className="text-[12px] text-muted">{g.reason}</div>

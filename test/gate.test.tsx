@@ -6,6 +6,7 @@ import { demoConfig, demoFetch, DEMO_READ_KEY } from '../server/demo.ts';
 import { computeGates } from '../server/gate.ts';
 import { buildApp } from '../server/app.ts';
 import { Overview } from '../web/src/views/Overview.tsx';
+import { parseConfig } from '../server/config.ts';
 import { gatesInSel } from '../web/src/lib.ts';
 import { makeAuth, signIn } from './helpers.ts';
 
@@ -122,5 +123,47 @@ describe('authorization boundary: the card is informational only', () => {
     }
     expect(f.store.mutations).toEqual([]);
     expect(f.store.issues.ATL!.find((x) => x.n === 16)!.labels).not.toContain('Ready'); // nothing was approved or relabelled
+  });
+});
+
+describe('review fixes', () => {
+  it('a blocker outside the loaded snapshot is a Linear link, never a dead button; a loaded one still opens the panel', async () => {
+    const { snap } = await setup();
+    const card = (o: Partial<MilestoneGate>) => { const out = html(snap, [gate({ state: 'blocked', ...o })]); return out.slice(out.indexOf('data-gate-state'), out.indexOf('Needs attention')); };
+    const missing = card({ advanceTicket: 'XYZ-9', advanceUrl: 'https://linear.app/acme/issue/XYZ-9' });
+    expect(missing).toContain('href="https://linear.app/acme/issue/XYZ-9"');
+    expect(missing).toContain('rel="noopener noreferrer"');
+    expect(missing).not.toMatch(/<button[^>]*>XYZ-9/);
+    const noUrl = card({ advanceTicket: 'XYZ-9' });
+    expect(noUrl).not.toContain('<a ');
+    expect(noUrl).toContain('XYZ-9');
+    expect(noUrl).toContain('no source link available');
+    expect(card({ advanceTicket: 'ATL-7' })).toMatch(/<button[^>]*>ATL-7<\/button>/); // in the snapshot: opens the detail panel
+  });
+  it('computeGates carries the relation URL of the blocker through to the card', () => {
+    const mk = (o: object) => ({ identifier: 'A-1', title: 't', state: { name: 'Todo', type: 'unstarted' }, openBlockers: [], awaitingHuman: [], stage: 'backlog', ...o }) as unknown as Issue;
+    const b = { identifier: 'Z-5', title: 'far', url: 'https://linear.app/z/issue/Z-5', stateName: 'Todo', stateType: 'unstarted', resolved: false };
+    const g = computeGates([{ id: 'p', name: 'P', linear: undefined, criticalPath: [{ ticket: 'A-1', deferred: false }] }], [mk({ openBlockers: [b] })])[0]!;
+    expect(g).toMatchObject({ state: 'blocked', advanceTicket: 'Z-5', advanceUrl: 'https://linear.app/z/issue/Z-5' });
+  });
+  const cfg = (criticalPath: unknown) => () => parseConfig({ projects: [{ id: 'p', name: 'P', criticalPath }] });
+  it('criticalPath is parsed strictly: nothing is truncated, coerced or silently dropped', () => {
+    expect(cfg(undefined)()).toBeTruthy(); // absent = no path
+    expect(cfg('ABC-1')).toThrow(/must be an array/);
+    expect(cfg({ ticket: 'ABC-1' })).toThrow(/must be an array/);
+    const n = (k: number) => Array.from({ length: k }, (_, i) => `ABC-${i + 1}`);
+    expect(cfg(n(200))()).toBeTruthy();
+    expect(cfg(n(201))).toThrow(/limit is 200/);
+    expect(cfg([...n(199), 'ABC-1'])).toThrow(/twice/); // duplicates are caught at any position
+    expect(cfg([...n(150), 'bad id'])).toThrow(/criticalPath\[150\]/);
+    expect(cfg([{ ticket: 'ABC-' + '1'.repeat(36) + 'garbage' }])).toThrow(/not a ticket identifier/); // no truncation into a different valid id
+    expect(cfg(['ABC-' + '1'.repeat(40)])).toThrow(/not a ticket identifier/);
+    expect(cfg([{ ticket: 'ABC-1', defered: true }])).toThrow(/unknown field "defered"/); // a typo must not silently make a gate blocking
+    expect(cfg([{ ticket: 'ABC-1', deferred: 'true' }])).toThrow(/deferred must be true or false/);
+    expect(cfg([{ ticket: 42 }])).toThrow(/ticket must be a string/);
+    expect(cfg([null])).toThrow(/must be a ticket identifier string/);
+    expect(cfg([7])).toThrow(/must be a ticket identifier string/);
+    expect(parseConfig({ projects: [{ id: 'p', name: 'P', criticalPath: [' abc-1 ', { ticket: 'ABC-2', deferred: true }] }] }).projects[0]!.criticalPath)
+      .toEqual([{ ticket: 'ABC-1', deferred: false }, { ticket: 'ABC-2', deferred: true }]);
   });
 });

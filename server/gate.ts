@@ -19,16 +19,16 @@ export function computeGates(projects: Pick<ProjectCfg, 'id' | 'name' | 'linear'
     if (!i) { out.push({ ...common, state: 'unknown', advanceTicket: undefined, reason: `${first.ticket} is on the path but is not in the loaded data, so its state is unknown.` }); continue; }
     if (i.openBlockers.length) {
       const b = i.openBlockers[0]!;
-      out.push({ ...common, state: 'blocked', advanceTicket: b.identifier, title: b.title, reason: `${i.identifier} is blocked by ${b.identifier} (${b.stateName})${i.openBlockers.length > 1 ? ` and ${i.openBlockers.length - 1} more` : ''}.` });
+      out.push({ ...common, state: 'blocked', advanceTicket: b.identifier, advanceUrl: b.url, title: b.title, reason: `${i.identifier} is blocked by ${b.identifier} (${b.stateName})${i.openBlockers.length > 1 ? ` and ${i.openBlockers.length - 1} more` : ''}.` });
     } else if (i.blockedMarker) {
-      out.push({ ...common, state: 'blocked', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is marked blocked by ${i.blockedMarker} with no blocking relation to follow.` });
+      out.push({ ...common, state: 'blocked', advanceTicket: i.identifier, advanceUrl: i.url, title: i.title, reason: `${i.identifier} is marked blocked by ${i.blockedMarker} with no blocking relation to follow.` });
     } else if (i.stage === 'ready') {
-      out.push({ ...common, state: 'executable', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is unblocked and authorized (${readyLabelOf(i)}); it can be executed.` });
+      out.push({ ...common, state: 'executable', advanceTicket: i.identifier, advanceUrl: i.url, title: i.title, reason: `${i.identifier} is unblocked and authorized (${readyLabelOf(i)}); it can be executed.` });
     } else if (i.stage === 'backlog' || i.stage === 'discovery') {
-      out.push({ ...common, state: 'needs-authorization', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is unblocked but not authorized: it needs readiness and the "${readyLabelOf(i)}" label.` });
+      out.push({ ...common, state: 'needs-authorization', advanceTicket: i.identifier, advanceUrl: i.url, title: i.title, reason: `${i.identifier} is unblocked but not authorized: it needs readiness and the "${readyLabelOf(i)}" label.` });
     } else {
       const wait = i.awaitingHuman[0];
-      out.push({ ...common, state: 'in-flight', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is in ${i.stage ?? 'progress'}${wait ? `; waiting on: ${wait}` : ''}.` });
+      out.push({ ...common, state: 'in-flight', advanceTicket: i.identifier, advanceUrl: i.url, title: i.title, reason: `${i.identifier} is in ${i.stage ?? 'progress'}${wait ? `; waiting on: ${wait}` : ''}.` });
     }
   }
   return out;
