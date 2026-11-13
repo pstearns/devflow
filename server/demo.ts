@@ -13,12 +13,15 @@ export function demoConfig(): Config {
     projects: [
       // names ONE Linear project of team ATL: "Atlas Labs" and unprojected ATL issues are NOT covered by it
       { id: 'atlas', name: 'Atlas Platform (demo)', linear: { teamKey: 'ATL', projects: ['Atlas'] }, github: { repos: ['demo-org/atlas'] },
+        // synthetic approved path: ATL-7 is the executable gate; ATL-16 is a deferred obligation that must not block
+        criticalPath: ['ATL-1', 'ATL-2', 'ATL-7', { ticket: 'ATL-16', deferred: true }],
         knowledge: [
           { title: 'Atlas architecture', kind: 'obsidian', path: 'Projects/Atlas/Architecture.md' },
           { title: 'Repo contract', kind: 'repo', repo: 'demo-org/atlas', path: 'docs/CONTRACT.md', ref: 'main' },
         ] },
       // legacy whole-team style entry: covers every PROJECT of team BCN (but not its unprojected issues)
-      { id: 'beacon', name: 'Beacon Mobile (demo)', linear: { teamKey: 'BCN', projects: [] }, github: { repos: ['demo-org/beacon'] }, knowledge: [] },
+      { id: 'beacon', name: 'Beacon Mobile (demo)', linear: { teamKey: 'BCN', projects: [] }, github: { repos: ['demo-org/beacon'] }, knowledge: [],
+        criticalPath: ['BCN-1', 'BCN-3'] }, // BCN-3 is blocked by BCN-2: the card links to the blocker
     ],
     // explicit team-level entry: its own vocabulary, write allowed, NO GitHub repository
     teams: [{ key: 'ZED', write: true, workflow: { readyLabel: 'Go', discoveryLabels: ['Spike'], classificationLabels: ['Chore'] } }],

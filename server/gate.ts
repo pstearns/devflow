@@ -2,13 +2,13 @@
 import type { Issue, MilestoneGate } from '../shared/types.ts';
 import type { ProjectCfg } from './config.ts';
 
-export function computeGates(projects: Pick<ProjectCfg, 'id' | 'name' | 'workflow' | 'criticalPath'>[], issues: Issue[]): MilestoneGate[] {
+export function computeGates(projects: Pick<ProjectCfg, 'id' | 'name' | 'linear' | 'criticalPath'>[], issues: Issue[], readyLabelOf: (i: Issue) => string = () => 'Ready'): MilestoneGate[] {
   const byId = new Map(issues.map((i) => [i.identifier.toUpperCase(), i]));
   const resolved = (i: Issue) => i.state.type === 'completed' || i.state.type === 'canceled';
   const out: MilestoneGate[] = [];
   for (const p of projects) {
     if (!p.criticalPath.length) continue;
-    const base = { projectId: p.id, projectName: p.name, pathTickets: p.criticalPath.map((e) => e.ticket) };
+    const base = { projectId: p.id, projectName: p.name, teamKey: p.linear?.teamKey, pathTickets: p.criticalPath.map((e) => e.ticket) };
     const open = p.criticalPath.map((e) => ({ ...e, issue: byId.get(e.ticket) })).filter((e) => !e.issue || !resolved(e.issue));
     const deferred = open.filter((e) => e.deferred).map((e) => e.ticket);
     const gates = open.filter((e) => !e.deferred);
@@ -23,9 +23,9 @@ export function computeGates(projects: Pick<ProjectCfg, 'id' | 'name' | 'workflo
     } else if (i.blockedMarker) {
       out.push({ ...common, state: 'blocked', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is marked blocked by ${i.blockedMarker} with no blocking relation to follow.` });
     } else if (i.stage === 'ready') {
-      out.push({ ...common, state: 'executable', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is unblocked and authorized (${p.workflow.readyLabel}); it can be executed.` });
+      out.push({ ...common, state: 'executable', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is unblocked and authorized (${readyLabelOf(i)}); it can be executed.` });
     } else if (i.stage === 'backlog' || i.stage === 'discovery') {
-      out.push({ ...common, state: 'needs-authorization', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is unblocked but not authorized: it needs readiness and the "${p.workflow.readyLabel}" label.` });
+      out.push({ ...common, state: 'needs-authorization', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is unblocked but not authorized: it needs readiness and the "${readyLabelOf(i)}" label.` });
     } else {
       const wait = i.awaitingHuman[0];
       out.push({ ...common, state: 'in-flight', advanceTicket: i.identifier, title: i.title, reason: `${i.identifier} is in ${i.stage ?? 'progress'}${wait ? `; waiting on: ${wait}` : ''}.` });

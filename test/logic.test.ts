@@ -215,7 +215,7 @@ describe('next milestone blocker (critical path gate)', () => {
   const mk = (id: string, o: Partial<import('../shared/types.ts').Issue> = {}) => ({
     identifier: id, title: `T ${id}`, state: { name: 'Todo', type: 'unstarted' }, openBlockers: [], awaitingHuman: [], stage: 'backlog', ...o,
   }) as unknown as import('../shared/types.ts').Issue;
-  const proj = (criticalPath: { ticket: string; deferred: boolean }[]) => [{ id: 'p', name: 'P', workflow: { readyLabel: 'Ready' } as never, criticalPath }];
+  const proj = (criticalPath: { ticket: string; deferred: boolean }[]) => [{ id: 'p', name: 'P', linear: { teamKey: 'A', projects: [] }, criticalPath }];
   const path = (...t: (string | [string, boolean])[]) => t.map((x) => (Array.isArray(x) ? { ticket: x[0], deferred: x[1] } : { ticket: x, deferred: false }));
   it('skips resolved gates, separates deferred obligations, and points at the first open blocker', async () => {
     const { computeGates } = await import('../server/gate.ts');

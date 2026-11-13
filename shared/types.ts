@@ -107,6 +107,7 @@ export interface Issue {
 export interface MilestoneGate {
   projectId: string; // DevFlow config project
   projectName: string;
+  teamKey?: string; // Linear team of the config project (scopes the card when its tickets are not loaded yet)
   state: 'blocked' | 'needs-authorization' | 'executable' | 'in-flight' | 'unknown' | 'clear';
   gate?: string; // the path ticket that is the earliest unresolved gate
   advanceTicket?: string; // the ticket that can advance the milestone (the gate itself, or its first open blocker)

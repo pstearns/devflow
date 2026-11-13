@@ -50,6 +50,14 @@ export function useRoute(): [Route, (patch: Partial<Route>, replaceParams?: bool
 /** Everything that is scoped to a selection is filtered through these (the server stays the authority for writes). */
 export interface Sel { team: string; project: string }
 export const selOf = (r: Pick<Route, 'team' | 'project'>): Sel => ({ team: r.team, project: r.project });
+/**
+ * Which critical-path cards a selection shows. No team: every path. A whole team: that team's paths, even while their tickets are not
+ * loaded yet (the card then says Unknown instead of vanishing). A project or "unprojected": only paths with a ticket inside it.
+ */
+export function gatesInSel<G extends { teamKey?: string; pathTickets: string[] }>(gates: G[], sel: Sel, visible: { identifier: string }[]): G[] {
+  const ids = new Set(visible.map((i) => i.identifier));
+  return gates.filter((g) => !sel.team || (sel.project === 'all' ? g.teamKey === sel.team : g.pathTickets.some((t) => ids.has(t))));
+}
 export function inSel(sel: Sel, e: { teamKey: string; linearProjectId?: string }): boolean {
   if (!sel.team) return true;
   if (e.teamKey !== sel.team) return false;
