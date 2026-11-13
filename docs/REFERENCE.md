@@ -133,9 +133,10 @@ Without the write key, or outside an authorized scope, actions are visible but d
 | `port` | Default 4317 |
 | `staleAfterMinutes`, `staleDays` | Stale threshold for data (1–120, default 5) and for started issues (default 5) |
 | `idleExitMinutes` | Exit after this long with no request (0–1440; default 0 = never) |
-| `projects[]` | `id`, `name`, `linear` (`teamKey`, optional `projects`), `github.repos`, `knowledge`, `workflow` |
+| `projects[]` | `id`, `name`, `linear` (`teamKey`, optional `projects`), `github.repos`, `knowledge`, `workflow`, `criticalPath` |
 | `teams[]` | `key`, `write`, `workflow`, `github.repos`, `knowledge` |
 | `workflow` | `readyLabel` (Ready), `discoveryLabels` (Discovery), `classificationLabels`, `protectedLabels` (none), `todoState` (Todo), `backlogState` (Backlog) |
+| `criticalPath[]` | Ordered, human-approved gate tickets: `"ABC-1"` or `{ "ticket": "ABC-2", "deferred": true }`. The Overview's "Next milestone blocker" card shows the first unresolved non-deferred gate (blocked / needs authorization / executable / in flight) and links to the ticket that can advance it. Deferred entries are listed separately and never block. A blocker outside the loaded data links to its Linear page. Parsed strictly: a non-array, more than 200 entries, a malformed or duplicate identifier, an unknown field or a non-boolean `deferred` stops startup with a message; nothing is truncated or ignored. Read-only; DevFlow does not infer the path. |
 | `knowledge[]` | `obsidian` (`title`, `path`), `repo` (`title`, `repo`, `path`, `ref`) or `url` (`title`, `url`) |
 | `obsidian` | `vault`, `vaultPath` |
 | `prompts` | Overrides for `discover`, `execute`, `review`, `resolve`, `resume`, `milestone`; placeholders `{{project}}`, `{{ticket}}`, `{{milestone}}` |

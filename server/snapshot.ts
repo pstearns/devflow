@@ -9,6 +9,7 @@ import type { RepoData } from './github.ts';
 import { matchPrs } from './match.ts';
 import { ciStatus, humanReviewStatus, independentReviewStatus, status } from './status.ts';
 import { safeUrl } from './util.ts';
+import { computeGates } from './gate.ts';
 
 export interface BuildInput {
   cfg: Config;
@@ -243,9 +244,14 @@ export function buildSnapshot(inp: BuildInput): Snapshot {
 
   const activity = buildActivity(issues, prs, inp.github, repoScope);
   const attention = buildAttention(issues, prs, milestones, inp.health, cfg, nowMs);
+  // the label that authorizes an issue is the one of ITS OWN team/project policy, not of the config project that lists it on a path
+  const readyLabelOf = (i: Issue) => {
+    const t = teams.find((x) => x.key === i.teamKey);
+    return (t?.projects.find((p) => p.id === i.linearProjectId)?.workflow ?? t?.teamLevel.workflow)?.readyLabel ?? DEFAULT_WORKFLOW.readyLabel;
+  };
   return {
     generatedAt: now.toISOString(), dataAt: inp.dataAt ?? now.toISOString(), mode, staleAfterSeconds: cfg.staleAfterMinutes * 60, staleDays: cfg.staleDays,
-    teams, issues, milestones, prs, activity, attention, health: inp.health, prompts: cfg.prompts, labels, write: inp.write ?? { enabled: false },
+    teams, issues, milestones, prs, activity, attention, gates: computeGates(cfg.projects, issues, readyLabelOf), health: inp.health, prompts: cfg.prompts, labels, write: inp.write ?? { enabled: false },
   };
 }
 

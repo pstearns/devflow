@@ -24,6 +24,8 @@ export interface ProjectCfg {
   linear?: { teamKey: string; projects: string[] };
   repos: string[]; // owner/repo
   knowledge: KnowledgeCfg[];
+  /** Human-approved, ordered gate sequence. `deferred` entries are obligations that must be done eventually but do not gate the next step. */
+  criticalPath: { ticket: string; deferred: boolean }[];
 }
 /** Explicit team-level entry: authorizes writes for the team's issues that no config project covers, and carries the team-level policy. */
 export interface TeamCfg {
@@ -73,6 +75,39 @@ function parseWorkflow(raw: unknown, id: string): WorkflowCfg {
     readyLabel, discoveryLabels: strList(w.discoveryLabels, d.discoveryLabels), classificationLabels: strList(w.classificationLabels, d.classificationLabels),
     protectedLabels: strList(w.protectedLabels, d.protectedLabels), todoState: str(w.todoState, 100) ?? d.todoState, backlogState: str(w.backlogState, 100) ?? d.backlogState,
   };
+}
+
+const TICKET_RE = /^[A-Z][A-Z0-9]*-\d+$/;
+const MAX_PATH = 200;
+const MAX_TICKET = 40;
+/**
+ * The approved sequence is parsed strictly: it is never truncated, coerced or partly ignored, because a silently shortened path
+ * could report "Clear" while a later gate is still unresolved. Anything malformed fails startup with a message naming the entry.
+ */
+function parseCriticalPath(raw: unknown, id: string): { ticket: string; deferred: boolean }[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`Project "${id}": criticalPath must be an array`);
+  if (raw.length > MAX_PATH) throw new Error(`Project "${id}": criticalPath has ${raw.length} entries; the limit is ${MAX_PATH} (it is never truncated)`);
+  const out: { ticket: string; deferred: boolean }[] = [];
+  raw.forEach((e, n) => {
+    const at = `Project "${id}": criticalPath[${n}]`;
+    let ticket: unknown;
+    let deferred = false;
+    if (typeof e === 'string') ticket = e;
+    else if (isObj(e)) {
+      const bad = Object.keys(e).filter((k) => k !== 'ticket' && k !== 'deferred');
+      if (bad.length) throw new Error(`${at} has unknown field "${bad[0]}" (allowed: ticket, deferred)`);
+      if ('deferred' in e && typeof e.deferred !== 'boolean') throw new Error(`${at}.deferred must be true or false`);
+      deferred = e.deferred === true;
+      ticket = e.ticket;
+    } else throw new Error(`${at} must be a ticket identifier string or { "ticket": "ABC-1", "deferred": true }`);
+    if (typeof ticket !== 'string') throw new Error(`${at}.ticket must be a string`);
+    const t = ticket.trim().toUpperCase();
+    if (t.length > MAX_TICKET || !TICKET_RE.test(t)) throw new Error(`${at} "${ticket.slice(0, 60)}" is not a ticket identifier like ABC-12`);
+    if (out.some((x) => x.ticket === t)) throw new Error(`Project "${id}": criticalPath lists ${t} twice`);
+    out.push({ ticket: t, deferred });
+  });
+  return out;
 }
 
 function parseKnowledge(v: unknown): KnowledgeCfg[] {
@@ -131,7 +166,7 @@ export function parseConfig(raw: unknown): Config {
       if (!kind || !title) return [];
       return [{ title, kind, path: str(k.path, 500), repo: str(k.repo, 200), ref: str(k.ref, 100), url: str(k.url, 2048) }];
     });
-    projects.push({ id, name, workflow: parseWorkflow(p.workflow, id), linear, repos, knowledge });
+    projects.push({ id, name, workflow: parseWorkflow(p.workflow, id), linear, repos, knowledge, criticalPath: parseCriticalPath(p.criticalPath, id) });
   }
   const ob = isObj(raw.obsidian) && str(raw.obsidian.vault, 200) ? { vault: str(raw.obsidian.vault, 200)!, vaultPath: str(raw.obsidian.vaultPath, 500) } : undefined;
   const rv = isObj(raw.review) ? raw.review : {};

@@ -99,6 +99,26 @@ export interface Issue {
   detailAt?: string; // when description/PR evidence were last fetched for this issue specifically
 }
 
+/**
+ * The earliest unresolved gate on a project's configured, human-approved critical path.
+ * blocked = an open blocker stands in the way (link goes to that blocker); needs-authorization = unblocked but not yet authorized (Ready);
+ * executable = ready and authorized; in-flight = already being worked or awaiting review/merge; unknown = path ticket not in the loaded data.
+ */
+export interface MilestoneGate {
+  projectId: string; // DevFlow config project
+  projectName: string;
+  teamKey?: string; // Linear team of the config project (scopes the card when its tickets are not loaded yet)
+  state: 'blocked' | 'needs-authorization' | 'executable' | 'in-flight' | 'unknown' | 'clear';
+  gate?: string; // the path ticket that is the earliest unresolved gate
+  advanceTicket?: string; // the ticket that can advance the milestone (the gate itself, or its first open blocker)
+  advanceUrl?: string; // Linear URL of advanceTicket (from the relation), so a blocker outside the loaded data is still reachable
+  title?: string; // title of advanceTicket when known
+  reason: string;
+  deferred: string[]; // unresolved deferred obligations, shown separately: they do not block
+  pathTickets: string[]; // every identifier on the path (used to scope the card to the current selection)
+  remaining: number; // unresolved non-deferred path tickets, including the gate
+}
+
 export interface Milestone {
   id: string;
   teamKey: string;
@@ -266,6 +286,7 @@ export interface Snapshot {
   prs: PullRequest[];
   activity: ActivityEvent[];
   attention: AttentionItem[];
+  gates: MilestoneGate[];
   health: SourceHealth[];
   prompts: PromptDef[];
   labels: LabelDef[]; // retrieved from Linear for the configured teams (live), not hard-coded

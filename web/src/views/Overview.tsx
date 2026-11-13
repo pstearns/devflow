@@ -1,7 +1,11 @@
 import type { Issue, Snapshot } from '../../../shared/types.ts';
 import { AttentionList } from '../components/Detail.tsx';
 import { Card, Empty, Ext, Pill, Tag, Time } from '../components/ui.tsx';
-import { READY_TILE_FILTER, attentionInSel, eventInSel, matchesStatusFilter, prInSel, type Route, type Sel } from '../lib.ts';
+import { READY_TILE_FILTER, gatesInSel, attentionInSel, eventInSel, matchesStatusFilter, prInSel, type Route, type Sel } from '../lib.ts';
+
+const GATE_LABEL = { blocked: 'Blocked', 'needs-authorization': 'Needs authorization', executable: 'Executable', 'in-flight': 'In flight', unknown: 'Unknown', clear: 'Clear' } as const;
+
+const GATE_TONE = { blocked: 'bad', 'needs-authorization': 'warn', executable: 'ok', 'in-flight': 'accent', unknown: 'muted', clear: 'ok' } as const;
 
 export function Overview({ snap, issues, sel, go, now }: {
   snap: Snapshot; issues: Issue[]; sel: Sel; go: (p: Partial<Route>, replace?: boolean) => void; now: number;
@@ -26,6 +30,7 @@ export function Overview({ snap, issues, sel, go, now }: {
     if (sel.project === 'all' || sel.project === 'none') rows.push({ key: `${t.key}:team`, title: `${t.name} (team level / unprojected)`, url: undefined, repos: t.teamLevel.repos, knowledge: t.teamLevel.knowledge });
     return rows;
   });
+  const gates = gatesInSel(snap.gates, sel, issues);
   const ticketName = (id?: string) => id && issues.find((i) => i.identifier === id);
 
   return (
@@ -40,6 +45,25 @@ export function Overview({ snap, issues, sel, go, now }: {
             </button>
           ))}
         </div>
+
+        {gates.map((g) => (
+          <div key={g.projectId} role="region" aria-label={`Next milestone blocker, ${g.projectName}`} data-gate-state={g.state}>
+          <Card title={`Next milestone blocker · ${g.projectName}`} right={<span className="text-[11px] text-muted">{g.state === 'clear' ? 'path clear' : `${g.remaining} gate${g.remaining === 1 ? '' : 's'} left on approved path`}</span>}>
+            <div className="space-y-1 px-3 py-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Tag tone={GATE_TONE[g.state]}>{GATE_LABEL[g.state]}</Tag>
+                {g.advanceTicket && (ticketName(g.advanceTicket)
+                  ? <button className="mono text-accent" onClick={() => open(g.advanceTicket!)}>{g.advanceTicket}</button>
+                  // a blocker in a team/project that is not loaded has no detail panel to open: link to its Linear page instead
+                  : <Ext href={g.advanceUrl} className="mono text-accent" title={g.advanceUrl ? 'Not in the loaded data: opens in Linear' : 'Not in the loaded data and no source link available'}>{g.advanceTicket}</Ext>)}
+                {g.title && <span className="min-w-0 truncate">{g.title}</span>}
+              </div>
+              <div className="text-[12px] text-muted">{g.reason}</div>
+              {g.deferred.length > 0 && <div className="text-[12px] text-muted">Deferred, not blocking: {g.deferred.map((d, k) => <span key={d}>{k ? ', ' : ''}{ticketName(d) ? <button className="mono text-accent" onClick={() => open(d)}>{d}</button> : <span className="mono">{d}</span>}</span>)}</div>}
+            </div>
+          </Card>
+          </div>
+        ))}
 
         <Card title={`Needs attention (${attention.length})`} right={<span className="text-[11px] text-muted">actionable = backed by source evidence · suggestion = DevFlow inference</span>}>
           {attention.length ? <AttentionList items={attention} onOpen={open} /> : <Empty>Nothing needs attention based on the data currently loaded.</Empty>}

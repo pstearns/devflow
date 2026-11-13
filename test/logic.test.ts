@@ -210,3 +210,32 @@ describe('failure handling', () => {
     expect(noRun.ci.value).toBe('unknown');
   });
 });
+
+describe('next milestone blocker (critical path gate)', () => {
+  const mk = (id: string, o: Partial<import('../shared/types.ts').Issue> = {}) => ({
+    identifier: id, title: `T ${id}`, state: { name: 'Todo', type: 'unstarted' }, openBlockers: [], awaitingHuman: [], stage: 'backlog', ...o,
+  }) as unknown as import('../shared/types.ts').Issue;
+  const proj = (criticalPath: { ticket: string; deferred: boolean }[]) => [{ id: 'p', name: 'P', linear: { teamKey: 'A', projects: [] }, criticalPath }];
+  const path = (...t: (string | [string, boolean])[]) => t.map((x) => (Array.isArray(x) ? { ticket: x[0], deferred: x[1] } : { ticket: x, deferred: false }));
+  it('skips resolved gates, separates deferred obligations, and points at the first open blocker', async () => {
+    const { computeGates } = await import('../server/gate.ts');
+    const done = mk('A-1', { state: { name: 'Done', type: 'completed' } as never, stage: 'done' });
+    const blocker = { identifier: 'A-9', title: 'dep', stateName: 'Todo', stateType: 'unstarted', resolved: false };
+    const g = computeGates(proj(path('A-1', ['A-5', true], 'A-2')), [done, mk('A-5'), mk('A-2', { openBlockers: [blocker as never] })])[0]!;
+    expect(g).toMatchObject({ state: 'blocked', gate: 'A-2', advanceTicket: 'A-9', deferred: ['A-5'], remaining: 1 });
+  });
+  it('distinguishes executable, needs-authorization, unknown and clear', async () => {
+    const { computeGates } = await import('../server/gate.ts');
+    expect(computeGates(proj(path('A-1')), [mk('A-1', { stage: 'ready' })])[0]).toMatchObject({ state: 'executable', advanceTicket: 'A-1' });
+    expect(computeGates(proj(path('A-1')), [mk('A-1')])[0]).toMatchObject({ state: 'needs-authorization', advanceTicket: 'A-1' });
+    expect(computeGates(proj(path('A-1')), [])[0]).toMatchObject({ state: 'unknown', advanceTicket: undefined });
+    expect(computeGates(proj(path(['A-1', true])), [mk('A-1')])[0]).toMatchObject({ state: 'clear', deferred: ['A-1'] });
+    expect(computeGates(proj([]), [])).toEqual([]);
+  });
+  it('config accepts strings and objects, rejects bad or duplicate identifiers', () => {
+    const c = (criticalPath: unknown[]) => parseConfig({ projects: [{ id: 'p', name: 'P', criticalPath }] });
+    expect(c(['abc-1', { ticket: 'ABC-2', deferred: true }]).projects[0]!.criticalPath).toEqual([{ ticket: 'ABC-1', deferred: false }, { ticket: 'ABC-2', deferred: true }]);
+    expect(() => c(['nope'])).toThrow();
+    expect(() => c(['A-1', 'a-1'])).toThrow();
+  });
+});
