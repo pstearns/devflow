@@ -12,6 +12,7 @@ import { bwrapArgs, bwrapUsable, stageHome } from '../server/orchestrator/sandbo
 import * as AUDIT from '../server/orchestrator/audit.ts';
 import { GithubPrs } from '../server/orchestrator/pr.ts';
 import { GithubCi } from '../server/orchestrator/ci.ts';
+import { SourceError } from '../server/util.ts';
 import { PolicyError, verifyPolicy } from '../server/orchestrator/policy.ts';
 import { isProtectedPath } from '../server/orchestrator/controller.ts';
 import * as G from '../server/orchestrator/git.ts';
@@ -448,6 +449,23 @@ describe('Codex review round 5 (regressions)', () => {
     expect((await new GithubCi(gh(ok)).snapshot('o/r', 'a'.repeat(40), { required: [] })).state).toBe('success');
     const incomplete = { ...pages, [`${base}/status`]: { total_count: 150, statuses: [{ context: 'x', state: 'success' }] } };
     await expect(new GithubCi(gh(incomplete)).snapshot('o/r', 'a'.repeat(40), { required: [] })).rejects.toThrow(/incomplete commit-status list/);
+  });
+  it('permission-denied fallbacks never fail open: workflow-run fallback still reads statuses, and unreadable statuses fail even with named required checks', async () => {
+    const sha = 'a'.repeat(40), base = `/repos/o/r/commits/${sha}`;
+    const denied = new SourceError('auth', 'denied');
+    const wf = { 'total_count': 1, workflow_runs: [{ id: 1, name: 'build', status: 'completed', conclusion: 'success', head_sha: sha, head_branch: 'b', updated_at: new Date().toISOString() }] };
+    // (a) check-runs denied -> Actions fallback is green, but external CI reports failure on the same SHA
+    const a = { [`${base}/check-runs?page=1`]: denied, '/repos/o/r/actions/runs': wf, [`${base}/status`]: { total_count: 1, statuses: [{ context: 'security', state: 'failure' }] } };
+    const ra = await new GithubCi(gh(a)).snapshot('o/r', sha, { required: [] });
+    expect(ra.state).toBe('failure'); expect(ra.detail).toMatch(/security/);
+    // (b) statuses unreadable + a required name: still a completeness failure
+    const b = { [`${base}/check-runs?page=1`]: { total_count: 1, check_runs: run(1).map((c) => ({ ...c, name: 'build' })) }, [`${base}/status`]: denied };
+    const rb = await new GithubCi(gh(b)).snapshot('o/r', sha, { required: ['build'] });
+    expect(rb.state).toBe('failure'); expect(rb.detail).toMatch(/incomplete/);
+    // (c) both denied
+    expect((await new GithubCi(gh({ ...a, [`${base}/status`]: denied })).snapshot('o/r', sha, { required: ['build'] })).state).toBe('failure');
+    // (d) fully readable and green
+    expect((await new GithubCi(gh({ ...a, [`${base}/status`]: { total_count: 0, statuses: [] } })).snapshot('o/r', sha, { required: ['build'] })).state).toBe('success');
   });
   it('a protected file touched and then REVERTED inside the new history is still rejected (every commit is inspected)', async () => {
     const w = world({ seed: { 'README.md': 'x\n' } });

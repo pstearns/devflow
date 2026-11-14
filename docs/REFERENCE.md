@@ -37,7 +37,7 @@ There is no background polling. The header shows the age of the oldest source; o
 |---|---|
 | `LINEAR_API_KEY` | Personal API key, permission **Read** |
 | `LINEAR_WRITE_API_KEY` (optional) | A *separate* Linear personal API key, permission **Write**, ideally limited to the configured team(s). Enables the Actions menu. Must differ from `LINEAR_API_KEY` or writes stay disabled. DevFlow itself writes only to scopes your config authorizes. |
-| `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions (and Commit statuses if available) |
+| `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions. For `orchestrate`, **Commit statuses: read is required** (external CI must be ruled out; without it the gate fails closed). |
 
 DevFlow never uses the `gh` CLI or any ambient identity. These keys are not the sign-in password. Tokens stay on the server: not sent to the browser, not logged, never in error text. `.env` and `devflow.config.json` are git-ignored; DevFlow warns at startup if `.env` is readable by other users.
 

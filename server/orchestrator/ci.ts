@@ -14,7 +14,11 @@ export interface CiProvider {
 type Getter = Pick<GithubClient, 'get'>;
 const low = (s: string) => s.toLowerCase();
 
+const UNREADABLE_STATUSES: CheckItem = { name: 'commit-statuses', state: 'unknown', rawStatus: 'unreadable', source: 'commit_status' };
+
 export function evaluateChecks(items: CheckItem[], required: string[]): { state: 'success' | 'failure' | 'pending'; detail: string } {
+  // Unreadable evidence is a completeness failure no matter which checks are named: a required name could be supplied by the part we cannot see.
+  if (items.some((c) => c.rawStatus === 'unreadable')) return { state: 'failure', detail: 'CI evidence is incomplete: commit statuses are not readable by this token (grant "Commit statuses: read"); refusing to treat the rest as green' };
   const considered = required.length ? items.filter((c) => required.some((r) => low(r) === low(c.name))) : items;
   const missing = required.filter((r) => !considered.some((c) => low(c.name) === low(r)));
   const bad = considered.filter((c) => c.state === 'failed' || c.state === 'unknown'); // cancelled/unrecognised is not a pass
@@ -29,8 +33,16 @@ export function evaluateChecks(items: CheckItem[], required: string[]): { state:
 export class GithubCi implements CiProvider {
   constructor(private gh: Getter, private o: { pollMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number } = {}) {}
 
-  /** ALL check runs for the SHA (paginated; a partial list is an error, never "green") plus the combined commit statuses (external CI). */
+  /**
+   * Complete CI evidence for the SHA: check runs (or, if the token cannot read them, the latest workflow run per workflow), PLUS the combined
+   * commit statuses of external CI, read independently of which route the first part took. Any part that cannot be read completely is
+   * recorded as an explicit "unreadable" marker, which evaluateChecks() treats as a failure regardless of name filtering.
+   */
   private async items(repo: string, sha: string): Promise<CheckItem[]> {
+    return [...(await this.runs(repo, sha)), ...(await this.statuses(repo, sha))];
+  }
+
+  private async runs(repo: string, sha: string): Promise<CheckItem[]> {
     try {
       const out: CheckItem[] = [];
       let seen = 0, total = Infinity;
@@ -43,15 +55,6 @@ export class GithubCi implements CiProvider {
         if (!list.length) break;
       }
       if (seen < total) throw new SourceError('invalid', 'incomplete check-run list: refusing to treat partial CI evidence as green');
-      try {
-        const st = await this.gh.get(`/repos/${repo}/commits/${sha}/status`, { per_page: 100 });
-        const sl = isObj(st) && Array.isArray(st.statuses) ? st.statuses : [];
-        if (isObj(st) && typeof st.total_count === 'number' && st.total_count > sl.length) throw new SourceError('invalid', 'incomplete commit-status list: refusing to treat partial CI evidence as green');
-        out.push(...normalizeCommitStatuses({ statuses: sl }));
-      } catch (e) {
-        if (!(e instanceof SourceError) || e.kind !== 'auth') throw e;
-        out.push({ name: 'commit-statuses', state: 'unknown', rawStatus: 'unreadable', source: 'commit_status' }); // token cannot read them: only matters when no required checks are named
-      }
       return out;
     } catch (e) {
       if (!(e instanceof SourceError) || e.kind !== 'auth') throw e;
@@ -65,6 +68,18 @@ export class GithubCi implements CiProvider {
         name: r.name, rawStatus: r.status, rawConclusion: r.conclusion, url: r.url, source: 'workflow_run', at: r.at,
         state: r.status !== 'completed' ? 'pending' : r.conclusion === 'success' || r.conclusion === 'neutral' || r.conclusion === 'skipped' ? 'passed' : r.conclusion === 'failure' || r.conclusion === 'timed_out' || r.conclusion === 'startup_failure' ? 'failed' : 'unknown',
       }));
+    }
+  }
+
+  private async statuses(repo: string, sha: string): Promise<CheckItem[]> {
+    try {
+      const st = await this.gh.get(`/repos/${repo}/commits/${sha}/status`, { per_page: 100 });
+      const sl = isObj(st) && Array.isArray(st.statuses) ? st.statuses : [];
+      if (isObj(st) && typeof st.total_count === 'number' && st.total_count > sl.length) throw new SourceError('invalid', 'incomplete commit-status list: refusing to treat partial CI evidence as green');
+      return normalizeCommitStatuses({ statuses: sl });
+    } catch (e) {
+      if (!(e instanceof SourceError) || e.kind !== 'auth') throw e;
+      return [UNREADABLE_STATUSES]; // external CI cannot be ruled out: never green
     }
   }
 
