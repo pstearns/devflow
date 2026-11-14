@@ -371,6 +371,61 @@ describe('Codex review round 3 (regressions)', () => {
   });
 });
 
+describe('Codex review round 4 (regressions)', () => {
+  it('a protected file cannot be hidden by moving it: renames count as deleting the source AND adding the destination', async () => {
+    const w = world({ seed: { 'AGENTS.md': 'rules\n', '.github/workflows/build.yml': 'name: b\n' } });
+    const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: w.repo, encoding: 'utf8' }).trim();
+    execFileSync('git', ['mv', 'AGENTS.md', 'docs-old.txt'], { cwd: w.repo }); execFileSync('git', ['mv', '.github/workflows/build.yml', 'build-moved.yml'], { cwd: w.repo });
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'moves'], { cwd: w.repo });
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: w.repo, encoding: 'utf8' }).trim();
+    const files = await G.changedFiles(w.repo, base, sha);
+    expect(files).toEqual(expect.arrayContaining(['AGENTS.md', '.github/workflows/build.yml', 'docs-old.txt', 'build-moved.yml']));
+    expect(files.filter(isProtectedPath).sort()).toEqual(['.github/workflows/build.yml', 'AGENTS.md']);
+    expect(await G.patch(w.repo, base, sha)).toMatch(/deleted file mode/); // the reviewer sees the deletion too
+  });
+  it('the gate re-reads CI: a check that goes red on the same SHA while the review ran blocks the PASS', async () => {
+    const w = world({ scenario: 'correct-first', wrapAgents: (inner) => ({ preflight: () => inner.preflight(), implement: inner.implement, review: async (o) => { const r = await inner.review(o); w.ci.snapshotOverride = 'failure'; return r; } }) });
+    const m = await w.orch.run('ATL-22');
+    expect(m.state).toBe('escalated');
+    expect(m.reason).toMatch(/CI still green when re-read/);
+    expect(w.comments().some((b) => b.includes('Awaiting owner approval'))).toBe(false);
+  });
+  it('every approval attempt re-reads CI too: red during backoff stops the retry', async () => {
+    let w!: ReturnType<typeof makeWorld>; let updates = 0; let flipped = false;
+    w = world({ scenario: 'correct-first', linearOpts: { fail: (op) => op === 'IssueUpdate' && ++updates === 2 }, onSleep: () => { if (!flipped) { flipped = true; w.ci.snapshotOverride = 'failure'; } } });
+    const m = await w.orch.run('ATL-22');
+    expect(m.reasonClass).toBe('stale-commit');
+    expect(m.reason).toMatch(/CI is no longer green/);
+    expect(m.approvedSha).toBeUndefined();
+  });
+  it('authorization is re-checked right before the start transition: a revoked ticket is never moved to In Progress', async () => {
+    let w!: ReturnType<typeof makeWorld>;
+    w = world({ scenario: 'correct-first', onLinearRead: (n) => { if (n === 3) w.issue().labels = ['Feature']; } }); // read 3 = inside the start step
+    const m = await w.orch.run('ATL-22');
+    expect(m.reasonClass).toBe('ticket-changed');
+    expect(w.f.store.mutations.filter((x) => x.op === 'IssueUpdate')).toHaveLength(0);
+    expect(w.issue().state).toBe('Todo');
+    expect(w.calls.implement).toBe(0);
+  });
+  it('an escalation never overwrites what the owner did meanwhile (readiness revoked => ticket left exactly as set)', async () => {
+    const w = world({ scenario: 'correct-first', ci: 'timeout', wrapAgents: (inner) => ({ preflight: () => inner.preflight(), review: inner.review, implement: async (o) => { const r = await inner.implement(o); w.issue().labels = ['Feature']; return r; } }) });
+    const m = await w.orch.run('ATL-22');
+    expect(m.reasonClass).toBe('ci-timeout');
+    expect(w.issue().state).toBe('In Progress'); // not Blocked: the owner revoked readiness, DevFlow writes nothing
+    expect(w.comments().at(-1)).toContain('left exactly as you set it');
+    expect(w.f.store.mutations.filter((x) => x.op === 'IssueUpdate')).toHaveLength(1); // only the start
+  });
+  it('credentials and host paths in reviewer prose never reach Linear (raw output stays in local evidence)', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV';
+    const sha = 'a'.repeat(40);
+    const prose = `read /home/alice/.codex/auth.json then OPENAI_API_KEY=sk-test-secret-value and ${jwt}; github_pat_11ABCDEFG0123456789abcdefgh; Authorization: Bearer abcdef0123456789abcdef; blob ${'Zm9vYmFy'.repeat(8)}; commit ${sha}; normal words stay`;
+    const out = AUDIT.quote(prose, 2000);
+    for (const secret of ['/home/alice', 'auth.json', 'sk-test-secret-value', 'eyJhbGci', 'github_pat_11', 'abcdef0123456789abcdef', 'Zm9vYmFy']) expect(out, secret).not.toContain(secret);
+    expect(out).toContain(sha); expect(out).toContain('normal words stay');
+    expect(AUDIT.line(prose, 2000)).not.toMatch(/sk-test|eyJhbGci|github_pat/);
+  });
+});
+
 describe('agent output cannot escalate, forge audit history, or redirect execution', () => {
   it.skipIf(!usable)('hostile reviewer text is quoted, mention/link-defanged, never executed, and cannot forge a controller milestone or advance the ticket', async () => {
     rmSync('/tmp/devflow-pwned-marker', { force: true });
@@ -433,7 +488,7 @@ describe('agent output cannot escalate, forge audit history, or redirect executi
     // tamper the recorded CI evidence between CI and gate by wrapping the reviewer: flip attempt state through the manifest on disk is not possible; instead assert the gate list is recorded
     const m = await w.orch.run('ATL-22');
     expect(m.outcome).toBe('PASS');
-    expect(m.gate!.map((g) => g.name)).toEqual(['review is for this SHA', 'CI green on this SHA', 'remote branch at this SHA', 'draft PR head at this SHA', 'PR is an open draft on the configured base', 'all changed files attested', 'trusted policy intact']);
+    expect(m.gate!.map((g) => g.name)).toEqual(['review is for this SHA', 'CI green on this SHA', 'CI still green when re-read', 'remote branch at this SHA', 'draft PR head at this SHA', 'PR is an open draft on the configured base', 'all changed files attested', 'trusted policy intact']);
     expect(m.gate!.every((g) => g.ok)).toBe(true);
   });
   it.skipIf(!usable)('a PR head that disagrees with the reviewed SHA blocks the PASS at the gate even though CI and review are fine', async () => {

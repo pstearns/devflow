@@ -26,8 +26,16 @@ export const DESCRIPTION = 'Add `slugify(text)` in src/slugify.mjs. It lowercase
 export class LocalCi implements CiProvider {
   calls: string[] = [];
   constructor(private origin: string, private root: string, private mode: 'real' | 'timeout' = 'real') {}
+  snapshotOverride?: 'failure' | 'timeout'; // flips the CURRENT result without touching the recorded one
+  async snapshot(_repo: string, sha: string) {
+    if (this.snapshotOverride) return { state: this.snapshotOverride, detail: `forced ${this.snapshotOverride}`, checks: [] };
+    return this.run(sha);
+  }
   async wait(_repo: string, sha: string) {
     this.calls.push(sha);
+    return this.run(sha);
+  }
+  private async run(sha: string) {
     if (this.mode === 'timeout') return { state: 'timeout' as const, detail: 'Timed out waiting for CI: No CI checks reported for this commit yet', checks: [] };
     const dir = mkdtempSync(join(this.root, 'ci-'));
     sh(dir, 'clone', '-q', this.origin, 'w');

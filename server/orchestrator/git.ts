@@ -24,9 +24,10 @@ export async function isAncestor(cwd: string, a: string, b: string) {
 export const isClean = async (cwd: string) => (await git(cwd, ['status', '--porcelain=v1', '--untracked-files=all'])).trim() === '';
 export const currentBranch = async (cwd: string) => (await git(cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
 export async function changedFiles(cwd: string, base: string, sha: string) {
-  return (await git(cwd, ['diff', '--name-only', '-z', `${base}..${sha}`])).split('\0').filter(Boolean);
+  // --no-renames: a moved file must show as BOTH a deletion and an addition, or a protected source path could hide behind its new name
+  return (await git(cwd, ['diff', '--no-renames', '--name-only', '-z', `${base}..${sha}`])).split('\0').filter(Boolean);
 }
-export const patch = (cwd: string, base: string, sha: string) => git(cwd, ['diff', '--no-color', '--no-ext-diff', `${base}..${sha}`]);
+export const patch = (cwd: string, base: string, sha: string) => git(cwd, ['diff', '--no-color', '--no-ext-diff', '--no-renames', `${base}..${sha}`]);
 export async function lineCount(cwd: string, sha: string, file: string): Promise<number | undefined> {
   if (file.startsWith('-') || file.includes('\0')) return undefined;
   try {

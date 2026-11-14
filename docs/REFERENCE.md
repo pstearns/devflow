@@ -180,6 +180,8 @@ Per project, in `devflow.config.json` (omit the block to forbid orchestration fo
 
 **Per-project resolution.** The agent runner and the policy pin are built from the authorized ticket's own project block (a team can have several projects with different binaries and tool policy); the CLI re-reads the config from disk and re-resolves that same project id for every verification.
 
+**Gate details.** Changed files are computed with `--no-renames`, so moving a protected file shows as deleting it. CI is re-read (not trusted from the earlier poll) at the gate and on every approval attempt; red or not-yet-green stops the run. Authorization is re-checked immediately before the start transition, and an escalation writes the Blocked state only if the ticket is still where DevFlow left it and still authorized; otherwise it leaves the owner's state alone and says so. Credential-shaped strings and absolute host paths are scrubbed from all agent prose before it is published (raw output stays in local evidence).
+
 **Live ticket revalidation.** Every approval attempt (including retries after backoff) re-reads the live ticket and requires the same authorizing project scope, continued write authorization, the approval label still present and the ticket still in the state DevFlow put it in. If the owner moved, re-scoped or un-approved it, the run stops with `ticket-changed` and DevFlow writes no state at all; escalation never reopens a completed/canceled ticket.
 
 **Pull requests.** DevFlow reuses an existing PR only if it is open, a draft, from the run branch of this repository, onto the configured base; and the same checks plus the head SHA run at the final gate, so a PR marked ready or retargeted mid-run blocks the PASS.

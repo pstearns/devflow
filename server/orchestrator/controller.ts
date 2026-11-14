@@ -146,7 +146,11 @@ export class Orchestrator {
       const protectedBase = await this.d.prs.baseProtected?.(oc.repo, oc.baseBranch).catch(() => undefined);
       this.save(store, m, 'accepted', { baseSha, preflight: pf.detail, baseBranchProtected: protectedBase ?? 'unknown', policyDigest: pinned.digest, authorizedBy: who.who ?? 'unknown' });
       // Leaving the unstarted state is what makes a second dispatch (by any controller) fail acceptance.
-      await this.infra(store, m, 'linear-start', () => this.d.write.setState(ctx.id, auth.started.id));
+      await this.infra(store, m, 'linear-start', async () => {
+        this.authorize(await this.load(ticket)); // the owner may have revoked or moved the ticket while preflight and git were running
+        this.verifyPin(m!);
+        await this.d.write.setState(ctx.id, auth.started.id);
+      });
       const after = await this.load(ticket);
       if (after.state.id !== auth.started.id) throw new Error(`Linear did not confirm the move to "${oc.startedState}" (shows "${after.state.name}")`);
       await this.comment(store, m, undefined, A.started(m, this.at(), { authorizer: who.who, authorizedAt: who.at, readyLabel: auth.readyLabel, scope: auth.scopeText, claude: pf.versions?.claude, codex: pf.versions?.codex, policyDigest: pinned.digest, baseProtected: protectedBase ?? 'unknown', operator: 'DevFlow controller' }));
@@ -154,6 +158,7 @@ export class Orchestrator {
       return await this.loop(store, m, ctx, auth, pinned);
     } catch (e) {
       if (!m) { store.release(ticket, runId); throw e; } // rejected before any state existed
+      if (e instanceof Rejected) return this.escalate(store, m, 'ticket-changed', `Authorization changed before the run could start: ${e.message}`);
       if (e instanceof PolicyError) return this.escalate(store, m, 'policy-violation', `Trusted controller policy failed verification: ${e.message}. Nothing further was executed.`);
       if (e instanceof InfraError) return this.escalate(store, m, 'infrastructure', `Infrastructure failure at "${e.step}": ${e.message}. No repair attempt was consumed; the code was not judged.`, `Infrastructure failure at step "${e.step}" after ${m.infra.filter((i) => i.step === e.step).length} attempt(s). The diagnostic is in the retained evidence only. No repair attempt was consumed; the code was not judged.`);
       return this.escalate(store, m, 'controller-error', `controller error: ${e instanceof Error ? e.message : 'unknown'}`, 'Unexpected controller error; the diagnostic is in the retained evidence only.');
@@ -166,7 +171,7 @@ export class Orchestrator {
     for (let i = 0; ; i++) {
       this.verifyPin(m);
       try { return await fn(); } catch (e) {
-        if (e instanceof PolicyError || e instanceof TicketChanged || e instanceof GateChanged) throw e; // an authorization failure is never "transient"
+        if (e instanceof PolicyError || e instanceof TicketChanged || e instanceof GateChanged || e instanceof Rejected) throw e; // an authorization failure is never "transient"
         const detail = e instanceof Error ? e.message.slice(0, 300) : 'unknown error';
         this.recordInfra(store, m, step, detail);
         if (i >= max) throw new InfraError(step, detail);
@@ -266,6 +271,9 @@ export class Orchestrator {
     const add = (name: string, ok: boolean, detail: string) => checks.push({ name, ok, detail });
     add('review is for this SHA', review.commit === sha && a.headSha === sha, `review ${review.commit.slice(0, 12)} vs commit ${sha.slice(0, 12)}`);
     add('CI green on this SHA', a.ci?.state === 'success', a.ci ? a.ci.state : 'no CI result recorded');
+    let now: { state: string; detail: string } = { state: 'unreadable', detail: 'CI could not be re-read' };
+    try { now = await this.d.ci.snapshot(m.repo, sha, { required: oc.ciChecks }); } catch { /* reported below */ }
+    add('CI still green when re-read', now.state === 'success', now.state === 'success' ? 'current check results are green' : `${now.state}: ${now.detail}`);
     const remote = await G.remoteHead(oc.repoPath, m.branch);
     add('remote branch at this SHA', remote === sha, `remote ${remote?.slice(0, 12) ?? 'none'}`);
     let pr: PrState | undefined;
@@ -370,12 +378,16 @@ export class Orchestrator {
   }
 
   // ---------------------------------------------------------------- outcomes
-  /** What must still hold on the LIVE ticket at the moment we change it: same project scope, writes still authorized, approval label still present, still in the state we put it in. */
-  private liveProblem(live: Ctx, m: Manifest, auth: Auth): string | undefined {
+  /**
+   * What must still hold on the LIVE ticket at the moment we change it: same project scope, writes still authorized, approval label still
+   * present, and the ticket still in a state DevFlow put it in (or never left: unstarted). Used before approval AND before an escalation
+   * write, so DevFlow never overwrites what the owner has done since.
+   */
+  private liveProblem(live: Ctx, m: Manifest): string | undefined {
     const sc = resolveScope(this.d.cfg, live.teamKey, live.project);
     if (!sc.writeAllowed || sc.configProject?.id !== m.project) return 'the ticket is no longer in the project scope that authorized this run';
     if (!hasReady(live, sc.workflow)) return `the "${sc.workflow.readyLabel}" approval label was removed (execution authorization revoked)`;
-    if (live.state.id !== auth.started.id) return `the ticket was moved to "${live.state.name}" in Linear during the run`;
+    if (live.state.id !== m.linearStates.startedId && live.state.type !== 'unstarted') return `the ticket was moved to "${live.state.name}" in Linear during the run`;
     return undefined;
   }
 
@@ -383,13 +395,16 @@ export class Orchestrator {
     try {
       // Revalidated inside EVERY approval attempt: a retry after backoff must not overwrite a state the owner changed in the meantime.
       await this.infra(store, m, 'linear-approval', async () => {
-        const bad = this.liveProblem(await this.load(m.ticket), m, auth);
+        const live = await this.load(m.ticket);
+        const bad = this.liveProblem(live, m) ?? (live.state.id !== auth.started.id ? `the ticket is in "${live.state.name}", not the in-progress state DevFlow put it in` : undefined);
         if (bad) throw new TicketChanged(bad);
         // the review gate is re-run on every attempt, immediately before the transition: a retry must not ride a stale gate
         const remote = await G.remoteHead(auth.oc.repoPath, m.branch);
         if (remote !== sha) throw new GateChanged(`the remote branch moved to ${remote?.slice(0, 12) ?? 'nothing'} before approval (reviewed ${sha.slice(0, 12)})`);
         const prBad = m.pr ? prProblem(m, await this.d.prs.inspect(m.repo, m.pr.number), sha) : 'no pull request recorded';
         if (prBad) throw new GateChanged(prBad);
+        const ci = await this.d.ci.snapshot(m.repo, sha, { required: auth.oc.ciChecks }); // check results are not immutable: re-read them on every approval attempt
+        if (ci.state !== 'success') throw new GateChanged(`CI is no longer green on ${sha.slice(0, 12)}: ${ci.detail}`);
         this.verifyPin(m); // after ALL the awaited reads, immediately before the privileged write
         await this.d.write.setState(m.issueId, auth.approval.id);
       });
@@ -421,14 +436,15 @@ export class Orchestrator {
       }, null, 2));
     } catch { /* evidence is best effort here; the manifest below still records the reason */ }
     this.state(store, m, 'escalated', { reason, class: cls });
+    let leftAlone: string | undefined;
     try {
       const live = await this.load(m.ticket);
-      if (cls === 'ticket-changed') m.blockedConfirmed = undefined; // the owner changed it: their change stands, DevFlow writes no state
-      else if (isResolvedType(live.state.type)) m.blockedConfirmed = false; // the owner already closed it: never reopen or overwrite
+      const changed = cls === 'ticket-changed' ? 'the ticket changed during the run' : isResolvedType(live.state.type) ? 'the ticket was already closed' : this.liveProblem(live, m);
+      if (changed) { m.blockedConfirmed = undefined; leftAlone = changed; store.event(m, this.at(), 'escalation-state-skipped', { why: changed }); } // the owner's change stands: DevFlow writes no state
       else { await this.d.write.setState(m.issueId, m.linearStates.blockedId); m.blockedConfirmed = (await this.load(m.ticket)).state.id === m.linearStates.blockedId; }
     } catch (e) { m.blockedConfirmed = false; store.event(m, this.at(), 'blocked-transition-failed', { error: e instanceof Error ? e.message : 'unknown' }); }
     try {
-      await this.comment(store, m, m.attempts[m.attempts.length - 1], A.final(m, this.at(), { kind: 'escalated', summary: reason, reason: publicReason ?? reason, cls, evidenceRef: m.escalationEvidence, blockedConfirmed: m.blockedConfirmed }), true);
+      await this.comment(store, m, m.attempts[m.attempts.length - 1], A.final(m, this.at(), { kind: 'escalated', summary: reason, reason: publicReason ?? reason, cls, evidenceRef: m.escalationEvidence, blockedConfirmed: m.blockedConfirmed, leftAlone }), true);
     } catch (e) { store.event(m, this.at(), 'escalation-comment-failed', { error: e instanceof Error ? e.message : 'unknown' }); }
     this.save(store, m, 'escalation-recorded', { blockedConfirmed: m.blockedConfirmed });
     await this.cleanup(store, m).catch(() => undefined);

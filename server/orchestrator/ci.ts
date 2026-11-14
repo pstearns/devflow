@@ -6,6 +6,8 @@ import { SourceError } from '../util.ts';
 
 export interface CiResult { state: 'success' | 'failure' | 'timeout'; detail: string; checks: { name: string; state: string; url?: string }[] }
 export interface CiProvider {
+  /** One immediate read of the CURRENT results for the SHA (no waiting): used at the gate and at approval, because check results are not immutable. */
+  snapshot(repo: string, sha: string, o: { required: string[] }): Promise<CiResult>;
   wait(repo: string, sha: string, o: { required: string[]; timeoutMs: number }): Promise<CiResult>;
 }
 
@@ -41,6 +43,12 @@ export class GithubCi implements CiProvider {
         state: r.status !== 'completed' ? 'pending' : r.conclusion === 'success' || r.conclusion === 'neutral' || r.conclusion === 'skipped' ? 'passed' : r.conclusion === 'failure' || r.conclusion === 'timed_out' || r.conclusion === 'startup_failure' ? 'failed' : 'unknown',
       }));
     }
+  }
+
+  async snapshot(repo: string, sha: string, o: { required: string[] }): Promise<CiResult> {
+    const items = await this.items(repo, sha);
+    const r = evaluateChecks(items, o.required);
+    return { state: r.state === 'pending' ? 'timeout' : r.state, detail: r.state === 'pending' ? `Not green now: ${r.detail}` : r.detail, checks: items.map((c) => ({ name: c.name, state: c.state, url: c.url })) };
   }
 
   async wait(repo: string, sha: string, o: { required: string[]; timeoutMs: number }): Promise<CiResult> {

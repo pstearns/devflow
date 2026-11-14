@@ -13,12 +13,20 @@ const defang = (s: string) => s.replace(/\u0000/g, '').replace(/\\/g, '\\\\').re
 /** Every kind of line ending Markdown (or a renderer) may honour becomes \n BEFORE any line-based quoting. */
 const normNl = (s: string) => s.replace(/\r\n?|[\u000b\u000c\u0085\u2028\u2029]/g, '\n');
 /** Controller-originated diagnostics (git/fs errors) may carry host paths; Linear gets a redacted form, local evidence keeps the original. */
+/** Credential-shaped strings in agent prose (a prompt-injected agent can read its own staged login): removed from everything published. Raw output stays in local evidence. */
+export const scrub = (s: string) => s
+  .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, '(redacted-secret)')
+  .replace(/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|lin_(?:api|oauth)_[A-Za-z0-9]{16,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{12,}/g, '(redacted-secret)')
+  .replace(/\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{4,}){0,2}/g, '(redacted-secret)')
+  .replace(/\b[Bb]earer\s+[A-Za-z0-9._~+/=-]{12,}/g, 'Bearer (redacted-secret)')
+  .replace(/\b([A-Za-z0-9_]*(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)S?)\s*[=:]\s*\S+/gi, '$1=(redacted-secret)')
+  .replace(/(?<![A-Za-z0-9+/_=-])(?=[A-Za-z0-9+/_=-]*\d)(?=[A-Za-z0-9+/_=-]*[A-Za-z])(?![0-9a-f]{40}(?![A-Za-z0-9+/_=-]))[A-Za-z0-9+/_=-]{32,}(?![A-Za-z0-9+/_=-])/g, '(redacted-secret)');
 export const redact = (s: string) => s.replace(/(?<![\w.\-:/])(?:~|\.{1,2})?\/[^\s'"`<>|;,)\]}\u0000]+/gu, '(redacted-path)').replace(/\bfile:\/\/\S+/g, '(redacted-path)');
 /** One line of untrusted text safe to place inside backticks, a table cell or a list item: no control chars, backticks, pipes or line breaks. */
-export const line = (s: string, n = 120) => clip(defang(normNl(redact(s))).replace(/[\u0000-\u001f\u007f\u2028\u2029`|<>]/g, ' ').replace(/\s+/g, ' ').trim(), n);
+export const line = (s: string, n = 120) => clip(defang(normNl(scrub(redact(s)))).replace(/[\u0000-\u001f\u007f\u2028\u2029`|<>]/g, ' ').replace(/\s+/g, ' ').trim(), n);
 export const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 /** Agent-authored text: quoted line by line, so it can never impersonate a controller heading or a verified fact. */
-export const quote = (s: string, n = 600) => clip(defang(normNl(s)), n).split('\n').map((l) => `> ${l}`).join('\n');
+export const quote = (s: string, n = 600) => clip(defang(normNl(scrub(redact(s)))), n).split('\n').map((l) => `> ${l}`).join('\n');
 const short = (sha?: string) => (sha ? sha.slice(0, 12) : '—');
 const commit = (m: Manifest, sha?: string) => (sha ? `[\`${short(sha)}\`](https://github.com/${m.repo}/commit/${sha})` : '—');
 const pr = (m: Manifest) => (m.pr ? `[#${m.pr.number}](${m.pr.url || '#'}) (draft)` : '—');
@@ -113,11 +121,11 @@ export function repairRequested(m: Manifest, n: number, reasonRaw: string) {
     : `**Milestone 5/${TOTAL} — No repair available.** ${reason}. All ${MAX_REPAIRS} repair attempts are used; the run will escalate.`;
 }
 
-export function final(m: Manifest, at: string, f: { kind: 'awaiting-owner' | 'escalated'; summary: string; reason?: string; cls?: string; gate?: GateCheck[]; evidenceRef?: string; blockedConfirmed?: boolean }) {
+export function final(m: Manifest, at: string, f: { kind: 'awaiting-owner' | 'escalated'; leftAlone?: string; summary: string; reason?: string; cls?: string; gate?: GateCheck[]; evidenceRef?: string; blockedConfirmed?: boolean }) {
   const pass = f.kind === 'awaiting-owner';
   const rows = m.attempts.map((a) => `| ${a.n === 0 ? 'initial' : `repair ${a.n}`} | ${commit(m, a.headSha)} | ${a.ci ? a.ci.state : '—'} | ${a.review ? a.review.verdict : a.failure ? 'n/a' : '—'} | ${a.failure ? line(a.failure, 90) : 'accepted'} |`);
   return frame(m, 6, pass ? 'Awaiting owner approval' : 'Escalated to the owner', at, {
-    what: pass ? `Commit ${commit(m, m.approvedSha)} passed CI and independent review and is **awaiting owner approval**. The ticket moved to its approval state.` : f.cls === 'ticket-changed' ? `The run **stopped and escalated** (ticket-changed). The ticket was **left exactly as you set it**: DevFlow changed no state. No further automated attempts will be made.` : `The run **stopped and escalated** (${f.cls}). The ticket was moved to \`${line(m.linearStates.blockedName, 60)}\`${f.blockedConfirmed === false ? ' — **the transition was NOT confirmed; please check the ticket**' : ''}. No further automated attempts will be made.`,
+    what: pass ? `Commit ${commit(m, m.approvedSha)} passed CI and independent review and is **awaiting owner approval**. The ticket moved to its approval state.` : f.cls === 'ticket-changed' || f.leftAlone ? `The run **stopped and escalated** (${f.cls}). The ticket was **left exactly as you set it**: DevFlow changed no state${f.leftAlone ? ` (${line(f.leftAlone, 160)})` : ''}. No further automated attempts will be made.` : `The run **stopped and escalated** (${f.cls}). The ticket was moved to \`${line(m.linearStates.blockedName, 60)}\`${f.blockedConfirmed === false ? ' — **the transition was NOT confirmed; please check the ticket**' : ''}. No further automated attempts will be made.`,
     why: pass ? 'All controller gates held for this exact SHA (below). DevFlow never merges and never marks the PR ready.' : `The controller stopped the run (reason text may include agent-influenced data and is quoted; host paths are redacted, the original is in the retained evidence):\n${quote(redact(f.reason ?? ''), 1200)}`,
     evidence: [
       pass ? `Gate: ${(f.gate ?? []).map((g) => `${g.ok ? '✅' : '❌'} ${line(g.name, 80)}`).join(' · ')}` : '',
