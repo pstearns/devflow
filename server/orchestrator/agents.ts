@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { OrchestrationCfg } from '../config.ts';
-import { baseEnv, bwrapArgs, bwrapUsable, nodeMounts, readAgentBytes, readAgentFile, resolveBin, stageHome, type Mount, type SandboxJob, type Staged } from './sandbox.ts';
+import { baseEnv, bwrapArgs, bwrapUsable, claimOwner, nodeMounts, readAgentBytes, readAgentFile, releaseOwner, resolveBin, stageHome, type Mount, type SandboxJob, type Staged } from './sandbox.ts';
 import { RUN_BRANCH_RE } from './types.ts';
 export { readAgentFile };
 
@@ -92,13 +92,14 @@ export function reviewerSandbox(cfg: Pick<OrchestrationCfg, 'codex'>, snapshot: 
 export async function makeBundle(cfg: Pick<OrchestrationCfg, 'claude'>, clone: string, hostHome: string, env: NodeJS.ProcessEnv, branch: string, exclude: string): Promise<Buffer | undefined> {
   if (!RUN_BRANCH_RE.test(branch) || !/^[0-9a-f]{40}$/.test(exclude)) return undefined;
   const out = mkdtempSync(join(tmpdir(), 'devflow-bundle-'));
+  claimOwner(out);
   try {
     const rs = implementerSandbox(cfg, clone, hostHome, env);
     rs.job.mounts.push({ src: out, dst: '/out', rw: true });
     const r = await runInSandbox(rs, '/usr/bin/git', ['bundle', 'create', '/out/run.bundle', `refs/heads/${branch}`, `^${exclude}`], { timeoutMs: 120_000 });
     if (r.exitCode !== 0) return undefined;
     return readAgentBytes(join(out, 'run.bundle'), 128 * 1024 * 1024, out);
-  } finally { rmSync(out, { recursive: true, force: true }); }
+  } finally { rmSync(out, { recursive: true, force: true }); releaseOwner(out); }
 }
 
 export async function runInSandbox(rs: RoleSandbox, cmd: string, args: string[], o: { stdin?: string; timeoutMs: number }): Promise<ProcResult> {
@@ -116,6 +117,7 @@ export class CliAgents implements AgentRunner {
     const problems: string[] = [], detail: string[] = [], versions: { claude?: string; codex?: string } = {};
     if (!bwrapUsable()) return { ok: false, problems: ['bubblewrap (bwrap) is missing or user namespaces are disabled: refusing to run agents without isolation'], detail };
     const tmp = mkdtempSync(join(tmpdir(), 'devflow-pf-'));
+    claimOwner(tmp);
     const out = join(tmp, 'out'); mkdirSync(out, { recursive: true });
     const probe = async (what: string, mk: () => RoleSandbox, args: string[]) => {
       const rs = mk();
@@ -150,7 +152,7 @@ export class CliAgents implements AgentRunner {
         const cl = await probe('codex login status', codex, ['login', 'status']);
         return (cl.exitCode !== 0 || !/^logged in/im.test(cl.stdout + cl.stderr)) && !this.env.OPENAI_API_KEY ? 'Codex is not authenticated (run `codex login`, or set OPENAI_API_KEY)' : undefined;
       });
-    } finally { rmSync(tmp, { recursive: true, force: true }); }
+    } finally { rmSync(tmp, { recursive: true, force: true }); releaseOwner(tmp); }
     return { ok: problems.length === 0, problems, detail, versions };
   }
 

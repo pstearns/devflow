@@ -205,19 +205,53 @@ describe('retention configuration', () => {
 });
 
 describe('stale credential staging sweep', () => {
-  it('removes only OLD staging dirs of this user that match the exact naming, and never follows links or touches newer ones', async () => {
-    const { sweepStaleStaging } = await import('../server/orchestrator/sandbox.ts');
+  const setup = async () => {
+    const sb = await import('../server/orchestrator/sandbox.ts');
     const parent = mkdtempSync(join(tmpdir(), 'devflow-sweep-'));
-    const mk = (name: string, ageMin: number) => { const d = join(parent, name); mkdirSync(d); writeFileSync(join(d, 'auth.json'), '{}'); const t = (Date.now() - ageMin * 60_000) / 1000; _u(d, t, t); return d; };
-    const old1 = mk('devflow-codex-home-abc123', 120), old2 = mk('devflow-pf-Zz9Yx8', 90), fresh = mk('devflow-claude-home-def456', 5), other = mk('devflow-unrelated-xyz789', 500), odd = mk('devflow-codex-home-has space', 500);
+    const mk = (name: string, ageMin: number, owner?: 'alive' | 'dead' | 'recycled') => {
+      const d = join(parent, name); mkdirSync(d); writeFileSync(join(d, 'auth.json'), '{}');
+      const t = (Date.now() - ageMin * 60_000) / 1000; _u(d, t, t);
+      if (owner === 'alive') sb.claimOwner(d);
+      if (owner === 'dead') writeFileSync(`${d}.owner`, JSON.stringify({ pid: 999_999, start: '1' }));
+      if (owner === 'recycled') writeFileSync(`${d}.owner`, JSON.stringify({ pid: process.pid, start: 'not-my-start-time' })); // same PID, different process
+      return d;
+    };
+    return { sb, parent, mk };
+  };
+  it('NEVER removes a directory whose owner process (same PID and start time) is alive, however old it is', async () => {
+    const { sb, parent, mk } = await setup();
+    const live = mk('devflow-codex-home-live11', 24 * 60, 'alive');
+    try { expect(sb.sweepStaleStaging({ parent })).toEqual([]); expect(existsSync(live)).toBe(true); } finally { rmSync(parent, { recursive: true, force: true }); }
+  });
+  it('removes dead-owner dirs (after a short grace), PID-reuse look-alikes, and ownerless orphans only once they are older than any permitted run', async () => {
+    const { sb, parent, mk } = await setup();
+    const dead = mk('devflow-codex-home-dead11', 5, 'dead'), recycled = mk('devflow-pf-recyc1', 5, 'recycled'), freshDead = mk('devflow-bundle-fresh1', 0, 'dead');
+    const orphanOld = mk('devflow-claude-home-orph11', 7 * 60), orphanMid = mk('devflow-claude-home-orph22', 3 * 60);
+    try {
+      const removed = sb.sweepStaleStaging({ parent });
+      expect(removed.sort()).toEqual(['devflow-claude-home-orph11', 'devflow-codex-home-dead11', 'devflow-pf-recyc1']);
+      for (const keep of [freshDead, orphanMid]) expect(existsSync(keep)).toBe(true); // too new to call abandoned
+      for (const gone of [dead, recycled, orphanOld]) { expect(existsSync(gone)).toBe(false); expect(existsSync(`${gone}.owner`)).toBe(false); }
+    } finally { rmSync(parent, { recursive: true, force: true }); }
+  });
+  it('only touches exactly-named staging dirs of this user, never follows links, never touches unrelated names', async () => {
+    const { sb, parent, mk } = await setup();
+    const other = mk('devflow-unrelated-xyz789', 900), odd = mk('devflow-codex-home-has space', 900);
     const victim = mkdtempSync(join(tmpdir(), 'devflow-victim-')); writeFileSync(join(victim, 'precious'), 'x');
     symlinkSync(victim, join(parent, 'devflow-bundle-link123'));
-    const removed = sweepStaleStaging(60 * 60_000, parent, Date.now());
+    try { expect(sb.sweepStaleStaging({ parent })).toEqual([]); for (const k of [other, odd]) expect(existsSync(k)).toBe(true); expect(existsSync(join(victim, 'precious'))).toBe(true); }
+    finally { rmSync(parent, { recursive: true, force: true }); rmSync(victim, { recursive: true, force: true }); }
+  });
+  it('staging dirs created by the product carry an owner record outside the directory and lose it with the directory', async () => {
+    const sb = await import('../server/orchestrator/sandbox.ts');
+    const parent = mkdtempSync(join(tmpdir(), 'devflow-sweep-')); const home = mkdtempSync(join(tmpdir(), 'devflow-fakehome-'));
     try {
-      expect(removed.sort()).toEqual(['devflow-codex-home-abc123', 'devflow-pf-Zz9Yx8']);
-      expect(existsSync(old1)).toBe(false); expect(existsSync(old2)).toBe(false);
-      for (const keep of [fresh, other, odd]) expect(existsSync(keep)).toBe(true);
-      expect(existsSync(join(victim, 'precious'))).toBe(true);
-    } finally { rmSync(parent, { recursive: true, force: true }); rmSync(victim, { recursive: true, force: true }); }
+      mkdirSync(join(home, '.codex')); writeFileSync(join(home, '.codex', 'auth.json'), '{"x":1}');
+      const st = sb.stageHome('codex', home, parent);
+      expect(existsSync(`${st.dir}.owner`)).toBe(true);
+      expect(readdirSync(st.dir)).not.toContain('.owner'); // never inside the mounted directory
+      st.finish();
+      expect(existsSync(st.dir)).toBe(false); expect(existsSync(`${st.dir}.owner`)).toBe(false);
+    } finally { rmSync(parent, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
   });
 });

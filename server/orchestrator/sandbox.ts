@@ -92,19 +92,39 @@ export function readAgentFile(path: string, maxBytes: number, mustStayInside?: s
 // ---------------------------------------------------------------- credentials: copies, never the user's real home
 const shaOf = (b: string | Buffer) => createHash('sha256').update(b).digest('hex');
 
+/** Start time of a process in clock ticks (field 22 of /proc/<pid>/stat), so a recycled PID is not mistaken for the original owner. */
+function procStart(pid: number): string | undefined {
+  try { const st = readFileSync(`/proc/${pid}/stat`, 'utf8'); return st.slice(st.lastIndexOf(')') + 2).split(' ')[19]; } catch { return undefined; }
+}
+/** Liveness record for a staging directory. It lives NEXT TO the directory (never inside it: the agent can write there) and is removed with it. */
+export function claimOwner(dir: string) { writeFileSync(`${dir}.owner`, JSON.stringify({ pid: process.pid, start: procStart(process.pid) }), { mode: 0o600 }); }
+export function releaseOwner(dir: string) { rmSync(`${dir}.owner`, { force: true }); }
+function ownerState(dir: string): 'alive' | 'dead' | 'none' {
+  try {
+    const o = JSON.parse(readFileSync(`${dir}.owner`, 'utf8')) as { pid?: number; start?: string };
+    if (typeof o.pid !== 'number') return 'dead';
+    return o.start !== undefined && procStart(o.pid) === o.start ? 'alive' : 'dead';
+  } catch { return 'none'; }
+}
+
 /**
  * A process killed mid-run (SIGKILL, power loss) never reaches its cleanup, which would leave a staged copy of an agent login on disk. Every CLI
- * start sweeps staging directories this user created that are older than `maxAgeMs`; nothing newer is touched (it may belong to a live run).
+ * start sweeps staging directories this user created. Age alone never proves abandonment (an agent may run for hours without touching its home),
+ * so: an owner record whose process (same PID AND start time) is alive protects the directory; a dead owner makes it removable after a short
+ * grace; with no record at all, only directories older than `orphanMs` (longer than any permitted agent run) go.
  */
-export function sweepStaleStaging(maxAgeMs = 60 * 60_000, parent = tmpdir(), now = Date.now()): string[] {
+export function sweepStaleStaging(o: { graceMs?: number; orphanMs?: number; parent?: string; now?: number } = {}): string[] {
+  const { graceMs = 60_000, orphanMs = 6 * 3600_000, parent = tmpdir(), now = Date.now() } = o;
   const removed: string[] = [];
   for (const name of readdirSync(parent)) {
     if (!/^devflow-(claude-home|codex-home|pf|bundle)-[A-Za-z0-9]{6}$/.test(name)) continue;
     const p = join(parent, name);
     try {
       const st = lstatSync(p);
-      if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== process.getuid!() || now - st.mtimeMs < maxAgeMs) continue;
-      rmSync(p, { recursive: true, force: true }); removed.push(name);
+      if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== process.getuid!()) continue;
+      const age = now - st.mtimeMs, owner = ownerState(p);
+      if (owner === 'alive' || (owner === 'dead' && age < graceMs) || (owner === 'none' && age < orphanMs)) continue;
+      rmSync(p, { recursive: true, force: true }); releaseOwner(p); removed.push(name);
     } catch { /* raced with its owner: leave it */ }
   }
   return removed;
@@ -120,6 +140,7 @@ export interface Staged { dir: string; mounts: Mount[]; tmpfs: string[]; env: Re
  */
 export function stageHome(kind: 'claude' | 'codex', hostHome: string, parent = tmpdir()): Staged {
   const dir = mkdtempSync(join(parent, `devflow-${kind}-home-`));
+  claimOwner(dir);
   const cred = kind === 'claude' ? { host: join(hostHome, '.claude', '.credentials.json'), rel: join('.claude', '.credentials.json') } : { host: join(hostHome, '.codex', 'auth.json'), rel: 'auth.json' };
   const staged = join(dir, cred.rel);
   mkdirSync(dirname(staged), { recursive: true, mode: 0o700 });
@@ -139,7 +160,7 @@ export function stageHome(kind: 'claude' | 'codex', hostHome: string, parent = t
           writeFileSync(tmp, fresh, { mode: 0o600 }); renameSync(tmp, cred.host);
         }
       }
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmSync(dir, { recursive: true, force: true }); releaseOwner(dir); }
   };
   return kind === 'claude'
     ? { dir, mounts: [{ src: dir, dst: '/home/agent', rw: true }], tmpfs: [], env: {}, finish }
