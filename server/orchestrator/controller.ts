@@ -27,6 +27,8 @@ import { MAX_REPAIRS, type AttemptRecord, type FailureClass, type Finding, type 
 /** The ticket may not be executed (authorization, state, duplicate, configuration, failed preflight, unverifiable policy). Nothing was started. */
 export class Rejected extends Error {}
 /** An environment step kept failing after its retries. Not the agent's fault; never consumes a repair attempt. */
+/** The live ticket no longer matches what was authorized (moved, re-scoped, approval revoked). Never retried, never overwritten. */
+export class TicketChanged extends Error {}
 export class InfraError extends Error { constructor(public step: string, message: string) { super(message); } }
 
 export interface Deps {
@@ -162,7 +164,7 @@ export class Orchestrator {
     for (let i = 0; ; i++) {
       this.verifyPin(m);
       try { return await fn(); } catch (e) {
-        if (e instanceof PolicyError) throw e; // an authorization failure is never "transient"
+        if (e instanceof PolicyError || e instanceof TicketChanged) throw e; // an authorization failure is never "transient"
         const detail = e instanceof Error ? e.message.slice(0, 300) : 'unknown error';
         this.recordInfra(store, m, step, detail);
         if (i >= max) throw new InfraError(step, detail);
@@ -361,11 +363,27 @@ export class Orchestrator {
   }
 
   // ---------------------------------------------------------------- outcomes
+  /** What must still hold on the LIVE ticket at the moment we change it: same project scope, writes still authorized, approval label still present, still in the state we put it in. */
+  private liveProblem(live: Ctx, m: Manifest, auth: Auth): string | undefined {
+    const sc = resolveScope(this.d.cfg, live.teamKey, live.project);
+    if (!sc.writeAllowed || sc.configProject?.id !== m.project) return 'the ticket is no longer in the project scope that authorized this run';
+    if (!hasReady(live, sc.workflow)) return `the "${sc.workflow.readyLabel}" approval label was removed (execution authorization revoked)`;
+    if (live.state.id !== auth.started.id) return `the ticket was moved to "${live.state.name}" in Linear during the run`;
+    return undefined;
+  }
+
   private async pass(store: RunStore, m: Manifest, auth: Auth, sha: string, pinned: Pinned, gate: A.GateCheck[]): Promise<Manifest> {
-    pinned.verify();
-    const now = await this.load(m.ticket);
-    if (now.state.id !== auth.started.id) return this.escalate(store, m, 'ticket-changed', `Ticket moved to "${now.state.name}" in Linear during the run; not changing it`);
-    await this.infra(store, m, 'linear-approval', () => this.d.write.setState(m.issueId, auth.approval.id));
+    try {
+      // Revalidated inside EVERY approval attempt: a retry after backoff must not overwrite a state the owner changed in the meantime.
+      await this.infra(store, m, 'linear-approval', async () => {
+        const bad = this.liveProblem(await this.load(m.ticket), m, auth);
+        if (bad) throw new TicketChanged(bad);
+        await this.d.write.setState(m.issueId, auth.approval.id);
+      });
+    } catch (e) {
+      if (e instanceof TicketChanged) return this.escalate(store, m, 'ticket-changed', `${e.message}; the controller did not change the ticket`);
+      throw e;
+    }
     const verify = await this.load(m.ticket);
     if (verify.state.id !== auth.approval.id) return this.escalate(store, m, 'controller-error', `Linear did not confirm the move to "${auth.approval.name}" (shows "${verify.state.name}")`);
     m.approvedSha = sha; m.outcome = 'PASS'; m.reason = `Awaiting owner approval of ${sha}. Draft PR${m.pr ? ` #${m.pr.number}` : ''} not merged.`;
@@ -389,8 +407,10 @@ export class Orchestrator {
     } catch { /* evidence is best effort here; the manifest below still records the reason */ }
     this.state(store, m, 'escalated', { reason, class: cls });
     try {
-      await this.d.write.setState(m.issueId, m.linearStates.blockedId);
-      m.blockedConfirmed = (await this.load(m.ticket)).state.id === m.linearStates.blockedId;
+      const live = await this.load(m.ticket);
+      if (cls === 'ticket-changed') m.blockedConfirmed = undefined; // the owner changed it: their change stands, DevFlow writes no state
+      else if (isResolvedType(live.state.type)) m.blockedConfirmed = false; // the owner already closed it: never reopen or overwrite
+      else { await this.d.write.setState(m.issueId, m.linearStates.blockedId); m.blockedConfirmed = (await this.load(m.ticket)).state.id === m.linearStates.blockedId; }
     } catch (e) { m.blockedConfirmed = false; store.event(m, this.at(), 'blocked-transition-failed', { error: e instanceof Error ? e.message : 'unknown' }); }
     try {
       await this.comment(store, m, m.attempts[m.attempts.length - 1], A.final(m, this.at(), { kind: 'escalated', summary: reason, reason, cls, evidenceRef: m.escalationEvidence, blockedConfirmed: m.blockedConfirmed }), true);
@@ -404,10 +424,12 @@ export class Orchestrator {
 
   /** `recovery` = the escalation path: it must still be able to tell the owner even when policy verification is what failed. */
   private async comment(store: RunStore, m: Manifest, a: AttemptRecord | undefined, body: string, recovery = false) {
-    if (!recovery) this.verifyPin(m);
     const text = clip(body, MAX_COMMENT - 200);
     let id: string | undefined;
-    try { id = await this.d.write.createComment(m.issueId, text); } catch { id = await this.d.write.createComment(m.issueId, text); } // one retry, then the error propagates
+    for (let i = 0; ; i++) { // one retry, and the policy pin is checked immediately before EACH attempt
+      if (!recovery) this.verifyPin(m);
+      try { id = await this.d.write.createComment(m.issueId, text); break; } catch (e) { if (e instanceof PolicyError || i >= 1) throw e; }
+    }
     if (id) { m.linearCommentIds.push(id); if (a) a.commentId = id; }
     this.save(store, m, 'linear-comment', { commentId: id });
   }

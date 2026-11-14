@@ -9,12 +9,16 @@ const TOTAL = 6;
 export const MILESTONES = { started: 1, implemented: 2, ci: 3, review: 4, repair: 5, final: 6 } as const;
 const TITLES: Record<number, string> = { 1: 'Execution authorized and started', 2: 'Implementation completed', 3: 'CI verified', 4: 'Independent review completed', 5: 'Repair requested', 6: 'Final status' };
 
-const defang = (s: string) => s.replace(/@/g, '@\u200b').replace(/\u0000/g, '').replace(/!\[/g, '!\\[').replace(/\]\(/g, '] (');
+const defang = (s: string) => s.replace(/\u0000/g, '').replace(/\\/g, '\\\\').replace(/@/g, '@\u200b').replace(/\[/g, '\\[').replace(/\]/g, '\\]').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/:\/\//g, ':\u200b//');
+/** Every kind of line ending Markdown (or a renderer) may honour becomes \n BEFORE any line-based quoting. */
+const normNl = (s: string) => s.replace(/\r\n?|[\u000b\u000c\u0085\u2028\u2029]/g, '\n');
+/** Controller-originated diagnostics (git/fs errors) may carry host paths; Linear gets a redacted form, local evidence keeps the original. */
+export const redact = (s: string) => s.replace(/(?<![\w.\-:/])(?:~|\.{1,2})?(?:\/[\w.@+~=,%\-]+){2,}\/?/g, '(redacted-path)').replace(/\bfile:\/\/\S+/g, '(redacted-path)');
 /** One line of untrusted text safe to place inside backticks, a table cell or a list item: no control chars, backticks, pipes or line breaks. */
-export const line = (s: string, n = 120) => clip(defang(s).replace(/[\u0000-\u001f\u007f\u2028\u2029`|<>]/g, ' ').replace(/\s+/g, ' ').trim(), n);
+export const line = (s: string, n = 120) => clip(defang(normNl(s)).replace(/[\u0000-\u001f\u007f\u2028\u2029`|<>]/g, ' ').replace(/\s+/g, ' ').trim(), n);
 export const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 /** Agent-authored text: quoted line by line, so it can never impersonate a controller heading or a verified fact. */
-export const quote = (s: string, n = 600) => clip(defang(s), n).split('\n').map((l) => `> ${l}`).join('\n');
+export const quote = (s: string, n = 600) => clip(defang(normNl(s)), n).split('\n').map((l) => `> ${l}`).join('\n');
 const short = (sha?: string) => (sha ? sha.slice(0, 12) : '—');
 const commit = (m: Manifest, sha?: string) => (sha ? `[\`${short(sha)}\`](https://github.com/${m.repo}/commit/${sha})` : '—');
 const pr = (m: Manifest) => (m.pr ? `[#${m.pr.number}](${m.pr.url || '#'}) (draft)` : '—');
@@ -76,7 +80,7 @@ export function ciVerified(m: Manifest, a: AttemptRecord, at: string, ci: { stat
     what: `CI ${ok ? 'passed' : 'FAILED'} on commit ${commit(m, sha)}.`,
     why: ok ? 'A review is only requested for a commit whose CI is green; the controller read the result for this exact SHA.' : 'A failing commit is not sent to the reviewer; it is returned to Claude for repair.',
     evidence: [
-      `Result: ${line(ci.detail, 400)}`,
+      `Result: ${line(redact(ci.detail), 400)}`,
       ...ci.checks.slice(0, 12).map((c) => `Check \`${line(c.name, 80)}\`: ${line(c.state, 20)}${c.url && /^https:\/\/[^\s)>\]]+$/.test(c.url) ? ` — ${c.url}` : ''}`),
       a.ci ? `Retained: ${ev(m, a.ci.evidence.split('#')[0]!)}` : '',
     ].filter(Boolean),
@@ -95,7 +99,7 @@ export function reviewed(m: Manifest, a: AttemptRecord, at: string, r: Review, g
     why: pass ? 'The reviewer attested every changed file, and the controller independently verified the result before accepting it (table below). The reviewer’s word alone advances nothing.' : 'The reviewer reported blocking findings with evidence; the controller validated the format, SHA and file references before relaying them.',
     evidence: [
       `Controller verification: ${gate.map((g) => `${g.ok ? '✅' : '❌'} ${line(g.name, 80)}`).join(' · ')}`,
-      ...gate.filter((g) => !g.ok).map((g) => `Failed: ${line(g.name, 80)} — ${line(g.detail, 200)}`),
+      ...gate.filter((g) => !g.ok).map((g) => `Failed: ${line(g.name, 80)} — ${line(redact(g.detail), 200)}`),
       a.review ? `Retained: ${ev(m, a.review.parsed.split('#')[0]!)}, raw output ${ev(m, a.review.raw.split('#')[0]!)}` : '',
     ].filter(Boolean),
     extra: `**Reviewer summary and findings (agent-authored, quoted, unverified prose):**\n${quote(r.summary, 900)}\n\n${findings}${pass ? '' : `\n\n${repairRequested(m, a.n, `${r.findings.length} review finding(s)`)}`}`,
@@ -103,7 +107,7 @@ export function reviewed(m: Manifest, a: AttemptRecord, at: string, r: Review, g
 }
 
 export function repairRequested(m: Manifest, n: number, reasonRaw: string) {
-  const reason = line(reasonRaw, 300);
+  const reason = line(redact(reasonRaw), 300);
   return n < MAX_REPAIRS
     ? `**Milestone 5/${TOTAL} — Repair requested.** Repair ${n + 1} of ${MAX_REPAIRS} requested from Claude. Reason: ${reason}. Retries used so far: repairs ${n}/${MAX_REPAIRS}, infrastructure ${m.infra.length}.`
     : `**Milestone 5/${TOTAL} — No repair available.** ${reason}. All ${MAX_REPAIRS} repair attempts are used; the run will escalate.`;
@@ -113,8 +117,8 @@ export function final(m: Manifest, at: string, f: { kind: 'awaiting-owner' | 'es
   const pass = f.kind === 'awaiting-owner';
   const rows = m.attempts.map((a) => `| ${a.n === 0 ? 'initial' : `repair ${a.n}`} | ${commit(m, a.headSha)} | ${a.ci ? a.ci.state : '—'} | ${a.review ? a.review.verdict : a.failure ? 'n/a' : '—'} | ${a.failure ? line(a.failure, 90) : 'accepted'} |`);
   return frame(m, 6, pass ? 'Awaiting owner approval' : 'Escalated to the owner', at, {
-    what: pass ? `Commit ${commit(m, m.approvedSha)} passed CI and independent review and is **awaiting owner approval**. The ticket moved to its approval state.` : `The run **stopped and escalated** (${f.cls}). The ticket was moved to \`${line(m.linearStates.blockedName, 60)}\`${f.blockedConfirmed === false ? ' — **the transition was NOT confirmed; please check the ticket**' : ''}. No further automated attempts will be made.`,
-    why: pass ? 'All controller gates held for this exact SHA (below). DevFlow never merges and never marks the PR ready.' : `The controller stopped the run (reason text may include agent-influenced data and is quoted):\n${quote(f.reason ?? '', 1200)}`,
+    what: pass ? `Commit ${commit(m, m.approvedSha)} passed CI and independent review and is **awaiting owner approval**. The ticket moved to its approval state.` : f.cls === 'ticket-changed' ? `The run **stopped and escalated** (ticket-changed). The ticket was **left exactly as you set it**: DevFlow changed no state. No further automated attempts will be made.` : `The run **stopped and escalated** (${f.cls}). The ticket was moved to \`${line(m.linearStates.blockedName, 60)}\`${f.blockedConfirmed === false ? ' — **the transition was NOT confirmed; please check the ticket**' : ''}. No further automated attempts will be made.`,
+    why: pass ? 'All controller gates held for this exact SHA (below). DevFlow never merges and never marks the PR ready.' : `The controller stopped the run (reason text may include agent-influenced data and is quoted; host paths are redacted, the original is in the retained evidence):\n${quote(redact(f.reason ?? ''), 1200)}`,
     evidence: [
       pass ? `Gate: ${(f.gate ?? []).map((g) => `${g.ok ? '✅' : '❌'} ${line(g.name, 80)}`).join(' · ')}` : '',
       `Branch \`${m.branch}\` · draft PR ${pr(m)} · base \`${m.baseBranch}\` @ ${commit(m, m.baseSha)}`,

@@ -61,7 +61,7 @@ export class FakePrs implements PullRequests {
 
 export interface WorldOpts {
   scenario?: string; labels?: string[]; state?: string; blockedBy?: number[]; project?: string | null; omitOrchestration?: boolean;
-  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>; second?: boolean; onSleep?: () => void;
+  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>; second?: boolean; onSleep?: () => void; linearOpts?: Parameters<typeof demoFetch>[1];
   /** Real agents: run the REAL claude/codex binaries with the user's real logins (staged into the sandbox as copies). Synthetic repo/ticket only. */
   live?: { claudeBin: string; codexBin: string; description: string }; wrapAgents?: (inner: AgentRunner, w: { origin: string; repo: string }) => AgentRunner; secrets?: boolean;
 }
@@ -94,7 +94,7 @@ export function makeWorld(o: WorldOpts = {}) {
   const trustedDir = join(root, 'trusted'); mkdirSync(trustedDir, { mode: 0o700 });
   const configPath = join(trustedDir, 'devflow.config.json'); writeFileSync(configPath, JSON.stringify(cfgObj), { mode: 0o600 }); chmodSync(configPath, 0o600);
   const cfg = parseConfig(cfgObj);
-  const f = demoFetch(Date.parse('2026-06-01T12:00:00Z'));
+  const f = demoFetch(Date.parse('2026-06-01T12:00:00Z'), o.linearOpts);
   f.store.issues.ATL!.push({ n: 22, title: 'Add slugify helper', state: o.state ?? 'Todo', project: o.project === undefined ? (o.second ? 'lp-ATL2' : undefined) : o.project, ageH: 1, labels: o.labels ?? ['Ready', 'Feature'], blockedBy: o.blockedBy, desc: o.live ? o.live.description : `${DESCRIPTION}\n\nSCENARIO: ${o.scenario ?? 'defect-then-fix'}` });
   const ci = new LocalCi(origin, root, o.ci);
   const hostHome = o.live ? homedir() : join(root, 'fake-home'); // the sandbox stages credentials from here: dummy files, so tests never touch the real ~/.claude

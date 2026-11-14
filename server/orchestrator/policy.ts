@@ -6,7 +6,7 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync, accessSync, constants, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OrchestrationCfg } from '../config.ts';
 import { nodePrefix } from './sandbox.ts';
@@ -43,7 +43,11 @@ function fileFacts(p: string, what: string, opts: { exec?: boolean } = {}) {
  * Verifies the trusted inputs for one orchestration config and returns a digest of everything the controller will rely on.
  * `configPath` is the file the policy was loaded from; it must be the owner's, not writable by others, and outside every agent-reachable tree.
  */
-export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new Date(), toolchainDir: string | undefined = nodePrefix()): PolicyView {
+export const SYSTEM_MOUNTS = ['/usr', '/etc/resolv.conf', '/etc/ssl', '/etc/ca-certificates', '/etc/hosts', '/etc/nsswitch.conf', '/etc/passwd', '/etc/group', '/etc/localtime', '/etc/alternatives'];
+/** Canonical form (symlinks resolved) when the path exists, lexical otherwise: aliases and ancestors cannot hide a sensitive directory. */
+const canon = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+
+export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new Date(), toolchainDir: string | undefined = nodePrefix(), extra: { home?: string; systemMounts?: string[] } = {}): PolicyView {
   const cfgReal = fileFacts(configPath, 'controller config');
   const repo = resolve(oc.repoPath), runs = resolve(oc.runsDir);
   for (const [name, p] of [['repoPath', repo], ['runsDir', runs]] as const) {
@@ -54,9 +58,12 @@ export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new
   if (within(cfgReal.real, repo) || within(cfgReal.real, runs)) throw new PolicyError('the controller config lives inside a repository or run directory that agents can influence: refusing to treat it as trusted policy');
   const sigs: string[] = [cfgReal.sig];
   const appRoot = appRootDir();
-  const protectedDirs = [dirname(cfgReal.real), repo, runs, resolve(homedir(), '.claude'), resolve(homedir(), '.codex'), resolve(homedir(), '.ssh'), ...(appRoot ? [appRoot] : [])];
+  const home = extra.home ?? homedir();
+  const protectedDirs = [dirname(cfgReal.real), repo, runs, join(home, '.claude'), join(home, '.codex'), join(home, '.ssh'), join(home, '.config'), join(home, '.local', 'share', 'devflow'), ...(appRoot ? [appRoot] : [])].map(canon);
+  // EVERY host path the sandbox mounts (system trees included, not only agent binaries) must be free of controller data.
+  for (const m of extra.systemMounts ?? SYSTEM_MOUNTS) { const cm = canon(m); const hit = protectedDirs.find((d) => within(d, cm)); if (hit) throw new PolicyError(`the system mount ${m} contains controller-sensitive paths (config, .env, repositories, run data or credentials): install DevFlow outside system directories`); }
   // Every directory the sandbox will mount from the host must be free of controller data, not just the agent binaries' directories.
-  const np = toolchainDir;
+  const np = toolchainDir ? canon(toolchainDir) : undefined;
   if (np) {
     const hit = protectedDirs.find((d) => within(d, np));
     if (hit) throw new PolicyError('the Node toolchain directory mounted into the sandbox contains controller-sensitive paths (config, .env, repositories or credentials); install node under a dedicated directory');
@@ -64,7 +71,7 @@ export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new
   }
   for (const [what, bin] of [['claude', oc.claude.bin], ['codex', oc.codex.bin]] as const) {
     const f = fileFacts(bin, `${what} executable`, { exec: true });
-    const dir = dirname(f.real);
+    const dir = dirname(f.real); // f.real is already canonical
     if (within(f.real, repo) || within(f.real, runs)) throw new PolicyError(`${what} executable lives inside a repository or run directory: agents could replace it`);
     const hit = protectedDirs.find((d) => within(d, dir)); // the whole bin directory gets mounted: it must not contain anything sensitive
     if (hit) throw new PolicyError(`${what} executable's directory contains controller-sensitive paths; it would be exposed to the agent`);
