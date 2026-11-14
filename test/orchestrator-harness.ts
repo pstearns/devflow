@@ -10,7 +10,7 @@ import { parseConfig } from '../server/config.ts';
 import { LinearClient } from '../server/linear.ts';
 import { LinearWriteClient } from '../server/linear-write.ts';
 import { CliAgents, type AgentRunner } from '../server/orchestrator/agents.ts';
-import type { PullRequests } from '../server/orchestrator/pr.ts';
+import type { PrState, PullRequests } from '../server/orchestrator/pr.ts';
 import type { CiProvider } from '../server/orchestrator/ci.ts';
 import { Orchestrator } from '../server/orchestrator/controller.ts';
 import { PolicyGuard } from '../server/orchestrator/policy.ts';
@@ -50,16 +50,18 @@ export class FakePrs implements PullRequests {
     if (!this.created.some((c) => c.branch === o.branch)) this.created.push({ branch: o.branch, base: o.base, title: o.title, draft: true });
     return { number: 7, url: 'https://example.invalid/gh/demo-org/atlas/pull/7' };
   }
-  async headSha(_repo: string, _n: number) {
+  state: Partial<PrState> = {}; // tests can flip the PR the way a third party could (ready for review, retargeted, closed)
+  async inspect(_repo: string, _n: number): Promise<PrState> {
     this.headCalls++;
-    if (this.mode === 'stale') return 'e'.repeat(40);
-    return sh(this.origin, 'rev-parse', `refs/heads/${this.created[this.created.length - 1]!.branch}`);
+    const c = this.created[this.created.length - 1]!;
+    const headSha = this.mode === 'stale' ? 'e'.repeat(40) : sh(this.origin, 'rev-parse', `refs/heads/${c.branch}`);
+    return { headSha, headRef: c.branch, headRepo: 'demo-org/atlas', baseRef: c.base, open: true, draft: true, ...this.state };
   }
 }
 
 export interface WorldOpts {
   scenario?: string; labels?: string[]; state?: string; blockedBy?: number[]; project?: string | null; omitOrchestration?: boolean;
-  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>;
+  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>; second?: boolean; onSleep?: () => void;
   /** Real agents: run the REAL claude/codex binaries with the user's real logins (staged into the sandbox as copies). Synthetic repo/ticket only. */
   live?: { claudeBin: string; codexBin: string; description: string }; wrapAgents?: (inner: AgentRunner, w: { origin: string; repo: string }) => AgentRunner; secrets?: boolean;
 }
@@ -74,7 +76,7 @@ export function makeWorld(o: WorldOpts = {}) {
   for (const [f, body] of Object.entries(o.seed ?? {})) { mkdirSync(join(repo, f, '..'), { recursive: true }); writeFileSync(join(repo, f), body); }
   sh(repo, 'add', '-A'); sh(repo, 'commit', '-q', '-m', 'init'); sh(repo, 'push', '-q', 'origin', 'main');
 
-  const cfgObj = {
+  const cfgObj: { projects: Record<string, unknown>[] } = {
     projects: [{
       id: 'atlas', name: 'Atlas', linear: { teamKey: 'ATL', projects: ['Atlas'] }, github: { repos: ['demo-org/atlas'] },
       orchestration: o.omitOrchestration ? undefined : {
@@ -84,12 +86,16 @@ export function makeWorld(o: WorldOpts = {}) {
       },
     }],
   };
+  if (o.second) { // a second project of the SAME team with a different tool policy; the ticket lives in it
+    const first = cfgObj.projects[0] as { orchestration: Record<string, unknown> };
+    cfgObj.projects.push({ id: 'labs', name: 'Atlas Labs', linear: { teamKey: 'ATL', projects: ['Atlas Labs'] }, github: { repos: ['demo-org/atlas'] }, orchestration: { ...first.orchestration, claude: { ...(first.orchestration.claude as object), allowedTools: ['Read', 'Glob'] } } });
+  }
   // The owner's trusted config: its own file, outside the repo and the runs directory, owner-only. This is what the PolicyGuard pins.
   const trustedDir = join(root, 'trusted'); mkdirSync(trustedDir, { mode: 0o700 });
   const configPath = join(trustedDir, 'devflow.config.json'); writeFileSync(configPath, JSON.stringify(cfgObj), { mode: 0o600 }); chmodSync(configPath, 0o600);
   const cfg = parseConfig(cfgObj);
   const f = demoFetch(Date.parse('2026-06-01T12:00:00Z'));
-  f.store.issues.ATL!.push({ n: 22, title: 'Add slugify helper', state: o.state ?? 'Todo', project: o.project, ageH: 1, labels: o.labels ?? ['Ready', 'Feature'], blockedBy: o.blockedBy, desc: o.live ? o.live.description : `${DESCRIPTION}\n\nSCENARIO: ${o.scenario ?? 'defect-then-fix'}` });
+  f.store.issues.ATL!.push({ n: 22, title: 'Add slugify helper', state: o.state ?? 'Todo', project: o.project === undefined ? (o.second ? 'lp-ATL2' : undefined) : o.project, ageH: 1, labels: o.labels ?? ['Ready', 'Feature'], blockedBy: o.blockedBy, desc: o.live ? o.live.description : `${DESCRIPTION}\n\nSCENARIO: ${o.scenario ?? 'defect-then-fix'}` });
   const ci = new LocalCi(origin, root, o.ci);
   const hostHome = o.live ? homedir() : join(root, 'fake-home'); // the sandbox stages credentials from here: dummy files, so tests never touch the real ~/.claude
   if (o.live) { /* real home: nothing to create */ } else if (!o.noLogin) { mkdirSync(join(hostHome, '.claude'), { recursive: true }); mkdirSync(join(hostHome, '.codex'), { recursive: true }); writeFileSync(join(hostHome, '.claude', '.credentials.json'), '{"fake":true}'); writeFileSync(join(hostHome, '.codex', 'auth.json'), '{"fake":true}'); } else mkdirSync(hostHome)
@@ -103,11 +109,12 @@ export function makeWorld(o: WorldOpts = {}) {
   };
   const agents = o.wrapAgents ? o.wrapAgents(counted, { origin, repo }) : counted;
   const logs: string[] = [];
-  const policy = new PolicyGuard(() => cfg.projects[0]!.orchestration!, configPath);
-  const mk = () => new Orchestrator({ cfg, policy, read: new LinearClient(DEMO_READ_KEY, f), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, agents, sleep: async () => {}, log: (l) => logs.push(l) });
+  const factoryCalls: { kind: string; projectId: string; tools: string[] }[] = [];
+  const ocOf = (id: string) => cfg.projects.find((p) => p.id === id)!.orchestration!;
+  const mk = () => new Orchestrator({ cfg, policy: (oc, pid) => { factoryCalls.push({ kind: 'policy', projectId: pid, tools: oc.claude.allowedTools }); return new PolicyGuard(() => ocOf(pid), configPath); }, read: new LinearClient(DEMO_READ_KEY, f), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, agents: (oc, pid) => { factoryCalls.push({ kind: 'agents', projectId: pid, tools: oc.claude.allowedTools }); return agents; }, sleep: async () => { o.onSleep?.(); }, log: (l) => logs.push(l) });
   const issue = () => f.store.issues.ATL!.find((x) => x.n === 22)!;
   return {
-    root, origin, repo, runsDir, cfg, configPath, policy, f, ci, prs, hostHome, calls, logs, mk, orch: mk(), issue, store: () => new RunStore(runsDir),
+    root, origin, repo, runsDir, cfg, configPath, factoryCalls, f, ci, prs, hostHome, calls, logs, mk, orch: mk(), issue, store: () => new RunStore(runsDir),
     comments: () => f.store.comments.filter((c) => c.issue === TICKET).map((c) => c.body),
     remoteHead: (branch: string) => sh(origin, 'rev-parse', `refs/heads/${branch}`),
     mainHead: () => sh(origin, 'rev-parse', 'refs/heads/main'),

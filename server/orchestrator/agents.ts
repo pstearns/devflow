@@ -3,11 +3,12 @@
 //  - the implementer sees only its own clone (own .git, no remote, no credentials); the reviewer sees only a read-only snapshot;
 //  - neither receives any Linear/GitHub/DevFlow credential, and the reviewer has no git metadata at all.
 import { spawn } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, closeSync, readSync, fstatSync, rmSync, constants as fsc } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { OrchestrationCfg } from '../config.ts';
-import { baseEnv, bwrapArgs, bwrapUsable, nodeMounts, resolveBin, stageHome, type Mount, type SandboxJob, type Staged } from './sandbox.ts';
+import { baseEnv, bwrapArgs, bwrapUsable, nodeMounts, readAgentFile, resolveBin, stageHome, type Mount, type SandboxJob, type Staged } from './sandbox.ts';
+export { readAgentFile };
 
 export interface ProcResult { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; truncated: boolean; finalMessage?: string }
 
@@ -33,7 +34,7 @@ export function runProcess(bin: string, args: string[], o: { cwd: string; env: N
 }
 
 /** Signals that mean "the environment failed", not "the code is wrong". Such failures never consume a repair attempt. */
-const INFRA_RE = /(^bwrap:|not logged in|please run \/login|invalid api key|authentication|unauthori[sz]ed|\b40[13]\b|rate.?limit|overloaded|\b5(02|03|29)\b|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network error|spawn error|usage limit)/im;
+const INFRA_RE = /(^bwrap:|not logged in|please run \/login|invalid api key|authentication|unauthori[sz]ed|\b40[13]\b|rate.?limit|overloaded|\b5(02|03|29)\b|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network error|spawn error|usage limit|hit your [^\n]{0,30}limit|api_error)/im;
 export function infraProblem(r: ProcResult): string | undefined {
   if (r.timedOut) return 'the agent timed out';
   if (r.exitCode === 0) return undefined;
@@ -86,26 +87,6 @@ export async function runInSandbox(rs: RoleSandbox, cmd: string, args: string[],
   try {
     return await runProcess('/usr/bin/bwrap', bwrapArgs({ ...rs.job, cmd, args }), { cwd: '/', env: { PATH: '/usr/bin:/bin' }, stdin: o.stdin, timeoutMs: o.timeoutMs });
   } finally { rs.staged.finish(); }
-}
-
-/**
- * Reads a file the AGENT could have written. The path sits in a directory the agent controls, so it may be a symlink to anything on the host
- * (a controller file, a credential). O_NOFOLLOW + a regular-file check + a size cap mean the controller only ever reads bytes the agent
- * itself put in that exact file; anything else is treated as "no output".
- */
-export function readAgentFile(path: string, maxBytes: number): string | undefined {
-  try {
-    if (!lstatSync(path).isFile()) return undefined;
-    const fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
-    try {
-      const st = fstatSync(fd);
-      if (!st.isFile() || st.size > maxBytes) return undefined;
-      const buf = Buffer.alloc(st.size);
-      let off = 0;
-      while (off < st.size) { const n = readSync(fd, buf, off, st.size - off, off); if (n <= 0) break; off += n; }
-      return buf.toString('utf8', 0, off);
-    } finally { closeSync(fd); }
-  } catch { return undefined; }
 }
 
 export class CliAgents implements AgentRunner {
@@ -166,6 +147,6 @@ export class CliAgents implements AgentRunner {
     // Flags verified against `codex exec --help` (codex-cli 0.169). The inner Codex sandbox stays on read-only as a second layer.
     const args = ['exec', '--sandbox', 'read-only', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--output-schema', '/schema.json', '--cd', '/review', '-c', 'approval_policy="never"', '-o', '/out/last-message.txt', '-'];
     const r = await runInSandbox(rs, rs.cmdPath, args, { stdin: o.prompt, timeoutMs: o.timeoutMs });
-    return { ...r, finalMessage: readAgentFile(join(o.outDir, 'last-message.txt'), 1024 * 1024) };
+    return { ...r, finalMessage: readAgentFile(join(o.outDir, 'last-message.txt'), 1024 * 1024, o.outDir) };
   }
 }

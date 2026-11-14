@@ -238,7 +238,7 @@ describe('GitHub write surface: draft PR only', () => {
   });
   it('reuses an existing open PR instead of creating a second one', async () => {
     const { f, calls } = reply(201, {});
-    const pr = await new GithubPrs(READ([{ number: 3, html_url: 'https://github.com/o/r/pull/3' }]), 't', f).ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1', base: 'main', title: 'T', body: 'B' });
+    const pr = await new GithubPrs(READ([{ number: 3, html_url: 'https://github.com/o/r/pull/3', state: 'open', draft: true, head: { sha: 'a'.repeat(40), ref: 'devflow/atl-1-abcdef1', repo: { full_name: 'o/r' } }, base: { ref: 'main' } }]), 't', f).ensureDraft('o/r', { branch: 'devflow/atl-1-abcdef1', base: 'main', title: 'T', body: 'B' });
     expect(pr.number).toBe(3); expect(calls).toHaveLength(0);
   });
   it('refuses to continue if GitHub hands back a non-draft PR, rejects a bad write token, and rejects hostile repo/branch names', async () => {
@@ -257,6 +257,6 @@ describe('GitHub write surface: draft PR only', () => {
     expect(calls).toHaveLength(0);
   });
   it('exposes no way to mark ready, merge, close, comment or edit', () => {
-    expect(Object.getOwnPropertyNames(GithubPrs.prototype).sort()).toEqual(['baseProtected', 'constructor', 'ensureDraft', 'headSha']);
+    expect(Object.getOwnPropertyNames(GithubPrs.prototype).sort()).toEqual(['baseProtected', 'constructor', 'ensureDraft', 'inspect', 'shape']);
   });
 });

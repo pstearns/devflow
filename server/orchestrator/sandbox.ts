@@ -4,7 +4,7 @@
 // Network stays on because both agents must reach their model API (see README: egress is not filtered).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, constants as fsc } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -56,8 +56,32 @@ export function resolveBin(bin: string): { dir: string; file: string } {
   return { dir: dirname(real), file: basename(real) };
 }
 
+/**
+ * Reads a file the AGENT could have written. The path sits in a directory the agent controls, so it (or a parent directory) may be a symlink
+ * to anything on the host. Parent directories must be real directories, the file is opened O_NOFOLLOW, must be a regular file under the size
+ * cap, and only the bytes read through that verified descriptor are returned.
+ */
+export function readAgentFile(path: string, maxBytes: number, mustStayInside?: string): string | undefined {
+  try {
+    if (mustStayInside) {
+      let d = dirname(path);
+      while (d.length > mustStayInside.length && d.startsWith(mustStayInside)) { if (lstatSync(d).isSymbolicLink() || !lstatSync(d).isDirectory()) return undefined; d = dirname(d); }
+    }
+    if (!lstatSync(path).isFile()) return undefined;
+    const fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > maxBytes) return undefined;
+      const buf = Buffer.alloc(st.size);
+      let off = 0;
+      while (off < st.size) { const n = readSync(fd, buf, off, st.size - off, off); if (n <= 0) break; off += n; }
+      return buf.toString('utf8', 0, off);
+    } finally { closeSync(fd); }
+  } catch { return undefined; }
+}
+
 // ---------------------------------------------------------------- credentials: copies, never the user's real home
-const sha = (p: string) => createHash('sha256').update(readFileSync(p)).digest('hex');
+const shaOf = (b: string | Buffer) => createHash('sha256').update(b).digest('hex');
 
 export interface Staged { dir: string; mounts: Mount[]; tmpfs: string[]; env: Record<string, string>; finish: () => void }
 
@@ -73,14 +97,20 @@ export function stageHome(kind: 'claude' | 'codex', hostHome: string, parent = t
   const staged = join(dir, cred.rel);
   mkdirSync(dirname(staged), { recursive: true, mode: 0o700 });
   let before: string | undefined;
-  if (existsSync(cred.host)) { copyFileSync(cred.host, staged); before = sha(staged); }
+  if (existsSync(cred.host)) { copyFileSync(cred.host, staged); before = shaOf(readFileSync(cred.host)); }
   if (kind === 'claude') writeFileSync(join(dir, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true }), { mode: 0o600 });
   else writeFileSync(join(dir, 'config.toml'), '', { mode: 0o600 });
   const finish = () => {
     try {
-      if (before && existsSync(staged) && sha(staged) !== before && existsSync(cred.host) && sha(cred.host) === before) {
-        const tmp = `${cred.host}.devflow.tmp`;
-        copyFileSync(staged, tmp); renameSync(tmp, cred.host);
+      // The staged file was writable by the agent: it may have become a symlink (or sit under one). Only bytes read through a no-follow
+      // descriptor, from a regular JSON-object file, are ever written back, and only if the host copy did not change meanwhile.
+      const fresh = readAgentFile(staged, 1024 * 1024, dir);
+      if (before && fresh !== undefined && existsSync(cred.host)) {
+        let valid = false; try { const j = JSON.parse(fresh) as unknown; valid = typeof j === 'object' && j !== null && !Array.isArray(j); } catch { /* not JSON: refuse */ }
+        if (valid && shaOf(fresh) !== before && shaOf(readFileSync(cred.host)) === before) {
+          const tmp = `${cred.host}.devflow.tmp`;
+          writeFileSync(tmp, fresh, { mode: 0o600 }); renameSync(tmp, cred.host);
+        }
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };

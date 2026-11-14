@@ -7,12 +7,21 @@ import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync, accessSync, constants, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { OrchestrationCfg } from '../config.ts';
+import { nodePrefix } from './sandbox.ts';
 
 export class PolicyError extends Error {}
 
 const within = (child: string, parent: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
 const unsafeMode = (mode: number) => (mode & 0o022) !== 0; // group- or world-writable
+
+/** The DevFlow application directory (holds .env and the config by default). Works from source and from the compiled build. */
+function appRootDir(): string | undefined {
+  let d = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 4; i++, d = dirname(d)) { try { if (statSync(resolve(d, 'package.json')).isFile() && statSync(resolve(d, 'server')).isDirectory()) return d; } catch { /* keep walking */ } }
+  return undefined;
+}
 
 export interface PolicyView { digest: string; configPath: string; checkedAt: string }
 
@@ -34,7 +43,7 @@ function fileFacts(p: string, what: string, opts: { exec?: boolean } = {}) {
  * Verifies the trusted inputs for one orchestration config and returns a digest of everything the controller will rely on.
  * `configPath` is the file the policy was loaded from; it must be the owner's, not writable by others, and outside every agent-reachable tree.
  */
-export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new Date()): PolicyView {
+export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new Date(), toolchainDir: string | undefined = nodePrefix()): PolicyView {
   const cfgReal = fileFacts(configPath, 'controller config');
   const repo = resolve(oc.repoPath), runs = resolve(oc.runsDir);
   for (const [name, p] of [['repoPath', repo], ['runsDir', runs]] as const) {
@@ -44,7 +53,15 @@ export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new
   if (within(runs, repo) || within(repo, runs)) throw new PolicyError('runsDir and repoPath must not contain each other (agent-reachable repository content could alter run evidence)');
   if (within(cfgReal.real, repo) || within(cfgReal.real, runs)) throw new PolicyError('the controller config lives inside a repository or run directory that agents can influence: refusing to treat it as trusted policy');
   const sigs: string[] = [cfgReal.sig];
-  const protectedDirs = [dirname(cfgReal.real), repo, runs, resolve(homedir(), '.claude'), resolve(homedir(), '.codex'), resolve(homedir(), '.ssh')];
+  const appRoot = appRootDir();
+  const protectedDirs = [dirname(cfgReal.real), repo, runs, resolve(homedir(), '.claude'), resolve(homedir(), '.codex'), resolve(homedir(), '.ssh'), ...(appRoot ? [appRoot] : [])];
+  // Every directory the sandbox will mount from the host must be free of controller data, not just the agent binaries' directories.
+  const np = toolchainDir;
+  if (np) {
+    const hit = protectedDirs.find((d) => within(d, np));
+    if (hit) throw new PolicyError('the Node toolchain directory mounted into the sandbox contains controller-sensitive paths (config, .env, repositories or credentials); install node under a dedicated directory');
+    if (unsafeMode(statSync(np).mode)) throw new PolicyError('the Node toolchain directory is group- or world-writable');
+  }
   for (const [what, bin] of [['claude', oc.claude.bin], ['codex', oc.codex.bin]] as const) {
     const f = fileFacts(bin, `${what} executable`, { exec: true });
     const dir = dirname(f.real);

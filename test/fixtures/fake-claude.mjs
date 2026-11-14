@@ -26,16 +26,16 @@ mkdirSync('src', { recursive: true }); mkdirSync('test', { recursive: true });
 if (!repair) {
   writeFileSync('src/slugify.mjs', scenario === 'correct-first' || scenario === 'symlink-clone' || scenario === 'symlink-out' || scenario.startsWith('infra') || scenario.startsWith('invalid') || scenario.startsWith('pr-') ? FIXED : BUGGY);
   writeFileSync('test/slugify.test.mjs', test(scenario === 'red-ci' ? 'WRONG' : 'hello-world'));
-  if (scenario === 'touch-ci') { mkdirSync('.github/workflows', { recursive: true }); writeFileSync('.github/workflows/ci.yml', 'name: ci\non: push\njobs: {}\n'); }
-} else if (scenario === 'never-fixes') {
+  if (scenario === 'touch-ci' || scenario === 'touch-ci-always') { mkdirSync('.github/workflows', { recursive: true }); writeFileSync('.github/workflows/ci.yml', 'name: ci\non: push\njobs: {}\n'); }
+} else if (scenario === 'never-fixes' || scenario === 'touch-ci-always') {
   writeFileSync('src/slugify.mjs', BUGGY + `// repair try ${Date.now()}\n`);
 } else {
   writeFileSync('src/slugify.mjs', FIXED);
   writeFileSync('test/slugify.test.mjs', test('hello-world'));
-  if (scenario === 'touch-ci') { /* second attempt behaves: no CI edit */ }
+  if (scenario === 'touch-ci') execFileSync('git', ['rm', '-rq', '--ignore-unmatch', '.github']); // the repair removes the forbidden file again
 }
 if (scenario === 'symlink-clone') { symlinkSync('..', 'escape-link'); symlinkSync('/etc', 'abs-link'); } // untracked links out of the clone
 if (scenario === 'no-commit') process.exit(0);
-git('add', 'src', 'test', ...(scenario === 'touch-ci' && !repair ? ['.github'] : []));
+git('add', 'src', 'test', ...((scenario === 'touch-ci' || scenario === 'touch-ci-always') && !repair ? ['.github'] : []));
 git('commit', '-q', '-m', repair ? 'ATL-22: repair slugify' : 'ATL-22: add slugify');
 console.log(JSON.stringify({ result: 'done' }));

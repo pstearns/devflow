@@ -10,6 +10,8 @@ export const MILESTONES = { started: 1, implemented: 2, ci: 3, review: 4, repair
 const TITLES: Record<number, string> = { 1: 'Execution authorized and started', 2: 'Implementation completed', 3: 'CI verified', 4: 'Independent review completed', 5: 'Repair requested', 6: 'Final status' };
 
 const defang = (s: string) => s.replace(/@/g, '@\u200b').replace(/\u0000/g, '').replace(/!\[/g, '!\\[').replace(/\]\(/g, '] (');
+/** One line of untrusted text safe to place inside backticks, a table cell or a list item: no control chars, backticks, pipes or line breaks. */
+export const line = (s: string, n = 120) => clip(defang(s).replace(/[\u0000-\u001f\u007f\u2028\u2029`|<>]/g, ' ').replace(/\s+/g, ' ').trim(), n);
 export const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 /** Agent-authored text: quoted line by line, so it can never impersonate a controller heading or a verified fact. */
 export const quote = (s: string, n = 600) => clip(defang(s), n).split('\n').map((l) => `> ${l}`).join('\n');
@@ -43,10 +45,10 @@ export interface StartFacts {
 export function started(m: Manifest, at: string, f: StartFacts) {
   return frame(m, 1, undefined, at, {
     what: `Execution of ${m.ticket} was authorized and the run started. The ticket moved to its in-progress state.`,
-    why: `The ticket carried the explicit \`${f.readyLabel}\` approval label, was unstarted and unblocked, and sits inside a write-authorized scope. Authorized by: **${f.authorizer ?? 'not shown in Linear history'}**${f.authorizedAt ? ` at ${f.authorizedAt}` : ''}.`,
+    why: `The ticket carried the explicit \`${f.readyLabel}\` approval label, was unstarted and unblocked, and sits inside a write-authorized scope. Authorized by: **${line(f.authorizer ?? 'not shown in Linear history', 80)}**${f.authorizedAt ? ` at ${line(f.authorizedAt, 40)}` : ''}.`,
     evidence: [
-      `Approved scope: ${f.scope}; repository \`${m.repo}\`, base \`${m.baseBranch}\` @ ${commit(m, m.baseSha)}; base branch protected on GitHub: ${String(f.baseProtected ?? 'unknown')}.`,
-      `Agents (all inside a bubblewrap sandbox, no controller credentials): **implementer** Claude Code ${f.claude ?? '(version unknown)'}; **independent reviewer** Codex ${f.codex ?? '(version unknown)'}. The controller (${f.operator}) alone writes to Linear and GitHub.`,
+      `Approved scope: ${line(f.scope, 200)}; repository \`${m.repo}\`, base \`${m.baseBranch}\` @ ${commit(m, m.baseSha)}; base branch protected on GitHub: ${String(f.baseProtected ?? 'unknown')}.`,
+      `Agents (all inside a bubblewrap sandbox, no controller credentials): **implementer** Claude Code ${line(f.claude ?? '(version unknown)', 40)}; **independent reviewer** Codex ${line(f.codex ?? '(version unknown)', 40)}. The controller (${f.operator}) alone writes to Linear and GitHub.`,
       `Trusted controller policy digest \`${f.policyDigest.slice(0, 16)}\` (owner-controlled config; repository files are never policy).`,
       `Limits: initial attempt + ${MAX_REPAIRS} repairs; environment failures are retried separately and never use a repair.`,
       `Run record: ${ev(m, 'manifest.json')} and ${ev(m, 'events.jsonl')} (retained on the DevFlow host).`,
@@ -74,11 +76,11 @@ export function ciVerified(m: Manifest, a: AttemptRecord, at: string, ci: { stat
     what: `CI ${ok ? 'passed' : 'FAILED'} on commit ${commit(m, sha)}.`,
     why: ok ? 'A review is only requested for a commit whose CI is green; the controller read the result for this exact SHA.' : 'A failing commit is not sent to the reviewer; it is returned to Claude for repair.',
     evidence: [
-      `Result: ${clip(ci.detail, 400)}`,
-      ...ci.checks.slice(0, 12).map((c) => `Check \`${c.name}\`: ${c.state}${c.url ? ` — ${c.url}` : ''}`),
+      `Result: ${line(ci.detail, 400)}`,
+      ...ci.checks.slice(0, 12).map((c) => `Check \`${line(c.name, 80)}\`: ${line(c.state, 20)}${c.url && /^https:\/\/[^\s)>\]]+$/.test(c.url) ? ` — ${c.url}` : ''}`),
       a.ci ? `Retained: ${ev(m, a.ci.evidence.split('#')[0]!)}` : '',
     ].filter(Boolean),
-    extra: ok ? undefined : repairRequested(m, a.n, `CI failed: ${clip(ci.detail, 200)}`),
+    extra: ok ? undefined : repairRequested(m, a.n, `CI failed: ${line(ci.detail, 200)}`),
   });
 }
 
@@ -86,21 +88,22 @@ export interface GateCheck { name: string; ok: boolean; detail: string }
 export function reviewed(m: Manifest, a: AttemptRecord, at: string, r: Review, gate: GateCheck[], versions: { codex?: string }) {
   const pass = r.verdict === 'PASS';
   const findings = r.findings.length
-    ? r.findings.map((f: Finding) => `- **${f.severity}** \`${defang(f.file)}${f.line ? `:${f.line}` : ''}\`\n${quote(`${f.title}\n${f.detail}\nEvidence: ${f.evidence}`, 900)}`).join('\n')
+    ? r.findings.map((f: Finding) => `- **${f.severity}** \`${line(f.file, 200)}${f.line ? `:${f.line}` : ''}\`\n${quote(`${f.title}\n${f.detail}\nEvidence: ${f.evidence}`, 900)}`).join('\n')
     : '_No findings._';
   return frame(m, 4, undefined, at, {
-    what: `Independent review of ${commit(m, r.commit)}: **${r.verdict}** (${r.findings.length} finding${r.findings.length === 1 ? '' : 's'}; reviewer Codex ${versions.codex ?? ''}; retries of malformed output: ${a.reviewRetries ?? 0}).`,
+    what: `Independent review of ${commit(m, r.commit)}: **${r.verdict}** (${r.findings.length} finding${r.findings.length === 1 ? '' : 's'}; reviewer Codex ${line(versions.codex ?? '', 40)}; retries of malformed output: ${a.reviewRetries ?? 0}).`,
     why: pass ? 'The reviewer attested every changed file, and the controller independently verified the result before accepting it (table below). The reviewer’s word alone advances nothing.' : 'The reviewer reported blocking findings with evidence; the controller validated the format, SHA and file references before relaying them.',
     evidence: [
-      `Controller verification: ${gate.map((g) => `${g.ok ? '✅' : '❌'} ${g.name}`).join(' · ')}`,
-      ...gate.filter((g) => !g.ok).map((g) => `Failed: ${g.name} — ${g.detail}`),
+      `Controller verification: ${gate.map((g) => `${g.ok ? '✅' : '❌'} ${line(g.name, 80)}`).join(' · ')}`,
+      ...gate.filter((g) => !g.ok).map((g) => `Failed: ${line(g.name, 80)} — ${line(g.detail, 200)}`),
       a.review ? `Retained: ${ev(m, a.review.parsed.split('#')[0]!)}, raw output ${ev(m, a.review.raw.split('#')[0]!)}` : '',
     ].filter(Boolean),
     extra: `**Reviewer summary and findings (agent-authored, quoted, unverified prose):**\n${quote(r.summary, 900)}\n\n${findings}${pass ? '' : `\n\n${repairRequested(m, a.n, `${r.findings.length} review finding(s)`)}`}`,
   });
 }
 
-export function repairRequested(m: Manifest, n: number, reason: string) {
+export function repairRequested(m: Manifest, n: number, reasonRaw: string) {
+  const reason = line(reasonRaw, 300);
   return n < MAX_REPAIRS
     ? `**Milestone 5/${TOTAL} — Repair requested.** Repair ${n + 1} of ${MAX_REPAIRS} requested from Claude. Reason: ${reason}. Retries used so far: repairs ${n}/${MAX_REPAIRS}, infrastructure ${m.infra.length}.`
     : `**Milestone 5/${TOTAL} — No repair available.** ${reason}. All ${MAX_REPAIRS} repair attempts are used; the run will escalate.`;
@@ -108,14 +111,14 @@ export function repairRequested(m: Manifest, n: number, reason: string) {
 
 export function final(m: Manifest, at: string, f: { kind: 'awaiting-owner' | 'escalated'; summary: string; reason?: string; cls?: string; gate?: GateCheck[]; evidenceRef?: string; blockedConfirmed?: boolean }) {
   const pass = f.kind === 'awaiting-owner';
-  const rows = m.attempts.map((a) => `| ${a.n === 0 ? 'initial' : `repair ${a.n}`} | ${commit(m, a.headSha)} | ${a.ci ? a.ci.state : '—'} | ${a.review ? a.review.verdict : a.failure ? 'n/a' : '—'} | ${a.failure ? clip(a.failure, 90) : 'accepted'} |`);
+  const rows = m.attempts.map((a) => `| ${a.n === 0 ? 'initial' : `repair ${a.n}`} | ${commit(m, a.headSha)} | ${a.ci ? a.ci.state : '—'} | ${a.review ? a.review.verdict : a.failure ? 'n/a' : '—'} | ${a.failure ? line(a.failure, 90) : 'accepted'} |`);
   return frame(m, 6, pass ? 'Awaiting owner approval' : 'Escalated to the owner', at, {
-    what: pass ? `Commit ${commit(m, m.approvedSha)} passed CI and independent review and is **awaiting owner approval**. The ticket moved to its approval state.` : `The run **stopped and escalated** (${f.cls}). The ticket was moved to \`${m.linearStates.blockedName}\`${f.blockedConfirmed === false ? ' — **the transition was NOT confirmed; please check the ticket**' : ''}. No further automated attempts will be made.`,
-    why: pass ? 'All controller gates held for this exact SHA (below). DevFlow never merges and never marks the PR ready.' : clip(defang(f.reason ?? ''), 1200),
+    what: pass ? `Commit ${commit(m, m.approvedSha)} passed CI and independent review and is **awaiting owner approval**. The ticket moved to its approval state.` : `The run **stopped and escalated** (${f.cls}). The ticket was moved to \`${line(m.linearStates.blockedName, 60)}\`${f.blockedConfirmed === false ? ' — **the transition was NOT confirmed; please check the ticket**' : ''}. No further automated attempts will be made.`,
+    why: pass ? 'All controller gates held for this exact SHA (below). DevFlow never merges and never marks the PR ready.' : `The controller stopped the run (reason text may include agent-influenced data and is quoted):\n${quote(f.reason ?? '', 1200)}`,
     evidence: [
-      pass ? `Gate: ${(f.gate ?? []).map((g) => `${g.ok ? '✅' : '❌'} ${g.name}`).join(' · ')}` : '',
+      pass ? `Gate: ${(f.gate ?? []).map((g) => `${g.ok ? '✅' : '❌'} ${line(g.name, 80)}`).join(' · ')}` : '',
       `Branch \`${m.branch}\` · draft PR ${pr(m)} · base \`${m.baseBranch}\` @ ${commit(m, m.baseSha)}`,
-      `Repair attempts used: ${m.attempts.filter((x) => x.n > 0).length}/${MAX_REPAIRS} · infrastructure retries: ${m.infra.length}${m.infra.length ? ` (${[...new Set(m.infra.map((i) => i.step))].join(', ')})` : ''} · review retries: ${m.attempts.reduce((s, x) => s + (x.reviewRetries ?? 0), 0)}`,
+      `Repair attempts used: ${m.attempts.filter((x) => x.n > 0).length}/${MAX_REPAIRS} · infrastructure retries: ${m.infra.length}${m.infra.length ? ` (${[...new Set(m.infra.map((i) => line(i.step, 30)))].join(', ')})` : ''} · review retries: ${m.attempts.reduce((s, x) => s + (x.reviewRetries ?? 0), 0)}`,
       `Run record ${ev(m, 'manifest.json')}${f.evidenceRef ? `, escalation record ${ev(m, f.evidenceRef)}` : ''}; event log ${ev(m, 'events.jsonl')}.`,
     ].filter(Boolean),
     extra: `${pass ? '**Owner action required:** review the draft PR and approve or reject it. Nothing is merged or deployed automatically.' : '**Owner action required:** read the reason above, fix the cause, and re-approve the ticket if you want another run.'}\n\n| Attempt | Commit | CI | Review | Outcome |\n|---|---|---|---|---|\n${rows.join('\n')}`,

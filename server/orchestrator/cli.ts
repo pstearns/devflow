@@ -4,7 +4,7 @@ import '../node-check.ts';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, loadEnvFile, type Config, type OrchestrationCfg } from '../config.ts';
+import { loadConfig, loadEnvFile, type Config } from '../config.ts';
 import { LinearClient } from '../linear.ts';
 import { LinearWriteClient } from '../linear-write.ts';
 import { GithubClient } from '../github.ts';
@@ -12,7 +12,7 @@ import { CliAgents } from './agents.ts';
 import { GithubCi } from './ci.ts';
 import { GithubPrs } from './pr.ts';
 import { Orchestrator, Rejected } from './controller.ts';
-import { PolicyGuard } from './policy.ts';
+import { PolicyError, PolicyGuard } from './policy.ts';
 import { DuplicateRun, RunStore } from './manifest.ts';
 import { TERMINAL } from './types.ts';
 
@@ -34,15 +34,19 @@ if (!loaded.found) die(`no configuration at ${loaded.path}`);
 const cfg: Config = loaded.config;
 
 if (cmd === 'release') {
-  // Manual recovery for an interrupted run: marks it aborted and frees the ticket's lock. Never touches Linear.
+  // Manual recovery for an interrupted run: marks it aborted and frees the ticket's lock. Never touches Linear. A team can have several
+  // projects with different runs directories, so every distinct one for the ticket's team is checked.
   const team = ticket.split('-')[0]!;
-  const oc = cfg.projects.find((p) => p.linear?.teamKey === team && p.orchestration)?.orchestration;
-  if (!oc) die(`no orchestration configured for team ${team}`);
-  const store = new RunStore(oc!.runsDir);
-  const run = store.activeRun(ticket);
-  if (run) { run.state = 'aborted'; run.outcome = 'ABORTED'; run.reason = 'released manually after interruption'; store.save(run, new Date().toISOString()); }
-  store.release(ticket);
-  console.log(run ? `Released ${ticket}; run ${run.runId} marked aborted. Check the ticket and branch in Linear/GitHub before re-approving.` : `Released the lock for ${ticket} (no active run was recorded).`);
+  const dirs = [...new Set(cfg.projects.filter((p) => p.linear?.teamKey === team && p.orchestration).map((p) => p.orchestration!.runsDir))];
+  if (!dirs.length) die(`no orchestration configured for team ${team}`);
+  let released = 0;
+  for (const dir of dirs) {
+    const store = new RunStore(dir);
+    const run = store.activeRun(ticket);
+    if (run) { run.state = 'aborted'; run.outcome = 'ABORTED'; run.reason = 'released manually after interruption'; store.save(run, new Date().toISOString()); released++; console.log(`Run ${run.runId} marked aborted.`); }
+    store.release(ticket);
+  }
+  console.log(`Released the lock for ${ticket}${released ? '; check the ticket and branch in Linear/GitHub before re-approving.' : ' (no active run was recorded).'}`);
   process.exit(0);
 }
 
@@ -52,19 +56,20 @@ if (writeKey === readKey) die('LINEAR_WRITE_API_KEY must differ from LINEAR_API_
 if (ghWrite === ghToken) die('GITHUB_WRITE_TOKEN must differ from GITHUB_TOKEN (the read token never creates pull requests)');
 
 const gh = new GithubClient(ghToken!);
-const policyFor = (): PolicyGuard => {
-  const oc = firstOrchestration(cfg);
-  if (!oc) return die(`no orchestration configured for ${ticket}'s team`);
-  return new PolicyGuard(() => firstOrchestration(loadConfigFresh())!, loaded.path);
-};
+// Runner and policy are built from the AUTHORIZED ticket's own project (the controller passes it), never from "the first project of the team".
+// The policy re-reads the config from disk and re-resolves that same project id, so any change to it changes the digest and stops the run.
 const orch = new Orchestrator({
   cfg,
   read: new LinearClient(readKey!),
   write: new LinearWriteClient(writeKey!),
   ci: new GithubCi(gh),
   prs: new GithubPrs(gh, ghWrite!),
-  policy: policyFor(),
-  agents: new CliAgents(firstOrchestration(cfg) ?? { claude: { bin: 'claude', allowedTools: [] }, codex: { bin: 'codex' } }), // credentials are staged per role by the sandbox, never inherited
+  policy: (_oc, projectId) => new PolicyGuard(() => {
+    const fresh = loadConfig(process.env, root).config.projects.find((p) => p.id === projectId)?.orchestration;
+    if (!fresh) throw new PolicyError(`project "${projectId}" no longer has an orchestration block in the trusted config`);
+    return fresh;
+  }, loaded.path),
+  agents: (oc) => new CliAgents(oc), // credentials are staged per role by the sandbox, never inherited
   log: (l) => console.log(`DevFlow ${l}`),
 });
 try {
@@ -74,12 +79,4 @@ try {
 } catch (e) {
   if (e instanceof Rejected || e instanceof DuplicateRun) die(`refused: ${e.message}`, 4);
   die(`failed: ${e instanceof Error ? e.message : 'unknown error'}`);
-}
-
-/** Binary names/tools come from the ticket's project, resolved per run in the controller; the CLI only needs one set for the runner. */
-/** Re-read from disk each time so a changed config changes the policy digest (and stops the run) instead of being silently ignored. */
-function loadConfigFresh(): Config { return loadConfig(process.env, root).config; }
-function firstOrchestration(c: Config): OrchestrationCfg | undefined {
-  const team = ticket.split('-')[0]!;
-  return c.projects.find((p) => p.linear?.teamKey === team && p.orchestration)?.orchestration;
 }

@@ -14,6 +14,7 @@ import type { LinearClient } from '../linear.ts';
 import { MAX_COMMENT, type LinearWriteClient } from '../linear-write.ts';
 import { isObj, nodes, str } from '../util.ts';
 import { infraProblem, type AgentRunner } from './agents.ts';
+import type { PrState } from './pr.ts';
 import * as A from './audit.ts';
 import type { CiProvider, CiResult } from './ci.ts';
 import * as G from './git.ts';
@@ -34,9 +35,10 @@ export interface Deps {
   write: Pick<LinearWriteClient, 'createComment' | 'setState'>;
   ci: CiProvider;
   prs: PullRequests;
-  agents: AgentRunner;
-  /** Trusted-policy guard. Required: a controller that cannot verify its own policy does not run. */
-  policy: { pin(): Pinned };
+  /** Built from the AUTHORIZED ticket's own project configuration (never "the first project of the team"), so the runner, the policy pin and the controller always agree. */
+  agents: (oc: OrchestrationCfg, projectId: string) => AgentRunner;
+  /** Trusted-policy guard for that same project. Required: a controller that cannot verify its own policy does not run. */
+  policy: (oc: OrchestrationCfg, projectId: string) => { pin(): Pinned };
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
@@ -58,7 +60,11 @@ export const isProtectedPath = (f: string) => PROTECTED_PREFIX.some((p) => f.sta
 type Auth = ReturnType<Orchestrator['authorize']>;
 
 export class Orchestrator {
+  private runs = new Map<string, { agents: AgentRunner; pinned: Pinned }>();
   constructor(private d: Deps) {}
+  private ag(m: Manifest) { return this.runs.get(m.runId)!.agents; }
+  /** Re-verifies the trusted policy NOW. Called inside every privileged closure, including each retry, so a long backoff cannot outlive the owner's authorization. */
+  private verifyPin(m: Manifest) { this.runs.get(m.runId)?.pinned.verify(); }
   private at() { return (this.d.now?.() ?? new Date()).toISOString(); }
   private log(l: string) { this.d.log?.(l); }
   private nap(ms: number) { return (this.d.sleep ?? ((t: number) => new Promise<void>((r) => setTimeout(r, t))))(ms); }
@@ -116,9 +122,10 @@ export class Orchestrator {
       const auth = this.authorize(ctx);
       const oc = auth.oc;
       // Fail closed: if the owner's policy cannot be verified (wrong owner/mode, inside an agent-reachable tree, binary swapped...), nothing starts.
-      try { pinned = this.d.policy.pin(); } catch (e) { throw new Rejected(`Trusted policy could not be verified (fail closed): ${e instanceof Error ? e.message : 'unknown'}`); }
+      const agents = this.d.agents(oc, auth.projectId);
+      try { pinned = this.d.policy(oc, auth.projectId).pin(); } catch (e) { throw new Rejected(`Trusted policy could not be verified (fail closed): ${e instanceof Error ? e.message : 'unknown'}`); }
       // Prove isolation + both CLIs (version, required flags) + their logins from inside the sandbox BEFORE the ticket is touched.
-      const pf = await this.d.agents.preflight();
+      const pf = await agents.preflight();
       if (!pf.ok) throw new Rejected(`Preflight failed (infrastructure; the ticket was not touched): ${pf.problems.join('; ')}`);
       await G.git(oc.repoPath, ['fetch', 'origin', oc.baseBranch]);
       const baseSha = await G.resolveRef(oc.repoPath, `origin/${oc.baseBranch}`);
@@ -131,10 +138,10 @@ export class Orchestrator {
         createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
       };
       m.clone = join(store.runDir(m), 'clone');
+      this.runs.set(runId, { agents, pinned });
       const protectedBase = await this.d.prs.baseProtected?.(oc.repo, oc.baseBranch).catch(() => undefined);
       this.save(store, m, 'accepted', { baseSha, preflight: pf.detail, baseBranchProtected: protectedBase ?? 'unknown', policyDigest: pinned.digest, authorizedBy: who.who ?? 'unknown' });
       // Leaving the unstarted state is what makes a second dispatch (by any controller) fail acceptance.
-      pinned.verify();
       await this.infra(store, m, 'linear-start', () => this.d.write.setState(ctx.id, auth.started.id));
       const after = await this.load(ticket);
       if (after.state.id !== auth.started.id) throw new Error(`Linear did not confirm the move to "${oc.startedState}" (shows "${after.state.name}")`);
@@ -153,7 +160,9 @@ export class Orchestrator {
   private async infra<T>(store: RunStore, m: Manifest, step: string, fn: () => Promise<T>): Promise<T> {
     const max = this.d.cfg.projects.find((p) => p.id === m.project)?.orchestration?.infraRetries ?? 2;
     for (let i = 0; ; i++) {
+      this.verifyPin(m);
       try { return await fn(); } catch (e) {
+        if (e instanceof PolicyError) throw e; // an authorization failure is never "transient"
         const detail = e instanceof Error ? e.message.slice(0, 300) : 'unknown error';
         this.recordInfra(store, m, step, detail);
         if (i >= max) throw new InfraError(step, detail);
@@ -188,7 +197,6 @@ export class Orchestrator {
       const bad = await this.importAndVerify(m, a, oc);
       if (bad) {
         a.failure = bad; this.save(store, m, 'attempt-failed', { attempt: n, reason: bad });
-        if (n === 0) return this.escalate(store, m, 'repairs-exhausted', `The first implementation attempt produced nothing acceptable: ${bad}`);
         findings = [controllerFinding(bad)]; ciFailure = undefined;
         if (n === MAX_REPAIRS) break;
         continue;
@@ -197,7 +205,6 @@ export class Orchestrator {
       startSha = sha;
 
       // 3. push, confirm the REMOTE has exactly this SHA, ensure a DRAFT PR, confirm GitHub's PR head is this SHA
-      pinned.verify();
       await this.infra(store, m, 'push', async () => {
         await G.pushRef(oc.repoPath, this.ref(m, n), m.branch);
         const remote = await G.remoteHead(oc.repoPath, m.branch);
@@ -208,8 +215,8 @@ export class Orchestrator {
           const pr = await this.d.prs.ensureDraft(m.repo, { branch: m.branch, base: m.baseBranch, title: `${m.ticket}: ${m.title}`.slice(0, 250), body: prBody(m) });
           m.pr = { ...pr, draft: true }; this.save(store, m, 'pr-created', { number: pr.number });
         }
-        const head = await this.d.prs.headSha(m.repo, m.pr.number);
-        if (head !== sha) throw new Error(`the pull request head is ${head.slice(0, 12)}, expected ${sha.slice(0, 12)}`);
+        const bad = prProblem(m, await this.d.prs.inspect(m.repo, m.pr.number), sha);
+        if (bad) throw new Error(bad);
       });
       await this.comment(store, m, a, A.implemented(m, a, this.at(), { files: a.files ?? 0, sha }));
 
@@ -256,9 +263,10 @@ export class Orchestrator {
     add('CI green on this SHA', a.ci?.state === 'success', a.ci ? a.ci.state : 'no CI result recorded');
     const remote = await G.remoteHead(oc.repoPath, m.branch);
     add('remote branch at this SHA', remote === sha, `remote ${remote?.slice(0, 12) ?? 'none'}`);
-    let prHead: string | undefined;
-    try { prHead = m.pr ? await this.d.prs.headSha(m.repo, m.pr.number) : undefined; } catch { /* reported below */ }
-    add('draft PR head at this SHA', prHead === sha, `PR head ${prHead?.slice(0, 12) ?? 'unreadable'}`);
+    let pr: PrState | undefined;
+    try { pr = m.pr ? await this.d.prs.inspect(m.repo, m.pr.number) : undefined; } catch { /* reported below */ }
+    add('draft PR head at this SHA', pr?.headSha === sha, `PR head ${pr?.headSha.slice(0, 12) ?? 'unreadable'}`);
+    add('PR is an open draft on the configured base', !!pr && !prProblem(m, pr, pr.headSha), pr ? (prProblem(m, pr, pr.headSha) ?? 'open, draft, right branches') : 'unreadable');
     add('all changed files attested', review.verdict === 'FAIL' || a.files === undefined || review.reviewedFiles.length >= a.files, `${review.reviewedFiles.length}/${a.files ?? '?'}`);
     let policyOk = true, policyWhy = 'unchanged since the run was accepted';
     try { pinned.verify(); } catch (e) { policyOk = false; policyWhy = e instanceof Error ? e.message : 'unverifiable'; }
@@ -270,7 +278,8 @@ export class Orchestrator {
 
   private async runClaude(store: RunStore, m: Manifest, a: AttemptRecord, oc: OrchestrationCfg, prompt: string, dir: string) {
     for (let i = 0; ; i++) {
-      const res = await this.d.agents.implement({ clone: m.clone, prompt, timeoutMs: oc.agentTimeoutMinutes * 60_000 });
+      this.verifyPin(m);
+      const res = await this.ag(m).implement({ clone: m.clone, prompt, timeoutMs: oc.agentTimeoutMinutes * 60_000 });
       const log = store.evidence(m, `${dir}/claude-output${i ? `-retry${i}` : ''}.txt`, logOf(res));
       a.agent = { exitCode: res.exitCode, timedOut: res.timedOut, log };
       const p = infraProblem(res);
@@ -320,7 +329,8 @@ export class Orchestrator {
       const before = G.hashDir(rdir);
       const prompt = reviewPrompt(ctx, sha, nonce);
       store.evidence(m, `attempt-${a.n}/codex-prompt${suffix}.txt`, prompt);
-      const res = await this.d.agents.review({ snapshot: rdir, outDir: out, prompt, schemaPath, timeoutMs: oc.agentTimeoutMinutes * 60_000 });
+      this.verifyPin(m);
+      const res = await this.ag(m).review({ snapshot: rdir, outDir: out, prompt, schemaPath, timeoutMs: oc.agentTimeoutMinutes * 60_000 });
       const rawRef = store.evidence(m, `attempt-${a.n}/codex-output${suffix}.txt`, logOf(res));
       const after = G.hashDir(rdir);
       this.removeTemp(store, m, rdir); this.removeTemp(store, m, out);
@@ -364,6 +374,7 @@ export class Orchestrator {
     catch (e) { store.event(m, this.at(), 'final-comment-failed', { error: e instanceof Error ? e.message : 'unknown' }); } // the transition already happened and is the authoritative signal
     await this.cleanup(store, m, auth.oc.repoPath, sha);
     store.release(m.ticket, m.runId);
+    this.runs.delete(m.runId);
     return m;
   }
 
@@ -387,10 +398,13 @@ export class Orchestrator {
     this.save(store, m, 'escalation-recorded', { blockedConfirmed: m.blockedConfirmed });
     await this.cleanup(store, m).catch(() => undefined);
     store.release(m.ticket, m.runId);
+    this.runs.delete(m.runId);
     return m;
   }
 
-  private async comment(store: RunStore, m: Manifest, a: AttemptRecord | undefined, body: string, _final = false) {
+  /** `recovery` = the escalation path: it must still be able to tell the owner even when policy verification is what failed. */
+  private async comment(store: RunStore, m: Manifest, a: AttemptRecord | undefined, body: string, recovery = false) {
+    if (!recovery) this.verifyPin(m);
     const text = clip(body, MAX_COMMENT - 200);
     let id: string | undefined;
     try { id = await this.d.write.createComment(m.issueId, text); } catch { id = await this.d.write.createComment(m.issueId, text); } // one retry, then the error propagates
@@ -432,6 +446,16 @@ export class Orchestrator {
   private state(store: RunStore, m: Manifest, s: Manifest['state'], data: Record<string, unknown> = {}) { m.state = s; this.save(store, m, `state:${s}`, data); }
 }
 
+/** The PR must be an open DRAFT from the run branch (this repo) onto the configured base, at the expected commit. */
+function prProblem(m: Manifest, st: PrState, sha: string): string | undefined {
+  if (st.headSha !== sha) return `the pull request head is ${st.headSha.slice(0, 12)}, expected ${sha.slice(0, 12)}`;
+  if (!st.open) return 'the pull request is no longer open';
+  if (!st.draft) return 'the pull request is no longer a draft (DevFlow only ever works against drafts)';
+  if (st.baseRef !== m.baseBranch) return `the pull request base is "${st.baseRef.slice(0, 60)}", expected "${m.baseBranch}"`;
+  if (st.headRef !== m.branch || (st.headRepo && st.headRepo !== m.repo)) return 'the pull request head is not the run branch of this repository';
+  return undefined;
+}
+
 // ------------------------------------------------------------------ prompts (controller-owned text; ticket text is quoted as data)
 const logOf = (r: { exitCode: number | null; signal: string | null; timedOut: boolean; truncated: boolean; stdout: string; stderr: string }) => `exit=${r.exitCode} signal=${r.signal} timedOut=${r.timedOut} truncated=${r.truncated}\n--- stdout ---\n${r.stdout}\n--- stderr ---\n${r.stderr}\n`;
 const controllerFinding = (why: string): Finding => ({ id: 'controller-1', severity: 'blocker', file: '-', title: 'Controller check failed', detail: why, evidence: why });
@@ -458,7 +482,7 @@ Rules:
 function repairPrompt(ctx: Ctx, m: Manifest, findings: Finding[], ci: string | undefined, n: number) {
   const list = findings.map((f) => `- [${f.severity}] ${f.id} ${f.file}${f.line ? `:${f.line}` : ''} — ${f.title}\n  ${f.detail}\n  evidence: ${f.evidence}`).join('\n');
   return `Repair attempt ${n} of ${MAX_REPAIRS} for ${ctx.identifier}: ${ctx.title}. You are in the same repository, branch \`${m.branch}\`.
-The previous commit was rejected. Fix exactly what is listed; do not widen scope.
+Your previous attempt was not accepted. Fix exactly what is listed; do not widen scope.
 
 ${ci ? `CI FAILED:\n${ci}\n` : ''}${list ? `INDEPENDENT REVIEW FINDINGS (from a different agent; verify each against the code before acting):\n${list}\n` : ''}
 Ticket specification:

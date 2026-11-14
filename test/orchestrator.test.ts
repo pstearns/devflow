@@ -152,7 +152,9 @@ describe('three failed repairs escalate', () => {
     const w = world({ scenario: 'no-commit' });
     const m = await w.orch.run('ATL-22');
     expect(m.state).toBe('escalated');
-    expect(m.reason).toMatch(/no new commit|nothing acceptable/);
+    expect(m.reasonClass).toBe('repairs-exhausted');
+    expect(m.attempts).toHaveLength(4); // the repair budget applies to an unusable first attempt too
+    expect(m.attempts.every((a) => /no new commit/.test(a.failure ?? ''))).toBe(true);
     expect(w.calls.review).toBe(0);
   });
 
@@ -301,6 +303,13 @@ describe('hardening: draft PR, retries, infrastructure vs repair, Blocked state'
     expect(m.infra[0]).toMatchObject({ step: 'claude' });
     expect(w.calls.implement).toBe(2);
   });
+  it('a provider usage-limit message is an infrastructure failure, not a code failure', async () => {
+    const { infraProblem } = await import('../server/orchestrator/agents.ts');
+    const r = (stdout: string, exitCode = 1) => ({ exitCode, signal: null, timedOut: false, stdout, stderr: '', truncated: false });
+    expect(infraProblem(r('{"terminal_reason":"api_error","result":"You\'ve hit your 5-hour limit · resets 6:10am (UTC)"}'))).toMatch(/environment failure/);
+    expect(infraProblem(r('', 0))).toBeUndefined();
+    expect(infraProblem(r('tests failed'))).toMatch(/exited abnormally/);
+  });
   it('a persistent Claude environment failure escalates as infrastructure with repairs untouched', async () => {
     const w = world({ scenario: 'infra-claude-always' });
     const m = await w.orch.run('ATL-22');
@@ -334,14 +343,6 @@ describe('hardening: draft PR, retries, infrastructure vs repair, Blocked state'
     expect(w.calls.review).toBe(2);
     expect(PASS_POSTED(w)).toBe(false);
     expect(stateOf(w)).toBe('Blocked');
-  });
-  it('a commit that edits .github/ is rejected as an implementation failure (the implementer may not rewrite its own CI)', async () => {
-    const w = world({ scenario: 'touch-ci' });
-    const m = await w.orch.run('ATL-22');
-    expect(m.attempts[0]!.failure).toMatch(/protected configuration\/CI\/agent-instruction files/);
-    expect(m.state).toBe('escalated'); // attempt 0 produced nothing acceptable
-    expect(w.ci.calls).toEqual([]);
-    expect(w.prs.created).toEqual([]);
   });
   it('escalation writes durable evidence, hashes it into the Linear comment, and moves the ticket to the configured Blocked state', async () => {
     const w = world({ scenario: 'never-fixes' });

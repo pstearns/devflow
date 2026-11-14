@@ -1,5 +1,7 @@
 # M1 live-agent runs (synthetic, disposable fixtures)
 
+> Runs A–D were made at commit `1236ef0`. After the independent Codex review (see PR description) seven defects were fixed in later commits; the real-CLI smoke run E below was repeated on the fixed code.
+
 Real Claude Code and real Codex, each inside the bubblewrap sandbox with a copy of the owner's own login. Nothing about the agents' answers was
 scripted. Everything around them was local and synthetic: a temp bare repo as `origin`, the synthetic Linear, an in-memory draft-PR service, and a
 CI that really ran `node --test` on each pushed SHA. No real Linear, GitHub, or production project was touched.
@@ -33,6 +35,8 @@ Codex ~62k tokens; 3 CI runs; 11 Linear comments; run directory 292 KB.
 | B | `cents` (helper doc/code mismatch) | Claude noticed the mismatch and fixed it itself; **PASS on first commit** | $0.235 | ~4.2k | 76 s |
 | C | `invoice2` (several subtle rules) | **PASS on first commit** | $0.285 | ~21.3k | 82 s |
 | D | `rounding2` | **FAIL → repair → FAIL → repair → PASS** (above) | $0.798 | ~62.4k | 265 s |
+
+| E | `cents`, re-run on the post-review code | Claude refused to run: the account had hit its **5-hour usage limit** (`terminal_reason: api_error`). The controller classified it `infrastructure`, retried 3×, consumed **no repair**, moved the ticket to Blocked and kept evidence. A real-world confirmation of the infra path; the post-fix real-CLI success run could not be repeated until the limit resets | $0.084 | – | 10 s |
 
 Fixtures B and C did not produce a FAIL: the implementer was simply good enough. D was the third fixture designed to make a defect objectively present
 and objectively fixable. Run A shows the escalation path with real agents.
