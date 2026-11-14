@@ -17,7 +17,7 @@ test added before it was closed. Rounds 1–9 reviewed commits `1236ef0`, `f4220
 | 8 | 1 | Medium | the staging sweep could delete a live long-running agent's login (age alone) → owner liveness record (PID + start time) |
 | 9 | 1 | Low | `chmod 000` on an agent's own home could defeat credential cleanup → permission-proof cleanup. **Verdict: APPROVE WITH CONDITIONS** |
 
-Trend: 7 → 5 → 5 → 4 → 5 → 1 → 6 → 1 → 1. Across all six rounds Codex reported **no demonstrated sandbox escape and no read of controller credentials by an agent**;
+Trend: 7 → 5 → 5 → 4 → 5 → 1 → 6 → 1 → 1. Across all nine rounds Codex reported **no demonstrated sandbox escape and no read of controller credentials by an agent**;
 the high-severity findings were authority/integrity gaps in the controller around the sandbox. The reviewer also repeatedly confirmed as sound: exact-SHA /
 fresh-nonce / changed-file-coverage validation, push destination and source restrictions, absence of any ready/merge API method, `O_NOFOLLOW` reads of agent
 output, and the credential write-back guards.
