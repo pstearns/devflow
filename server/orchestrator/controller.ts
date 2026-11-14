@@ -124,6 +124,7 @@ export class Orchestrator {
       if (active) throw new Rejected(`${ticket} already has a non-terminal run (${active.runId}, ${active.state})`);
       const ctx = await this.load(ticket); // authoritative read AFTER the lock
       const auth = this.authorize(ctx);
+      if (auth.projectId !== preAuth.projectId) throw new Rejected('the ticket moved to a different project while the run was being accepted');
       const oc = auth.oc;
       // Fail closed: if the owner's policy cannot be verified (wrong owner/mode, inside an agent-reachable tree, binary swapped...), nothing starts.
       const agents = this.d.agents(oc, auth.projectId);
@@ -131,7 +132,7 @@ export class Orchestrator {
       // Prove isolation + both CLIs (version, required flags) + their logins from inside the sandbox BEFORE the ticket is touched.
       const pf = await agents.preflight();
       if (!pf.ok) throw new Rejected(`Preflight failed (infrastructure; the ticket was not touched): ${pf.problems.join('; ')}`);
-      await G.git(oc.repoPath, ['fetch', 'origin', oc.baseBranch]);
+      await G.git(oc.repoPath, ['fetch', 'origin', oc.baseBranch], G.ambientEnv());
       const baseSha = await G.resolveRef(oc.repoPath, `origin/${oc.baseBranch}`);
       const who = await this.authorizer(ticket, auth.readyLabel);
       m = {
@@ -139,7 +140,7 @@ export class Orchestrator {
         branch: `devflow/${ticket.toLowerCase()}-${runId}`, clone: '', state: 'accepted', attempts: [], linearCommentIds: [], infra: [],
         linearStates: { startedId: auth.started.id, approvalId: auth.approval.id, blockedId: auth.blocked.id, blockedName: auth.blocked.name },
         policyDigest: pinned.digest, agents: { claude: pf.versions?.claude, codex: pf.versions?.codex }, authorizedBy: who.who,
-        createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
+        originalStateId: ctx.state.id, createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
       };
       m.clone = join(store.runDir(m), 'clone');
       this.runs.set(runId, { agents, pinned });
@@ -147,12 +148,14 @@ export class Orchestrator {
       this.save(store, m, 'accepted', { baseSha, preflight: pf.detail, baseBranchProtected: protectedBase ?? 'unknown', policyDigest: pinned.digest, authorizedBy: who.who ?? 'unknown' });
       // Leaving the unstarted state is what makes a second dispatch (by any controller) fail acceptance.
       await this.infra(store, m, 'linear-start', async () => {
-        this.authorize(await this.load(ticket)); // the owner may have revoked or moved the ticket while preflight and git were running
+        const fresh = this.authorize(await this.load(ticket)); // the owner may have revoked or moved the ticket while preflight and git were running
+        if (fresh.projectId !== auth.projectId) throw new Rejected('the ticket moved to a different project before the run started');
         this.verifyPin(m!);
         await this.d.write.setState(ctx.id, auth.started.id);
       });
       const after = await this.load(ticket);
       if (after.state.id !== auth.started.id) throw new Error(`Linear did not confirm the move to "${oc.startedState}" (shows "${after.state.name}")`);
+      m.startConfirmed = true; this.save(store, m, 'start-confirmed');
       await this.comment(store, m, undefined, A.started(m, this.at(), { authorizer: who.who, authorizedAt: who.at, readyLabel: auth.readyLabel, scope: auth.scopeText, claude: pf.versions?.claude, codex: pf.versions?.codex, policyDigest: pinned.digest, baseProtected: protectedBase ?? 'unknown', operator: 'DevFlow controller' }));
       await G.initClone(oc.repoPath, `refs/remotes/origin/${oc.baseBranch}`, m.clone, m.branch);
       return await this.loop(store, m, ctx, auth, pinned);
@@ -317,7 +320,9 @@ export class Orchestrator {
     const files = await G.changedFiles(oc.repoPath, m.baseSha, sha);
     a.files = files.length;
     if (!files.length) return 'The branch has no changes relative to the base';
-    const prot = files.filter(isProtectedPath);
+    let touched: string[];
+    try { touched = await G.touchedByCommits(oc.repoPath, a.startSha, sha); } catch (e) { return `The new commits could not be inspected: ${e instanceof Error ? e.message.slice(0, 100) : 'error'}`; }
+    const prot = [...new Set([...files, ...touched])].filter(isProtectedPath); // every path ANY new commit touched, not only the final difference
     if (prot.length) return `The commit modifies protected configuration/CI/agent-instruction files (${prot.slice(0, 3).join(', ')}); the implementer may not change what verifies or instructs it`;
     return undefined;
   }
@@ -387,7 +392,7 @@ export class Orchestrator {
     const sc = resolveScope(this.d.cfg, live.teamKey, live.project);
     if (!sc.writeAllowed || sc.configProject?.id !== m.project) return 'the ticket is no longer in the project scope that authorized this run';
     if (!hasReady(live, sc.workflow)) return `the "${sc.workflow.readyLabel}" approval label was removed (execution authorization revoked)`;
-    if (live.state.id !== m.linearStates.startedId && live.state.type !== 'unstarted') return `the ticket was moved to "${live.state.name}" in Linear during the run`;
+    if (live.state.id !== (m.startConfirmed ? m.linearStates.startedId : m.originalStateId)) return `the ticket was moved to "${live.state.name}" in Linear during the run`;
     return undefined;
   }
 
@@ -541,7 +546,7 @@ ${ci ? `CI FAILED:\n${ci}\n` : ''}${list ? `INDEPENDENT REVIEW FINDINGS (from a 
 Ticket specification:
 ${ctx.description}
 
-Commit your fix as a NEW commit on this branch (do not amend or rewrite history). Run the tests. Leave nothing uncommitted. Do not modify CI definitions, agent/tool configuration or instruction files. Do not push.`;
+Commit your fix as a NEW commit on this branch (do not amend or rewrite history that was already accepted). EXCEPTION: if a commit was rejected for touching a protected file (.github/, .env*, agent or tool configuration), that commit was never pushed and no commit in the branch may touch such a file even if a later commit reverts it: rebuild the branch from the base commit (\`git reset --soft ${m.baseSha}\` and commit again without those files). Run the tests. Leave nothing uncommitted. Do not modify CI definitions, agent/tool configuration or instruction files. Do not push.`;
 }
 function reviewPrompt(ctx: Ctx, sha: string, nonce: string) {
   return `You are an INDEPENDENT code reviewer. You are read-only: do not attempt to modify anything.

@@ -11,6 +11,7 @@ import { CliAgents, CLAUDE_FLAGS, CODEX_FLAGS, implementerSandbox, readAgentFile
 import { bwrapArgs, bwrapUsable, stageHome } from '../server/orchestrator/sandbox.ts';
 import * as AUDIT from '../server/orchestrator/audit.ts';
 import { GithubPrs } from '../server/orchestrator/pr.ts';
+import { GithubCi } from '../server/orchestrator/ci.ts';
 import { PolicyError, verifyPolicy } from '../server/orchestrator/policy.ts';
 import { isProtectedPath } from '../server/orchestrator/controller.ts';
 import * as G from '../server/orchestrator/git.ts';
@@ -262,6 +263,8 @@ describe('Codex review findings (regressions)', () => {
     expect(w.ci.calls).toHaveLength(1); // the rejected commit was never pushed, CI'd or reviewed
     const done = await import('node:fs').then((f) => f.readFileSync(join(runDir(w), 'attempt-1', 'claude-prompt.txt'), 'utf8'));
     expect(done).toContain('protected configuration');
+    expect(done).toContain('git reset --soft');
+    expect(execFileSync('git', ['log', '--format=', '--name-only', `${m.baseSha}..${m.approvedSha}`], { cwd: w.origin, encoding: 'utf8' }).trim().split('\n').filter((f) => f.startsWith('.github'))).toEqual([]); // no pushed commit ever touched it
   });
 });
 
@@ -423,6 +426,87 @@ describe('Codex review round 4 (regressions)', () => {
     for (const secret of ['/home/alice', 'auth.json', 'sk-test-secret-value', 'eyJhbGci', 'github_pat_11', 'abcdef0123456789abcdef', 'Zm9vYmFy']) expect(out, secret).not.toContain(secret);
     expect(out).toContain(sha); expect(out).toContain('normal words stay');
     expect(AUDIT.line(prose, 2000)).not.toMatch(/sk-test|eyJhbGci|github_pat/);
+  });
+});
+
+describe('Codex review round 5 (regressions)', () => {
+  const gh = (pages: Record<string, unknown>) => ({ get: async (path: string, params: Record<string, string | number> = {}) => { const k = `${path}?page=${params.page ?? 1}`; if (!(k in pages) && !(path in pages)) throw new Error(`unexpected ${k}`); const v = pages[k] ?? pages[path]; if (v instanceof Error) throw v; return v; } }) as never;
+  const run = (n: number, ok = true) => Array.from({ length: n }, (_, i) => ({ name: `c${i}`, status: 'completed', conclusion: ok ? 'success' : 'failure' }));
+  it('CI snapshots paginate check runs: a failure on page 2 is seen; a partial list is an error, never green', async () => {
+    const base = '/repos/o/r/commits/' + 'a'.repeat(40);
+    const pages = { [`${base}/check-runs?page=1`]: { total_count: 101, check_runs: run(100) }, [`${base}/check-runs?page=2`]: { total_count: 101, check_runs: [{ name: 'late', status: 'completed', conclusion: 'failure' }] }, [`${base}/status`]: { total_count: 0, statuses: [] } };
+    expect((await new GithubCi(gh(pages)).snapshot('o/r', 'a'.repeat(40), { required: [] })).state).toBe('failure');
+    const partial = { ...pages, [`${base}/check-runs?page=2`]: { total_count: 101, check_runs: [] } };
+    await expect(new GithubCi(gh(partial)).snapshot('o/r', 'a'.repeat(40), { required: [] })).rejects.toThrow(/incomplete check-run list/);
+  });
+  it('external CI reported as a commit status counts: a failing status blocks even when every Actions check is green', async () => {
+    const base = '/repos/o/r/commits/' + 'a'.repeat(40);
+    const pages = { [`${base}/check-runs?page=1`]: { total_count: 1, check_runs: run(1) }, [`${base}/status`]: { total_count: 1, statuses: [{ context: 'ci/external', state: 'failure' }] } };
+    const r = await new GithubCi(gh(pages)).snapshot('o/r', 'a'.repeat(40), { required: [] });
+    expect(r.state).toBe('failure'); expect(r.detail).toMatch(/ci\/external/);
+    const ok = { ...pages, [`${base}/status`]: { total_count: 1, statuses: [{ context: 'ci/external', state: 'success' }] } };
+    expect((await new GithubCi(gh(ok)).snapshot('o/r', 'a'.repeat(40), { required: [] })).state).toBe('success');
+    const incomplete = { ...pages, [`${base}/status`]: { total_count: 150, statuses: [{ context: 'x', state: 'success' }] } };
+    await expect(new GithubCi(gh(incomplete)).snapshot('o/r', 'a'.repeat(40), { required: [] })).rejects.toThrow(/incomplete commit-status list/);
+  });
+  it('a protected file touched and then REVERTED inside the new history is still rejected (every commit is inspected)', async () => {
+    const w = world({ seed: { 'README.md': 'x\n' } });
+    const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: w.repo, encoding: 'utf8' }).trim();
+    const g = (...a: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: w.repo, encoding: 'utf8' });
+    mkdirSync(join(w.repo, '.github'), { recursive: true }); writeFileSync(join(w.repo, '.github', 'ci.yml'), 'evil\n'); g('add', '-A'); g('commit', '-q', '-m', 'ci');
+    g('rm', '-rq', '.github'); writeFileSync(join(w.repo, 'app.txt'), 'app\n'); g('add', '-A'); g('commit', '-q', '-m', 'revert and app');
+    const sha = g('rev-parse', 'HEAD').trim();
+    expect(await G.changedFiles(w.repo, base, sha)).toEqual(['app.txt']); // the final difference looks clean ...
+    expect((await G.touchedByCommits(w.repo, base, sha)).filter(isProtectedPath)).toEqual(['.github/ci.yml']); // ... the history does not
+  });
+  it('privileged git ignores the owner’s global/system git config: a configured filter cannot be selected by repository .gitattributes', async () => {
+    const w = world();
+    const gcfg = join(w.root, 'gitconfig'), marker = join(w.root, 'FILTER-RAN');
+    writeFileSync(gcfg, `[filter "evil"]\n\tsmudge = sh -c 'touch ${marker}; cat'\n\tclean = cat\n\trequired = true\n`);
+    const saved = process.env.GIT_CONFIG_GLOBAL, savedNs = process.env.GIT_CONFIG_NOSYSTEM;
+    process.env.GIT_CONFIG_GLOBAL = gcfg; // simulate the owner's ~/.gitconfig
+    try {
+      writeFileSync(join(w.repo, '.gitattributes'), '* filter=evil\n'); writeFileSync(join(w.repo, 'f.txt'), 'bytes\r\n');
+      execFileSync('git', ['-c', 'filter.evil.clean=cat', '-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '-A'], { cwd: w.repo }); execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'attrs'], { cwd: w.repo, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+      rmSync(marker, { force: true });
+      const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: w.repo, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } }).trim();
+      await G.initClone(w.repo, 'HEAD', join(w.root, 'cl'), 'devflow/atl-1-abcdef1');
+      await G.exportTree(w.repo, sha, join(w.root, 'exp'));
+      expect(existsSync(marker)).toBe(false);
+      expect(readFileSync(join(w.root, 'exp', 'f.txt'), 'utf8')).toBe('bytes\r\n'); // exact committed bytes, no conversion
+    } finally { if (saved === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = saved; if (savedNs === undefined) delete process.env.GIT_CONFIG_NOSYSTEM; }
+  });
+  it('exportTree preserves symlinks and the executable bit, skips submodule pointers, and refuses a tree that tries to leave the directory', async () => {
+    const w = world();
+    const g = (...a: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: w.repo, encoding: 'utf8' });
+    writeFileSync(join(w.repo, 'run.sh'), '#!/bin/sh\n', { mode: 0o755 }); execFileSync('ln', ['-s', '../outside', join(w.repo, 'link')]); g('add', '-A'); g('commit', '-q', '-m', 'modes');
+    const sha = g('rev-parse', 'HEAD').trim();
+    await G.exportTree(w.repo, sha, join(w.root, 'e1'));
+    expect(statSync(join(w.root, 'e1', 'run.sh')).mode & 0o111).not.toBe(0);
+    expect(execFileSync('readlink', [join(w.root, 'e1', 'link')], { encoding: 'utf8' }).trim()).toBe('../outside'); // kept as a link, not followed
+    // a hand-built tree with a ".." component is refused outright (it cannot be committed normally; this is what a hostile bundle could carry)
+    const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: w.repo, input: 'x', encoding: 'utf8' }).trim();
+    const sub = execFileSync('git', ['mktree'], { cwd: w.repo, input: `100644 blob ${blob}\tx\n`, encoding: 'utf8' }).trim();
+    const bad = execFileSync('git', ['mktree'], { cwd: w.repo, input: `040000 tree ${sub}\t..\n`, encoding: 'utf8' }).trim();
+    const c = execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit-tree', bad, '-m', 'evil'], { cwd: w.repo, encoding: 'utf8' }).trim();
+    await expect(G.exportTree(w.repo, c, join(w.root, 'e2'))).rejects.toThrow(/suspicious path/);
+    expect(existsSync(join(w.root, 'x'))).toBe(false);
+  });
+  it('the start re-check pins the PROJECT: a ticket moved to a different authorized project is refused, not run with the old project’s repo', async () => {
+    let w!: ReturnType<typeof makeWorld>;
+    w = world({ scenario: 'correct-first', second: true, onLinearRead: (n) => { if (n === 3) w.issue().project = 'lp-ATL'; } }); // 'Atlas' = the first project; the ticket began in 'Atlas Labs' (second)
+    const m = await w.orch.run('ATL-22');
+    expect(m.reasonClass).toBe('ticket-changed');
+    expect(m.reason).toMatch(/different project/);
+    expect(w.calls.implement).toBe(0);
+    expect(w.f.store.mutations.filter((x) => x.op === 'IssueUpdate')).toHaveLength(0);
+  });
+  it('after the start is confirmed, an owner reset to Todo is respected: escalation does not overwrite it', async () => {
+    const w = world({ scenario: 'correct-first', ci: 'timeout', wrapAgents: (inner) => ({ preflight: () => inner.preflight(), review: inner.review, implement: async (o) => { const r = await inner.implement(o); w.issue().state = 'Todo'; return r; } }) });
+    const m = await w.orch.run('ATL-22');
+    expect(m.reasonClass).toBe('ci-timeout');
+    expect(w.issue().state).toBe('Todo'); // not Blocked
+    expect(w.comments().at(-1)).toContain('left exactly as you set it');
   });
 });
 

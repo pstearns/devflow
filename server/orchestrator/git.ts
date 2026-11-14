@@ -1,11 +1,19 @@
 // Thin, shell-free git helpers. Every call is execFile with an argument array: no string is ever interpreted by a shell.
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join, sep } from 'node:path';
 import { RUN_BRANCH_RE } from './types.ts';
 
-export function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env, maxBuffer = 64 * 1024 * 1024): Promise<string> {
+/**
+ * Environment for every git call that only reads or rewrites local objects. It ignores the user's global and system git configuration, so no
+ * filter driver, credential helper or alias defined there can be selected by repository content (.gitattributes) or run by this process.
+ * Only network operations that need the owner's credentials (push, ls-remote, fetch origin) pass the ambient environment explicitly.
+ */
+export const cleanEnv = (extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({ ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', ...extra });
+export const ambientEnv = (): NodeJS.ProcessEnv => ({ ...process.env, GIT_TERMINAL_PROMPT: '0' });
+
+export function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = cleanEnv(), maxBuffer = 64 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile('git', args, { cwd, env, maxBuffer, encoding: 'utf8' }, (err, stdout, stderr) => {
       if (err) reject(new Error(`git ${args[0]} failed: ${(stderr || err.message).trim().slice(0, 500)}`));
@@ -37,7 +45,7 @@ export async function lineCount(cwd: string, sha: string, file: string): Promise
 }
 /** SHA of a branch on origin, or undefined if it does not exist. Asks the remote, never a possibly stale local ref. */
 export async function remoteHead(cwd: string, branch: string) {
-  const out = (await git(cwd, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`])).trim();
+  const out = (await git(cwd, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], ambientEnv())).trim();
   return out ? out.split(/\s+/)[0] : undefined;
 }
 
@@ -58,9 +66,9 @@ export async function initClone(repo: string, baseRef: string, clone: string, br
  * paths dangle) and copied out through a verified regular-file read. Hooks are disabled on the command line for the fetch regardless.
  */
 export async function importBundle(repo: string, bundleFile: string, branch: string, ref: string) {
-  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1' };
+  const env = cleanEnv();
   await git(repo, ['-c', 'core.hooksPath=/dev/null', 'bundle', 'verify', bundleFile], env); // checks prerequisites are in OUR repo and the file is well-formed
-  await git(repo, ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'fetch', '-q', '--no-tags', '--no-write-fetch-head', bundleFile, `+refs/heads/${branch}:${ref}`], env);
+  await git(repo, ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'transfer.fsckObjects=true', '-c', 'fetch.fsckObjects=true', 'fetch', '-q', '--no-tags', '--no-write-fetch-head', bundleFile, `+refs/heads/${branch}:${ref}`], env);
   return resolveRef(repo, ref);
 }
 export const deleteRef = (repo: string, ref: string) => git(repo, ['update-ref', '-d', ref]).catch(() => '');
@@ -69,21 +77,60 @@ export function pushRef(repo: string, ref: string, branch: string) {
   // Feature-branch-only writes, enforced here and not just by remote protection: no other destination name can be pushed, ever.
   if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to push: "${branch.slice(0, 80)}" is not a DevFlow run branch (devflow/<ticket>-<run>)`);
   if (!/^refs\/devflow\/[A-Za-z0-9]+\/attempt-\d$/.test(ref)) throw new Error('refusing to push: source must be a private refs/devflow/<run>/attempt-N ref');
-  return git(repo, ['push', '--no-follow-tags', 'origin', `${ref}:refs/heads/${branch}`]); // never --force
+  return git(repo, ['push', '--no-follow-tags', 'origin', `${ref}:refs/heads/${branch}`], ambientEnv()); // never --force; the only call that uses the owner's git credentials
+}
+
+function blobs(repo: string, oids: string[]): Promise<Buffer[]> {
+  return new Promise((resolveP, reject) => {
+    const child = spawn('git', ['cat-file', '--batch'], { cwd: repo, env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
+    const chunks: Buffer[] = []; let total = 0;
+    child.stdout.on('data', (d: Buffer) => { total += d.length; if (total > 512 * 1024 * 1024) { child.kill(); reject(new Error('tree too large to export')); } else chunks.push(d); });
+    child.on('error', reject);
+    child.on('close', () => {
+      const buf = Buffer.concat(chunks), out: Buffer[] = []; let off = 0;
+      for (const oid of oids) {
+        const nl = buf.indexOf(0x0a, off); if (nl < 0) return reject(new Error('git cat-file ended early'));
+        const m = /^([0-9a-f]{40}) blob (\d+)$/.exec(buf.subarray(off, nl).toString('utf8'));
+        if (!m || m[1] !== oid) return reject(new Error('unexpected git cat-file output'));
+        const size = Number(m[2]); out.push(buf.subarray(nl + 1, nl + 1 + size)); off = nl + 1 + size + 1;
+      }
+      resolveP(out);
+    });
+    child.stdin.end(`${oids.join('\n')}\n`);
+  });
 }
 
 /**
- * Exports the exact tree of `sha` (no .git, no history) into dest. Uses a temporary index + checkout-index rather than `git archive`,
- * because archive honours in-tree .gitattributes `export-ignore`: a committed file could hide itself from the reviewer.
+ * Exports the exact committed bytes of `sha` (no .git, no history, no conversion) into dest by reading tree and blob OBJECTS directly.
+ * No checkout machinery runs, so no filter, smudge/process driver, eol or ident rewriting, or `export-ignore` can alter or hide anything,
+ * whatever the repository's .gitattributes say. Paths come from agent-influenced trees, so each is validated before it is written.
  */
 export async function exportTree(repo: string, sha: string, dest: string) {
   mkdirSync(dest, { recursive: true, mode: 0o700 });
-  const idx = join(dest, '..', `.index-${process.pid}-${Date.now()}`);
-  const env = { ...process.env, GIT_INDEX_FILE: idx, GIT_CONFIG_NOSYSTEM: '1' };
-  try {
-    await git(repo, ['read-tree', sha], env);
-    await git(repo, ['-c', 'core.attributesFile=/dev/null', 'checkout-index', '-a', '-f', `--prefix=${dest}/`], env);
-  } finally { rmSync(idx, { force: true }); }
+  const root = realpathSync(dest);
+  const rows = (await git(repo, ['ls-tree', '-r', '-z', '--full-tree', sha])).split('\0').filter(Boolean).flatMap((row) => {
+    const m = /^(\d{6}) (blob|commit) ([0-9a-f]{40})\t([\s\S]+)$/.exec(row);
+    return m ? [{ mode: m[1]!, type: m[2]!, oid: m[3]!, path: m[4]! }] : [];
+  }).filter((r) => r.type === 'blob'); // submodule pointers have no content to export
+  const data = rows.length ? await blobs(repo, rows.map((r) => r.oid)) : [];
+  rows.forEach((r, i) => {
+    const segs = r.path.split('/');
+    if (r.path.startsWith('/') || segs.some((x) => x === '' || x === '.' || x === '..' || x.toLowerCase() === '.git' || x.includes('\0'))) throw new Error(`refusing to export suspicious path "${r.path.slice(0, 80)}"`);
+    const target = join(root, r.path);
+    mkdirSync(join(target, '..'), { recursive: true, mode: 0o700 });
+    if (!realpathSync(join(target, '..')).startsWith(root + sep) && realpathSync(join(target, '..')) !== root) throw new Error('refusing to write outside the export directory');
+    if (r.mode === '120000') symlinkSync(data[i]!.toString('utf8'), target);
+    else writeFileSync(target, data[i]!, { mode: r.mode === '100755' ? 0o755 : 0o644 });
+  });
+}
+
+/** Every path touched by ANY commit in start..sha (merge commits diffed against each parent), so a change made and reverted inside the history is still seen. */
+export async function touchedByCommits(cwd: string, start: string, sha: string, max = 300): Promise<string[]> {
+  const revs = (await git(cwd, ['rev-list', `${start}..${sha}`])).split('\n').filter(Boolean);
+  if (revs.length > max) throw new Error(`too many new commits (${revs.length} > ${max})`);
+  const out = new Set<string>();
+  for (const c of revs) for (const f of (await git(cwd, ['diff-tree', '--no-commit-id', '--name-only', '-r', '-m', '--root', '--no-renames', '-z', c])).split('\0').filter(Boolean)) out.add(f);
+  return [...out];
 }
 
 /** Content hash of a directory (names, modes, bytes, symlink targets). Used to prove the reviewer changed nothing. */

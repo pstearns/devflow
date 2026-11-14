@@ -1,8 +1,8 @@
 // CI evidence for an exact SHA, read from GitHub (GET only, via the existing client). Missing or pending evidence is never a pass.
 import type { GithubClient } from '../github.ts';
-import { normalizeCheckRuns, normalizeRuns } from '../github.ts';
+import { normalizeCheckRuns, normalizeCommitStatuses, normalizeRuns } from '../github.ts';
 import type { CheckItem } from '../../shared/types.ts';
-import { SourceError } from '../util.ts';
+import { SourceError, isObj } from '../util.ts';
 
 export interface CiResult { state: 'success' | 'failure' | 'timeout'; detail: string; checks: { name: string; state: string; url?: string }[] }
 export interface CiProvider {
@@ -29,13 +29,36 @@ export function evaluateChecks(items: CheckItem[], required: string[]): { state:
 export class GithubCi implements CiProvider {
   constructor(private gh: Getter, private o: { pollMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number } = {}) {}
 
+  /** ALL check runs for the SHA (paginated; a partial list is an error, never "green") plus the combined commit statuses (external CI). */
   private async items(repo: string, sha: string): Promise<CheckItem[]> {
     try {
-      return normalizeCheckRuns(await this.gh.get(`/repos/${repo}/commits/${sha}/check-runs`, { per_page: 100 }));
+      const out: CheckItem[] = [];
+      let seen = 0, total = Infinity;
+      for (let page = 1; seen < total; page++) {
+        if (page > 20) throw new SourceError('invalid', 'too many check runs to read completely: refusing to treat partial CI evidence as green');
+        const raw = await this.gh.get(`/repos/${repo}/commits/${sha}/check-runs`, { per_page: 100, page });
+        const list = isObj(raw) && Array.isArray(raw.check_runs) ? raw.check_runs : [];
+        total = isObj(raw) && typeof raw.total_count === 'number' ? raw.total_count : list.length;
+        seen += list.length; out.push(...normalizeCheckRuns({ check_runs: list }));
+        if (!list.length) break;
+      }
+      if (seen < total) throw new SourceError('invalid', 'incomplete check-run list: refusing to treat partial CI evidence as green');
+      try {
+        const st = await this.gh.get(`/repos/${repo}/commits/${sha}/status`, { per_page: 100 });
+        const sl = isObj(st) && Array.isArray(st.statuses) ? st.statuses : [];
+        if (isObj(st) && typeof st.total_count === 'number' && st.total_count > sl.length) throw new SourceError('invalid', 'incomplete commit-status list: refusing to treat partial CI evidence as green');
+        out.push(...normalizeCommitStatuses({ statuses: sl }));
+      } catch (e) {
+        if (!(e instanceof SourceError) || e.kind !== 'auth') throw e;
+        out.push({ name: 'commit-statuses', state: 'unknown', rawStatus: 'unreadable', source: 'commit_status' }); // token cannot read them: only matters when no required checks are named
+      }
+      return out;
     } catch (e) {
       if (!(e instanceof SourceError) || e.kind !== 'auth') throw e;
       // Token cannot read check runs: fall back to the latest workflow run per workflow for exactly this head SHA.
-      const runs = normalizeRuns(await this.gh.get(`/repos/${repo}/actions/runs`, { head_sha: sha, per_page: 50 })).filter((r) => r.sha === sha);
+      const raw = await this.gh.get(`/repos/${repo}/actions/runs`, { head_sha: sha, per_page: 100 });
+      if (isObj(raw) && typeof raw.total_count === 'number' && Array.isArray(raw.workflow_runs) && raw.total_count > raw.workflow_runs.length) throw new SourceError('invalid', 'incomplete workflow-run list: refusing to treat partial CI evidence as green');
+      const runs = normalizeRuns(raw).filter((r) => r.sha === sha);
       const latest = new Map<string, (typeof runs)[number]>();
       for (const r of runs.sort((a, b) => (a.at ?? '').localeCompare(b.at ?? ''))) latest.set(r.name, r);
       return [...latest.values()].map((r): CheckItem => ({

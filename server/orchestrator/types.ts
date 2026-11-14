@@ -32,6 +32,7 @@ export interface Manifest {
   pr?: { number: number; url: string; draft: true }; linearStates: { startedId: string; approvalId: string; blockedId: string; blockedName: string }; blockedConfirmed?: boolean;
   infra: InfraEvent[]; escalationEvidence?: string;
   gate?: { name: string; ok: boolean; detail: string }[];
+  originalStateId: string; startConfirmed?: boolean;
   policyDigest: string; agents: { claude?: string; codex?: string }; authorizedBy?: string;
   attempts: AttemptRecord[]; approvedSha?: string; linearCommentIds: string[];
   createdAt: string; updatedAt: string; cleanup: { clone: 'pending' | 'removed' | 'kept'; note?: string };

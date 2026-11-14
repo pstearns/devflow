@@ -30,9 +30,10 @@ if (!repair) {
 } else if (scenario === 'never-fixes' || scenario === 'touch-ci-always') {
   writeFileSync('src/slugify.mjs', BUGGY + `// repair try ${Date.now()}\n`);
 } else {
+  if (scenario === 'touch-ci') execFileSync('git', ['reset', '-q', '--hard', 'HEAD~1']); // rebuild the unpushed branch WITHOUT the forbidden file in any commit
+  mkdirSync('src', { recursive: true }); mkdirSync('test', { recursive: true });
   writeFileSync('src/slugify.mjs', FIXED);
   writeFileSync('test/slugify.test.mjs', test('hello-world'));
-  if (scenario === 'touch-ci') execFileSync('git', ['rm', '-rq', '--ignore-unmatch', '.github']); // the repair removes the forbidden file again
 }
 if (scenario === 'symlink-clone') { symlinkSync('..', 'escape-link'); symlinkSync('/etc', 'abs-link'); } // untracked links out of the clone
 if (scenario === 'no-commit') process.exit(0);
