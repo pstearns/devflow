@@ -1,6 +1,6 @@
 # M1 live-agent runs (synthetic, disposable fixtures)
 
-> Runs A–D were made at commit `1236ef0`. After the independent Codex review (see PR description) seven defects were fixed in later commits; the real-CLI smoke run E below was repeated on the fixed code.
+> Runs A–D were made at commit `1236ef0`. Run E hit the account's usage limit. **Run F below is the regression on the FINAL code** (commit `18e93b3`, after nine independent review rounds), against the same fixture as Run D.
 
 Real Claude Code and real Codex, each inside the bubblewrap sandbox with a copy of the owner's own login. Nothing about the agents' answers was
 scripted. Everything around them was local and synthetic: a temp bare repo as `origin`, the synthetic Linear, an in-memory draft-PR service, and a
@@ -38,6 +38,8 @@ Codex ~62k tokens; 3 CI runs; 11 Linear comments; run directory 292 KB.
 
 | E | `cents`, re-run on the post-review code | Claude refused to run: the account had hit its **5-hour usage limit** (`terminal_reason: api_error`). The controller classified it `infrastructure`, retried 3×, consumed **no repair**, moved the ticket to Blocked and kept evidence. A real-world confirmation of the infra path; the post-fix real-CLI success run could not be repeated until the limit resets | $0.084 | – | 10 s |
 
+| F | `rounding2`, final code `18e93b3` | **FAIL → repair → FAIL → repair → FAIL → repair → PASS** (3 repairs, the maximum) with every gate green; 14 comments; no infrastructure retries | $1.043 | ~86.8k | 315 s |
+
 Fixtures B and C did not produce a FAIL: the implementer was simply good enough. D was the third fixture designed to make a defect objectively present
 and objectively fixable. Run A shows the escalation path with real agents.
 
@@ -59,3 +61,19 @@ and objectively fixable. Run A shows the escalation path with real agents.
 
 The full ordered trail is `audit-trail.md` in the retained evidence directory. Comments contain no host paths, environment, or credentials; evidence
 is referenced relative to the runs directory.
+
+## Run F in detail: final-code regression (commit `18e93b3`)
+
+Run `mwfuv466fb7846`, branch `devflow/atl-22-mwfuv466fb7846`, base `0da89cf85bf8e5cd6fb4c242df0201729f4c8397`, approved SHA `70dbd6f213da9f4a55e6783fff2c0e1620686024`. Real Claude 2.1.316 and real Codex 0.169.0-alpha.11.1 in the sandbox; nothing scripted or mocked.
+
+| Attempt | Commit (parent) | CI | Codex | Finding |
+|---|---|---|---|---|
+| initial | `7fbdafac3c26` (`0da89cf85bf8`) | success | **FAIL** | `roundCents(Number(str))` with `str = '100000000000000.005'` returns 100000000000000, correct value is …0.01 |
+| repair 1 | `545e7dfc5c37` | success | **FAIL** | `BigInt(Math.round(unitPrice * 1000))` already contains floating-point error: a 1 µ-dollar difference returns 1.02 not 1 |
+| repair 2 | `db7d22df89ac` | success | **FAIL** | `String(n)` vs `BigInt(n)` mismatch for large integer prices: returns -28 instead of 0 |
+| repair 3 | `70dbd6f213da` | success | **PASS** | none |
+
+Gate on the approved SHA (all ✅): review is for this SHA · CI green · CI still green when re-read · remote branch at this SHA · draft PR head at this SHA · PR is an
+open draft on the configured base · all changed files attested · trusted policy intact. Ticket → `In Review`, state `awaiting-owner`, clone removed, no merge, no
+infrastructure retries. Usage (CLI-reported): wall clock 315 s, Claude 198 s API time, ~583k tokens incl. cache, $1.043; Codex ~86.8k tokens; 4 CI runs; 14 Linear comments;
+run directory 376 KB. After the run: agent logins intact (`claude auth status` logged in, `codex login status` logged in), zero staging directories or owner records left.
