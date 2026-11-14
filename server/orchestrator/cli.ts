@@ -15,6 +15,7 @@ import { Orchestrator, Rejected } from './controller.ts';
 import { PolicyError, PolicyGuard } from './policy.ts';
 import { DuplicateRun, RunStore } from './manifest.ts';
 import { prune, verify } from './retention.ts';
+import { sweepStaleStaging } from './sandbox.ts';
 import { TERMINAL } from './types.ts';
 
 const die = (msg: string, code = 1): never => { console.error(`DevFlow orchestrate: ${msg}`); process.exit(code); };
@@ -29,6 +30,7 @@ const ticket = (maintenance ? '' : ticketRaw!).toUpperCase();
 const here = dirname(fileURLToPath(import.meta.url));
 const root = [resolve(here, '../..'), resolve(here, '../../..')].find((d) => existsSync(resolve(d, 'package.json')) && existsSync(resolve(d, 'server'))) ?? die('cannot locate the DevFlow directory');
 process.chdir(root);
+const swept = sweepStaleStaging(); if (swept.length) console.warn(`DevFlow: removed ${swept.length} stale agent staging director${swept.length === 1 ? 'y' : 'ies'} left by an interrupted run`);
 const warn = loadEnvFile(resolve(root, '.env'));
 if (warn) console.warn(`DevFlow warning: ${warn}`);
 const loaded = loadConfig(process.env, root);

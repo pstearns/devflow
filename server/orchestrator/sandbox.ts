@@ -4,7 +4,7 @@
 // Network stays on because both agents must reach their model API (see README: egress is not filtered).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, constants as fsc } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, constants as fsc } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -91,6 +91,24 @@ export function readAgentFile(path: string, maxBytes: number, mustStayInside?: s
 
 // ---------------------------------------------------------------- credentials: copies, never the user's real home
 const shaOf = (b: string | Buffer) => createHash('sha256').update(b).digest('hex');
+
+/**
+ * A process killed mid-run (SIGKILL, power loss) never reaches its cleanup, which would leave a staged copy of an agent login on disk. Every CLI
+ * start sweeps staging directories this user created that are older than `maxAgeMs`; nothing newer is touched (it may belong to a live run).
+ */
+export function sweepStaleStaging(maxAgeMs = 60 * 60_000, parent = tmpdir(), now = Date.now()): string[] {
+  const removed: string[] = [];
+  for (const name of readdirSync(parent)) {
+    if (!/^devflow-(claude-home|codex-home|pf|bundle)-[A-Za-z0-9]{6}$/.test(name)) continue;
+    const p = join(parent, name);
+    try {
+      const st = lstatSync(p);
+      if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== process.getuid!() || now - st.mtimeMs < maxAgeMs) continue;
+      rmSync(p, { recursive: true, force: true }); removed.push(name);
+    } catch { /* raced with its owner: leave it */ }
+  }
+  return removed;
+}
 
 export interface Staged { dir: string; mounts: Mount[]; tmpfs: string[]; env: Record<string, string>; finish: () => void }
 

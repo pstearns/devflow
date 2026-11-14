@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs';
+import { utimesSync as _u, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_RETENTION, plan, prune, scan, verify, type RetentionPolicy } from '../server/orchestrator/retention.ts';
@@ -201,5 +201,23 @@ describe('retention configuration', () => {
     expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, retention: { passDays: 0 } } }] })).toThrow(/passDays/);
     expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, retention: { maxTotalMB: 5 } } }] })).toThrow(/maxTotalMB/);
     expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, retention: { passDays: 60, failureDays: 30 } } }] })).toThrow(/failures are preserved at least as long/);
+  });
+});
+
+describe('stale credential staging sweep', () => {
+  it('removes only OLD staging dirs of this user that match the exact naming, and never follows links or touches newer ones', async () => {
+    const { sweepStaleStaging } = await import('../server/orchestrator/sandbox.ts');
+    const parent = mkdtempSync(join(tmpdir(), 'devflow-sweep-'));
+    const mk = (name: string, ageMin: number) => { const d = join(parent, name); mkdirSync(d); writeFileSync(join(d, 'auth.json'), '{}'); const t = (Date.now() - ageMin * 60_000) / 1000; _u(d, t, t); return d; };
+    const old1 = mk('devflow-codex-home-abc123', 120), old2 = mk('devflow-pf-Zz9Yx8', 90), fresh = mk('devflow-claude-home-def456', 5), other = mk('devflow-unrelated-xyz789', 500), odd = mk('devflow-codex-home-has space', 500);
+    const victim = mkdtempSync(join(tmpdir(), 'devflow-victim-')); writeFileSync(join(victim, 'precious'), 'x');
+    symlinkSync(victim, join(parent, 'devflow-bundle-link123'));
+    const removed = sweepStaleStaging(60 * 60_000, parent, Date.now());
+    try {
+      expect(removed.sort()).toEqual(['devflow-codex-home-abc123', 'devflow-pf-Zz9Yx8']);
+      expect(existsSync(old1)).toBe(false); expect(existsSync(old2)).toBe(false);
+      for (const keep of [fresh, other, odd]) expect(existsSync(keep)).toBe(true);
+      expect(existsSync(join(victim, 'precious'))).toBe(true);
+    } finally { rmSync(parent, { recursive: true, force: true }); rmSync(victim, { recursive: true, force: true }); }
   });
 });
