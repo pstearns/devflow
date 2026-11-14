@@ -13,9 +13,9 @@ const defang = (s: string) => s.replace(/\u0000/g, '').replace(/\\/g, '\\\\').re
 /** Every kind of line ending Markdown (or a renderer) may honour becomes \n BEFORE any line-based quoting. */
 const normNl = (s: string) => s.replace(/\r\n?|[\u000b\u000c\u0085\u2028\u2029]/g, '\n');
 /** Controller-originated diagnostics (git/fs errors) may carry host paths; Linear gets a redacted form, local evidence keeps the original. */
-export const redact = (s: string) => s.replace(/(?<![\w.\-:/])(?:~|\.{1,2})?(?:\/[\w.@+~=,%\-]+){2,}\/?/g, '(redacted-path)').replace(/\bfile:\/\/\S+/g, '(redacted-path)');
+export const redact = (s: string) => s.replace(/(?<![\w.\-:/])(?:~|\.{1,2})?\/[^\s'"`<>|;,)\]}\u0000]+/gu, '(redacted-path)').replace(/\bfile:\/\/\S+/g, '(redacted-path)');
 /** One line of untrusted text safe to place inside backticks, a table cell or a list item: no control chars, backticks, pipes or line breaks. */
-export const line = (s: string, n = 120) => clip(defang(normNl(s)).replace(/[\u0000-\u001f\u007f\u2028\u2029`|<>]/g, ' ').replace(/\s+/g, ' ').trim(), n);
+export const line = (s: string, n = 120) => clip(defang(normNl(redact(s))).replace(/[\u0000-\u001f\u007f\u2028\u2029`|<>]/g, ' ').replace(/\s+/g, ' ').trim(), n);
 export const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 /** Agent-authored text: quoted line by line, so it can never impersonate a controller heading or a verified fact. */
 export const quote = (s: string, n = 600) => clip(defang(normNl(s)), n).split('\n').map((l) => `> ${l}`).join('\n');

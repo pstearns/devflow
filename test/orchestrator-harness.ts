@@ -61,7 +61,7 @@ export class FakePrs implements PullRequests {
 
 export interface WorldOpts {
   scenario?: string; labels?: string[]; state?: string; blockedBy?: number[]; project?: string | null; omitOrchestration?: boolean;
-  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>; second?: boolean; onSleep?: () => void; linearOpts?: Parameters<typeof demoFetch>[1];
+  ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>; second?: boolean; onSleep?: () => void; linearOpts?: Parameters<typeof demoFetch>[1]; onLinearRead?: (n: number) => void;
   /** Real agents: run the REAL claude/codex binaries with the user's real logins (staged into the sandbox as copies). Synthetic repo/ticket only. */
   live?: { claudeBin: string; codexBin: string; description: string }; wrapAgents?: (inner: AgentRunner, w: { origin: string; repo: string }) => AgentRunner; secrets?: boolean;
 }
@@ -109,9 +109,10 @@ export function makeWorld(o: WorldOpts = {}) {
   };
   const agents = o.wrapAgents ? o.wrapAgents(counted, { origin, repo }) : counted;
   const logs: string[] = [];
+  let reads = 0;
   const factoryCalls: { kind: string; projectId: string; tools: string[] }[] = [];
   const ocOf = (id: string) => cfg.projects.find((p) => p.id === id)!.orchestration!;
-  const mk = () => new Orchestrator({ cfg, policy: (oc, pid) => { factoryCalls.push({ kind: 'policy', projectId: pid, tools: oc.claude.allowedTools }); return new PolicyGuard(() => ocOf(pid), configPath); }, read: new LinearClient(DEMO_READ_KEY, f), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, agents: (oc, pid) => { factoryCalls.push({ kind: 'agents', projectId: pid, tools: oc.claude.allowedTools }); return agents; }, sleep: async () => { o.onSleep?.(); }, log: (l) => logs.push(l) });
+  const mk = () => new Orchestrator({ cfg, policy: (oc, pid) => { factoryCalls.push({ kind: 'policy', projectId: pid, tools: oc.claude.allowedTools }); return new PolicyGuard(() => ocOf(pid), configPath); }, read: new LinearClient(DEMO_READ_KEY, ((u: string, i?: RequestInit) => { if (/query ActionIssue/.test(String(i?.body))) o.onLinearRead?.(++reads); return f(u, i); }) as typeof fetch), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, agents: (oc, pid) => { factoryCalls.push({ kind: 'agents', projectId: pid, tools: oc.claude.allowedTools }); return agents; }, sleep: async () => { o.onSleep?.(); }, log: (l) => logs.push(l) });
   const issue = () => f.store.issues.ATL!.find((x) => x.n === 22)!;
   return {
     root, origin, repo, runsDir, cfg, configPath, factoryCalls, f, ci, prs, hostHome, calls, logs, mk, orch: mk(), issue, store: () => new RunStore(runsDir),

@@ -24,6 +24,14 @@ export function nodePrefix(): string | undefined {
   return real.startsWith('/usr/') ? undefined : dirname(dirname(real));
 }
 
+/** The host paths bwrapArgs actually binds from the system (one list, used by BOTH the sandbox and the policy check). */
+export function hostSystemMounts(): string[] {
+  const out = ['/usr'];
+  for (const d of ['bin', 'sbin', 'lib', 'lib64']) { try { if (!lstatSync(`/${d}`).isSymbolicLink()) out.push(`/${d}`); } catch { /* absent */ } }
+  for (const e of ETC) if (existsSync(`/etc/${e}`)) out.push(`/etc/${e}`);
+  return out;
+}
+
 export function bwrapArgs(job: SandboxJob): string[] {
   const a = ['--unshare-all', '--share-net', '--die-with-parent', '--new-session', '--hostname', 'devflow-sandbox', '--clearenv'];
   for (const [k, v] of Object.entries(job.env)) a.push('--setenv', k, v);
@@ -61,7 +69,7 @@ export function resolveBin(bin: string): { dir: string; file: string } {
  * to anything on the host. Parent directories must be real directories, the file is opened O_NOFOLLOW, must be a regular file under the size
  * cap, and only the bytes read through that verified descriptor are returned.
  */
-export function readAgentFile(path: string, maxBytes: number, mustStayInside?: string): string | undefined {
+export function readAgentBytes(path: string, maxBytes: number, mustStayInside?: string): Buffer | undefined {
   try {
     if (mustStayInside) {
       let d = dirname(path);
@@ -75,10 +83,11 @@ export function readAgentFile(path: string, maxBytes: number, mustStayInside?: s
       const buf = Buffer.alloc(st.size);
       let off = 0;
       while (off < st.size) { const n = readSync(fd, buf, off, st.size - off, off); if (n <= 0) break; off += n; }
-      return buf.toString('utf8', 0, off);
+      return buf.subarray(0, off);
     } finally { closeSync(fd); }
   } catch { return undefined; }
 }
+export function readAgentFile(path: string, maxBytes: number, mustStayInside?: string): string | undefined { return readAgentBytes(path, maxBytes, mustStayInside)?.toString('utf8'); }
 
 // ---------------------------------------------------------------- credentials: copies, never the user's real home
 const shaOf = (b: string | Buffer) => createHash('sha256').update(b).digest('hex');

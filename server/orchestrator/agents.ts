@@ -7,10 +7,11 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { OrchestrationCfg } from '../config.ts';
-import { baseEnv, bwrapArgs, bwrapUsable, nodeMounts, readAgentFile, resolveBin, stageHome, type Mount, type SandboxJob, type Staged } from './sandbox.ts';
+import { baseEnv, bwrapArgs, bwrapUsable, nodeMounts, readAgentBytes, readAgentFile, resolveBin, stageHome, type Mount, type SandboxJob, type Staged } from './sandbox.ts';
+import { RUN_BRANCH_RE } from './types.ts';
 export { readAgentFile };
 
-export interface ProcResult { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; truncated: boolean; finalMessage?: string }
+export interface ProcResult { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; truncated: boolean; finalMessage?: string; /** self-contained git bundle of the run branch, created inside the sandbox */ bundle?: Buffer }
 
 export function runProcess(bin: string, args: string[], o: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs: number; maxBytes?: number }): Promise<ProcResult> {
   const max = o.maxBytes ?? 8 * 1024 * 1024;
@@ -52,7 +53,7 @@ export interface AgentRunner {
   /** Proves the sandbox starts and both CLIs run and are logged in, from inside the sandbox, before any ticket is touched. */
   preflight(): Promise<Preflight>;
   /** Claude Code in `clone` (its own git repo). It edits and commits; it can neither push nor reach any credential. */
-  implement(o: { clone: string; prompt: string; timeoutMs: number }): Promise<ProcResult>;
+  implement(o: { clone: string; prompt: string; timeoutMs: number; bundle: { branch: string; exclude: string } }): Promise<ProcResult>;
   /** Codex against a read-only snapshot. `outDir` is the only writable mount; the reviewer's final message is read from it. */
   review(o: { snapshot: string; outDir: string; prompt: string; schemaPath: string; timeoutMs: number }): Promise<ProcResult>;
 }
@@ -81,6 +82,23 @@ export function reviewerSandbox(cfg: Pick<OrchestrationCfg, 'codex'>, snapshot: 
   if (env.OPENAI_API_KEY) pass.OPENAI_API_KEY = env.OPENAI_API_KEY;
   const mounts: Mount[] = [...nodeMounts(), { src: bin.dir, dst: '/opt/agent' }, { src: snapshot, dst: '/review' }, { src: outDir, dst: '/out', rw: true }, ...(schemaPath ? [{ src: schemaPath, dst: '/schema.json' }] : []), ...staged.mounts];
   return { staged, cmdPath: `/opt/agent/${bin.file}`, job: { mounts, tmpfs: staged.tmpfs, cwd: '/review', env: baseEnv({ ...pass, ...staged.env, DEVFLOW_ROLE: 'reviewer' }) } };
+}
+
+/**
+ * `git bundle create` of the run branch, run in a sandbox with the clone mounted. Links the agent planted inside .git that point at host
+ * paths (objects, refs, alternates) dangle there, so the bundle simply fails to build; nothing outside the clone is ever read. The file is
+ * returned only if it is a regular file under the size cap.
+ */
+export async function makeBundle(cfg: Pick<OrchestrationCfg, 'claude'>, clone: string, hostHome: string, env: NodeJS.ProcessEnv, branch: string, exclude: string): Promise<Buffer | undefined> {
+  if (!RUN_BRANCH_RE.test(branch) || !/^[0-9a-f]{40}$/.test(exclude)) return undefined;
+  const out = mkdtempSync(join(tmpdir(), 'devflow-bundle-'));
+  try {
+    const rs = implementerSandbox(cfg, clone, hostHome, env);
+    rs.job.mounts.push({ src: out, dst: '/out', rw: true });
+    const r = await runInSandbox(rs, '/usr/bin/git', ['bundle', 'create', '/out/run.bundle', `refs/heads/${branch}`, `^${exclude}`], { timeoutMs: 120_000 });
+    if (r.exitCode !== 0) return undefined;
+    return readAgentBytes(join(out, 'run.bundle'), 128 * 1024 * 1024, out);
+  } finally { rmSync(out, { recursive: true, force: true }); }
 }
 
 export async function runInSandbox(rs: RoleSandbox, cmd: string, args: string[], o: { stdin?: string; timeoutMs: number }): Promise<ProcResult> {
@@ -136,10 +154,12 @@ export class CliAgents implements AgentRunner {
     return { ok: problems.length === 0, problems, detail, versions };
   }
 
-  implement(o: { clone: string; prompt: string; timeoutMs: number }) {
+  async implement(o: { clone: string; prompt: string; timeoutMs: number; bundle: { branch: string; exclude: string } }) {
     const rs = implementerSandbox(this.cfg, o.clone, this.home, this.env);
     const args = ['-p', '--output-format', 'json', '--permission-mode', 'acceptEdits', '--no-session-persistence', '--allowedTools', this.cfg.claude.allowedTools.join(',')];
-    return runInSandbox(rs, rs.cmdPath, args, { stdin: o.prompt, timeoutMs: o.timeoutMs });
+    const r = await runInSandbox(rs, rs.cmdPath, args, { stdin: o.prompt, timeoutMs: o.timeoutMs });
+    // Package the result INSIDE a fresh sandbox: the controller must never run git against a directory the agent controls.
+    return { ...r, bundle: await makeBundle(this.cfg, o.clone, this.home, this.env, o.bundle.branch, o.bundle.exclude) };
   }
 
   async review(o: { snapshot: string; outDir: string; prompt: string; schemaPath: string; timeoutMs: number }) {

@@ -325,7 +325,49 @@ describe('Codex review round 2 (regressions)', () => {
     expect(readFileSync(join(runDir(w), 'escalation.json'), 'utf8')).toContain('customer.git');
     const all = w.comments().join('\n');
     expect(all).not.toMatch(/alice|customer\.git|\/home\//);
-    expect(all).toContain('(redacted-path)');
+    expect(all).toContain('retained evidence only'); // the raw diagnostic is never published, only referenced
+  });
+});
+
+describe('Codex review round 3 (regressions)', () => {
+  it('policy and sandbox share ONE list of host system mounts (including conditional /bin /lib /lib64 when they are real directories)', async () => {
+    const { hostSystemMounts } = await import('../server/orchestrator/sandbox.ts');
+    const mounts = hostSystemMounts();
+    expect(mounts).toContain('/usr');
+    const args = bwrapArgs({ mounts: [], env: {}, cwd: '/', cmd: '/bin/true', args: [] });
+    const bound: string[] = []; args.forEach((x, i) => { if (x === '--ro-bind') bound.push(args[i + 1]!); });
+    for (const m of bound) expect(mounts, `bound but not policy-checked: ${m}`).toContain(m); // nothing the sandbox binds escapes the policy list
+    const w = world(); const lib = join(w.root, 'lib64'); mkdirSync(join(lib, 'private'), { recursive: true });
+    expect(() => verifyPolicy(oc(w), w.configPath, new Date(), undefined, { systemMounts: [lib, ...mounts] })).not.toThrow(); // clean dir passes
+    expect(() => verifyPolicy(oc(w), w.configPath, new Date(), undefined, { systemMounts: [w.root] })).toThrow(/system mount/);
+  });
+  it('an approval retry re-checks the remote branch and the PR, not a stale gate', async () => {
+    let w!: ReturnType<typeof makeWorld>; let updates = 0; let moved = false;
+    w = world({ scenario: 'correct-first', linearOpts: { fail: (op) => op === 'IssueUpdate' && ++updates === 2 }, // the approval transition fails once
+      onSleep: () => { if (moved) return; moved = true; w.pushFrom(w.store().runsFor('ATL-22')[0]!.branch); } }); // ...and during backoff someone pushes to the run branch
+    const m = await w.orch.run('ATL-22');
+    expect(m.reasonClass).toBe('stale-commit');
+    expect(m.reason).toMatch(/remote branch moved .* before approval/);
+    expect(w.f.store.mutations.filter((x) => x.op === 'IssueUpdate' && (x.vars.input as { stateId?: string }).stateId === 'st-ATL-in-review')).toHaveLength(1); // the failed one only; never retried against a moved branch
+    expect(m.approvedSha).toBeUndefined();
+  });
+  it('policy is verified AFTER the live-ticket read, immediately before the approval write', async () => {
+    let w!: ReturnType<typeof makeWorld>; let armed = false;
+    w = world({ scenario: 'correct-first', onLinearRead: () => { if (!armed && w.f.store.comments.length >= 4) { armed = true; writeFileSync(w.configPath, `${readFileSync(w.configPath, 'utf8')} `, { mode: 0o600 }); } } });
+    const m = await w.orch.run('ATL-22');
+    expect(armed).toBe(true);
+    expect(m.reasonClass).toBe('policy-violation');
+    expect(w.f.store.mutations.filter((x) => x.op === 'IssueUpdate' && (x.vars.input as { stateId?: string }).stateId === 'st-ATL-in-review')).toHaveLength(0); // no approval write under the changed policy
+    expect(w.issue().state).toBe('Blocked');
+  });
+  it('redaction covers Unicode, spaces-in-names (via structured public reasons), single-component paths and attempt-table failures', () => {
+    expect(AUDIT.redact('open /秘密/顧客/key.json failed')).not.toMatch(/秘密|顧客/);
+    expect(AUDIT.redact('fatal: /customer-repo is missing')).not.toContain('customer-repo');
+    expect(AUDIT.redact('see ./x/y and ../a/b and ~/c/d and file:///etc/passwd')).not.toMatch(/x\/y|a\/b|c\/d|passwd/);
+    expect(AUDIT.redact('https://github.com/o/r/pull/1 and src/a/b.ts')).toBe('https://github.com/o/r/pull/1 and src/a/b.ts'); // URLs and relative repo paths stay
+    const m = { ticket: 'ATL-1', runId: 'r1', repo: 'o/r', baseBranch: 'main', baseSha: 'a'.repeat(40), branch: 'devflow/atl-1-abcdef1', state: 'escalated', infra: [], linearStates: { blockedName: 'Blocked' }, attempts: [{ n: 0, startSha: 'a'.repeat(40), failure: 'ENOENT /home/alice/Client Secret/repo/.git' }] } as never;
+    const c = AUDIT.final(m, 'now', { kind: 'escalated', summary: 's', reason: 'x', cls: 'infrastructure' });
+    expect(c).not.toMatch(/alice|Client Secret|\/home/);
   });
 });
 

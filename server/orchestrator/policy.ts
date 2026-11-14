@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { OrchestrationCfg } from '../config.ts';
-import { nodePrefix } from './sandbox.ts';
+import { hostSystemMounts, nodePrefix } from './sandbox.ts';
 
 export class PolicyError extends Error {}
 
@@ -43,7 +43,6 @@ function fileFacts(p: string, what: string, opts: { exec?: boolean } = {}) {
  * Verifies the trusted inputs for one orchestration config and returns a digest of everything the controller will rely on.
  * `configPath` is the file the policy was loaded from; it must be the owner's, not writable by others, and outside every agent-reachable tree.
  */
-export const SYSTEM_MOUNTS = ['/usr', '/etc/resolv.conf', '/etc/ssl', '/etc/ca-certificates', '/etc/hosts', '/etc/nsswitch.conf', '/etc/passwd', '/etc/group', '/etc/localtime', '/etc/alternatives'];
 /** Canonical form (symlinks resolved) when the path exists, lexical otherwise: aliases and ancestors cannot hide a sensitive directory. */
 const canon = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
 
@@ -61,7 +60,7 @@ export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new
   const home = extra.home ?? homedir();
   const protectedDirs = [dirname(cfgReal.real), repo, runs, join(home, '.claude'), join(home, '.codex'), join(home, '.ssh'), join(home, '.config'), join(home, '.local', 'share', 'devflow'), ...(appRoot ? [appRoot] : [])].map(canon);
   // EVERY host path the sandbox mounts (system trees included, not only agent binaries) must be free of controller data.
-  for (const m of extra.systemMounts ?? SYSTEM_MOUNTS) { const cm = canon(m); const hit = protectedDirs.find((d) => within(d, cm)); if (hit) throw new PolicyError(`the system mount ${m} contains controller-sensitive paths (config, .env, repositories, run data or credentials): install DevFlow outside system directories`); }
+  for (const m of extra.systemMounts ?? hostSystemMounts()) { const cm = canon(m); const hit = protectedDirs.find((d) => within(d, cm)); if (hit) throw new PolicyError(`the system mount ${m} contains controller-sensitive paths (config, .env, repositories, run data or credentials): install DevFlow outside system directories`); }
   // Every directory the sandbox will mount from the host must be free of controller data, not just the agent binaries' directories.
   const np = toolchainDir ? canon(toolchainDir) : undefined;
   if (np) {

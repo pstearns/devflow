@@ -52,13 +52,14 @@ export async function initClone(repo: string, baseRef: string, clone: string, br
 }
 
 /**
- * Brings the agent's commits into the CONTROLLER's repository as a private ref. The clone is untrusted input: its config and hooks are
- * attacker-controlled, so hooks are disabled on the command line (which propagates to the spawned upload-pack), fsmonitor is off,
- * and only the one named branch is fetched. All later inspection happens on the trusted repo, never inside the clone.
+ * Brings the agent's commits into the CONTROLLER's repository as a private ref. The agent's repository directory is never read by a
+ * privileged git: the commits arrive as a self-contained BUNDLE file that was created inside the sandbox (where links pointing at host
+ * paths dangle) and copied out through a verified regular-file read. Hooks are disabled on the command line for the fetch regardless.
  */
-export async function importBranch(repo: string, clone: string, branch: string, ref: string) {
-  await git(repo, ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.ext.allow=never', 'fetch', '-q', '--no-tags', '--no-write-fetch-head', clone, `+refs/heads/${branch}:${ref}`],
-    { ...process.env, GIT_CONFIG_NOSYSTEM: '1' });
+export async function importBundle(repo: string, bundleFile: string, branch: string, ref: string) {
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1' };
+  await git(repo, ['-c', 'core.hooksPath=/dev/null', 'bundle', 'verify', bundleFile], env); // checks prerequisites are in OUR repo and the file is well-formed
+  await git(repo, ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', 'fetch', '-q', '--no-tags', '--no-write-fetch-head', bundleFile, `+refs/heads/${branch}:${ref}`], env);
   return resolveRef(repo, ref);
 }
 export const deleteRef = (repo: string, ref: string) => git(repo, ['update-ref', '-d', ref]).catch(() => '');

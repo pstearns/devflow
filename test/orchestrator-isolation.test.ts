@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { implementerSandbox, reviewerSandbox, runInSandbox, type RoleSandbox } from '../server/orchestrator/agents.ts';
+import { implementerSandbox, makeBundle, reviewerSandbox, runInSandbox, type RoleSandbox } from '../server/orchestrator/agents.ts';
 import { bwrapArgs, bwrapUsable, stageHome } from '../server/orchestrator/sandbox.ts';
 import * as G from '../server/orchestrator/git.ts';
 import { GithubPrs } from '../server/orchestrator/pr.ts';
@@ -166,25 +166,52 @@ describe('credential staging', () => {
   });
 });
 
-describe('untrusted clone cannot execute code in the controller', () => {
-  it('hooks, fsmonitor, packObjectsHook and filters planted in the clone never run during import, diff, export or line counts', async () => {
+describe.skipIf(!usable)('untrusted clone cannot execute code in, or read from, the controller', () => {
+  const BR = 'devflow/atl-1-abcdef1';
+  const bundleOf = (clone: string, base: string) => makeBundle({ claude: cfg.claude }, clone, fakeHome(), {}, BR, base);
+  const commitIn = (clone: string) => { writeFileSync(join(clone, 'new.txt'), 'n\n'); execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'filter.evil.clean=cat', 'add', '-A'], { cwd: clone, env: gitEnv }); execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'filter.evil.clean=cat', 'commit', '-q', '-m', 'work'], { cwd: clone, env: gitEnv }); };
+
+  it('hooks, fsmonitor, packObjectsHook and filters planted in the clone never run in the controller during bundle import, diff, export or line counts', async () => {
     const src = sourceRepo(), clone = uniq('clone'), marker = join(root, 'PWNED');
-    await G.initClone(src, 'refs/remotes/origin/main', clone, 'devflow/x');
+    await G.initClone(src, 'refs/remotes/origin/main', clone, BR);
     const evil = `#!/bin/sh\ntouch ${marker}\n`;
     for (const h of ['post-upload-pack', 'pre-upload-pack', 'reference-transaction', 'post-checkout', 'pre-auto-gc', 'update']) { writeFileSync(join(clone, '.git', 'hooks', h), evil); chmodSync(join(clone, '.git', 'hooks', h), 0o755); }
     writeFileSync(join(clone, '.git', 'config'), `${readFileSync(join(clone, '.git', 'config'), 'utf8')}[core]\n\tfsmonitor = touch ${marker}\n\thooksPath = ${join(clone, '.git', 'hooks')}\n[uploadpack]\n\tpackObjectsHook = ${join(clone, '.git', 'hooks', 'update')}\n[filter "evil"]\n\tclean = touch ${marker}\n\tsmudge = touch ${marker}\n[diff "evil"]\n\ttextconv = touch ${marker}\n`);
     writeFileSync(join(clone, '.gitattributes'), '* filter=evil diff=evil\n');
-    writeFileSync(join(clone, 'new.txt'), 'n\n');
-    execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'filter.evil.clean=cat', 'add', '-A'], { cwd: clone, env: gitEnv });
-    execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'filter.evil.clean=cat', 'commit', '-q', '-m', 'evil'], { cwd: clone, env: gitEnv });
+    commitIn(clone);
     rmSync(marker, { force: true }); // setup ran git INSIDE the hostile clone (which obeys its own config); everything below is the controller
-    const sha = await G.importBranch(src, clone, 'devflow/x', 'refs/devflow/r/attempt-0');
-    expect(sha).toMatch(/^[0-9a-f]{40}$/);
     const base = sh(src, 'rev-parse', 'refs/remotes/origin/main');
+    const bundle = await bundleOf(clone, base);
+    expect(bundle).toBeDefined();
+    const file = uniq('b') + '.bundle'; writeFileSync(file, bundle!);
+    const sha = await G.importBundle(src, file, BR, 'refs/devflow/r/attempt-0');
+    expect(sha).toMatch(/^[0-9a-f]{40}$/);
     await G.changedFiles(src, base, sha); await G.patch(src, base, sha); await G.lineCount(src, sha, 'new.txt');
     await G.exportTree(src, sha, join(root, 'export'));
     expect(existsSync(marker)).toBe(false);
     expect(readFileSync(join(root, 'export', 'new.txt'), 'utf8')).toBe('n\n');
+  });
+  it('a .git/objects symlink to the controller repository cannot be followed: no bundle is built and nothing is imported', async () => {
+    const src = sourceRepo(), clone = uniq('clone');
+    await G.initClone(src, 'refs/remotes/origin/main', clone, BR);
+    commitIn(clone);
+    // the controller repo has a private branch the agent must never be able to import
+    writeFileSync(join(src, 'private.txt'), 'CONTROLLER-SECRET'); sh(src, 'add', '-A'); sh(src, 'commit', '-q', '-m', 'private'); sh(src, 'branch', 'private-branch');
+    rmSync(join(clone, '.git', 'objects'), { recursive: true }); execFileSync('ln', ['-s', join(src, '.git', 'objects'), join(clone, '.git', 'objects')]);
+    mkdirSync(join(clone, '.git', 'refs', 'heads', 'devflow'), { recursive: true }); rmSync(join(clone, '.git', 'refs', 'heads', 'devflow', 'atl-1-abcdef1'), { force: true });
+    execFileSync('ln', ['-s', join(src, '.git', 'refs', 'heads', 'private-branch'), join(clone, '.git', 'refs', 'heads', 'devflow', 'atl-1-abcdef1')]);
+    const base = sh(src, 'rev-parse', 'refs/remotes/origin/main');
+    expect(await bundleOf(clone, base)).toBeUndefined(); // links dangle inside the sandbox
+    expect(sh(src, 'for-each-ref', '--format=%(refname)')).not.toMatch(/devflow/);
+  });
+  it('an alternates file pointing at the controller repository does not smuggle its objects into the bundle', async () => {
+    const src = sourceRepo(), clone = uniq('clone');
+    await G.initClone(src, 'refs/remotes/origin/main', clone, BR);
+    commitIn(clone);
+    writeFileSync(join(clone, '.git', 'objects', 'info', 'alternates'), `${join(src, '.git', 'objects')}\n`);
+    const base = sh(src, 'rev-parse', 'refs/remotes/origin/main');
+    const b = await bundleOf(clone, base); // may or may not build; either way it can only contain the clone's own objects
+    if (b) { const f = uniq('b') + '.bundle'; writeFileSync(f, b); const sha = await G.importBundle(src, f, BR, 'refs/devflow/r/a'); expect(await G.changedFiles(src, base, sha)).toEqual(['new.txt']); }
   });
   it('a file hidden with export-ignore in .gitattributes still reaches the reviewer snapshot', async () => {
     const src = sourceRepo();
@@ -193,13 +220,19 @@ describe('untrusted clone cannot execute code in the controller', () => {
     await G.exportTree(src, sh(src, 'rev-parse', 'HEAD'), join(root, 'snap'));
     expect(readFileSync(join(root, 'snap', 'secret.js'), 'utf8')).toBe('evil()\n');
   });
-  it('the import fetches only the named branch (other refs in the clone are not transferred)', async () => {
+  it('only the named branch is in the bundle (other branches and tags in the clone are not transferred)', async () => {
     const src = sourceRepo(), clone = uniq('clone');
-    await G.initClone(src, 'refs/remotes/origin/main', clone, 'devflow/x');
-    sh(clone, 'branch', 'sneaky'); writeFileSync(join(clone, 'f'), 'x'); sh(clone, 'add', '-A'); sh(clone, 'commit', '-q', '-m', 'c');
-    sh(clone, 'tag', 'v1');
-    await G.importBranch(src, clone, 'devflow/x', 'refs/devflow/r/a');
+    await G.initClone(src, 'refs/remotes/origin/main', clone, BR);
+    sh(clone, 'branch', 'sneaky'); commitIn(clone); sh(clone, 'tag', 'v1');
+    const base = sh(src, 'rev-parse', 'refs/remotes/origin/main');
+    const f = uniq('b') + '.bundle'; writeFileSync(f, (await bundleOf(clone, base))!);
+    await G.importBundle(src, f, BR, 'refs/devflow/r/a');
     expect(sh(src, 'for-each-ref', '--format=%(refname)')).not.toMatch(/sneaky|v1/);
+  });
+  it('refuses to bundle for a branch or exclusion that is not a run branch / full SHA', async () => {
+    const src = sourceRepo(), clone = uniq('clone');
+    await G.initClone(src, 'refs/remotes/origin/main', clone, BR);
+    for (const [b, x] of [['main', 'a'.repeat(40)], [BR, 'main'], [BR, '--all'], ['devflow/x; touch y', 'a'.repeat(40)]] as const) expect(await makeBundle({ claude: cfg.claude }, clone, fakeHome(), {}, b, x)).toBeUndefined();
   });
 });
 

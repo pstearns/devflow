@@ -154,7 +154,7 @@ describe('three failed repairs escalate', () => {
     expect(m.state).toBe('escalated');
     expect(m.reasonClass).toBe('repairs-exhausted');
     expect(m.attempts).toHaveLength(4); // the repair budget applies to an unusable first attempt too
-    expect(m.attempts.every((a) => /no new commit/.test(a.failure ?? ''))).toBe(true);
+    expect(m.attempts.every((a) => /no usable commit|no new commit/.test(a.failure ?? ''))).toBe(true);
     expect(w.calls.review).toBe(0);
   });
 

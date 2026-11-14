@@ -13,7 +13,7 @@ import { Q_ACTION_ISSUE, hasReady, isResolvedType, parseCtx, type Ctx } from '..
 import type { LinearClient } from '../linear.ts';
 import { MAX_COMMENT, type LinearWriteClient } from '../linear-write.ts';
 import { isObj, nodes, str } from '../util.ts';
-import { infraProblem, type AgentRunner } from './agents.ts';
+import { infraProblem, type AgentRunner, type ProcResult } from './agents.ts';
 import type { PrState } from './pr.ts';
 import * as A from './audit.ts';
 import type { CiProvider, CiResult } from './ci.ts';
@@ -29,6 +29,8 @@ export class Rejected extends Error {}
 /** An environment step kept failing after its retries. Not the agent's fault; never consumes a repair attempt. */
 /** The live ticket no longer matches what was authorized (moved, re-scoped, approval revoked). Never retried, never overwritten. */
 export class TicketChanged extends Error {}
+/** The reviewed commit or its draft PR no longer match at the moment of approval (moved, retargeted, marked ready). */
+export class GateChanged extends Error {}
 export class InfraError extends Error { constructor(public step: string, message: string) { super(message); } }
 
 export interface Deps {
@@ -153,8 +155,8 @@ export class Orchestrator {
     } catch (e) {
       if (!m) { store.release(ticket, runId); throw e; } // rejected before any state existed
       if (e instanceof PolicyError) return this.escalate(store, m, 'policy-violation', `Trusted controller policy failed verification: ${e.message}. Nothing further was executed.`);
-      if (e instanceof InfraError) return this.escalate(store, m, 'infrastructure', `Infrastructure failure at "${e.step}": ${e.message}. No repair attempt was consumed; the code was not judged.`);
-      return this.escalate(store, m, 'controller-error', `controller error: ${e instanceof Error ? e.message : 'unknown'}`);
+      if (e instanceof InfraError) return this.escalate(store, m, 'infrastructure', `Infrastructure failure at "${e.step}": ${e.message}. No repair attempt was consumed; the code was not judged.`, `Infrastructure failure at step "${e.step}" after ${m.infra.filter((i) => i.step === e.step).length} attempt(s). The diagnostic is in the retained evidence only. No repair attempt was consumed; the code was not judged.`);
+      return this.escalate(store, m, 'controller-error', `controller error: ${e instanceof Error ? e.message : 'unknown'}`, 'Unexpected controller error; the diagnostic is in the retained evidence only.');
     }
   }
 
@@ -164,7 +166,7 @@ export class Orchestrator {
     for (let i = 0; ; i++) {
       this.verifyPin(m);
       try { return await fn(); } catch (e) {
-        if (e instanceof PolicyError || e instanceof TicketChanged) throw e; // an authorization failure is never "transient"
+        if (e instanceof PolicyError || e instanceof TicketChanged || e instanceof GateChanged) throw e; // an authorization failure is never "transient"
         const detail = e instanceof Error ? e.message.slice(0, 300) : 'unknown error';
         this.recordInfra(store, m, step, detail);
         if (i >= max) throw new InfraError(step, detail);
@@ -192,11 +194,11 @@ export class Orchestrator {
       // 1. Claude implements / repairs, inside the sandbox. Environment failures retry without consuming this attempt.
       const prompt = n === 0 ? implementPrompt(ctx, m) : repairPrompt(ctx, m, findings, ciFailure, n);
       store.evidence(m, `${dir}/claude-prompt.txt`, prompt);
-      await this.runClaude(store, m, a, oc, prompt, dir);
+      const res = await this.runClaude(store, m, a, oc, prompt, dir);
 
       // 2. Bring the commit across the trust boundary into the controller's repo and judge it THERE
       this.state(store, m, 'verifying-commit', { attempt: n });
-      const bad = await this.importAndVerify(m, a, oc);
+      const bad = await this.importAndVerify(store, m, a, oc, res.bundle);
       if (bad) {
         a.failure = bad; this.save(store, m, 'attempt-failed', { attempt: n, reason: bad });
         findings = [controllerFinding(bad)]; ciFailure = undefined;
@@ -214,6 +216,7 @@ export class Orchestrator {
       });
       await this.infra(store, m, 'pull-request', async () => {
         if (!m.pr) {
+          this.verifyPin(m);
           const pr = await this.d.prs.ensureDraft(m.repo, { branch: m.branch, base: m.baseBranch, title: `${m.ticket}: ${m.title}`.slice(0, 250), body: prBody(m) });
           m.pr = { ...pr, draft: true }; this.save(store, m, 'pr-created', { number: pr.number });
         }
@@ -278,14 +281,14 @@ export class Orchestrator {
 
   private ref(m: Manifest, n: number) { return `refs/devflow/${m.runId}/attempt-${n}`; }
 
-  private async runClaude(store: RunStore, m: Manifest, a: AttemptRecord, oc: OrchestrationCfg, prompt: string, dir: string) {
+  private async runClaude(store: RunStore, m: Manifest, a: AttemptRecord, oc: OrchestrationCfg, prompt: string, dir: string): Promise<ProcResult> {
     for (let i = 0; ; i++) {
       this.verifyPin(m);
-      const res = await this.ag(m).implement({ clone: m.clone, prompt, timeoutMs: oc.agentTimeoutMinutes * 60_000 });
+      const res = await this.ag(m).implement({ clone: m.clone, prompt, timeoutMs: oc.agentTimeoutMinutes * 60_000, bundle: { branch: m.branch, exclude: a.startSha } });
       const log = store.evidence(m, `${dir}/claude-output${i ? `-retry${i}` : ''}.txt`, logOf(res));
       a.agent = { exitCode: res.exitCode, timedOut: res.timedOut, log };
       const p = infraProblem(res);
-      if (!p) return;
+      if (!p) return res;
       this.recordInfra(store, m, 'claude', p);
       if (i >= oc.infraRetries) throw new InfraError('claude', p);
       await this.nap(2000 * (i + 1));
@@ -293,9 +296,13 @@ export class Orchestrator {
   }
 
   /** Imports the agent's branch as a private ref in the CONTROLLER's repo and verifies it there. Returns a reason if unusable. */
-  private async importAndVerify(m: Manifest, a: AttemptRecord, oc: OrchestrationCfg): Promise<string | undefined> {
+  private async importAndVerify(store: RunStore, m: Manifest, a: AttemptRecord, oc: OrchestrationCfg, bundle: Buffer | undefined): Promise<string | undefined> {
+    if (!bundle) return 'The agent left no usable commit on the run branch (no bundle could be built inside the sandbox)';
     let sha: string;
-    try { sha = await G.importBranch(oc.repoPath, m.clone, m.branch, this.ref(m, a.n)); } catch { return 'The agent left no usable commit on the run branch'; }
+    try {
+      const rel = store.evidence(m, `attempt-${a.n}/branch.bundle`, bundle).split('#')[0]!; // controller-owned regular file; git never touches the agent's directory
+      sha = await G.importBundle(oc.repoPath, join(store.runDir(m), rel), m.branch, this.ref(m, a.n));
+    } catch { return 'The agent left no usable commit on the run branch'; }
     a.headSha = sha;
     if (sha === a.startSha) return 'Claude made no new commit';
     if (!(await G.isAncestor(oc.repoPath, a.startSha, sha))) return 'The new commit does not descend from the previous one (history was rewritten)';
@@ -378,9 +385,16 @@ export class Orchestrator {
       await this.infra(store, m, 'linear-approval', async () => {
         const bad = this.liveProblem(await this.load(m.ticket), m, auth);
         if (bad) throw new TicketChanged(bad);
+        // the review gate is re-run on every attempt, immediately before the transition: a retry must not ride a stale gate
+        const remote = await G.remoteHead(auth.oc.repoPath, m.branch);
+        if (remote !== sha) throw new GateChanged(`the remote branch moved to ${remote?.slice(0, 12) ?? 'nothing'} before approval (reviewed ${sha.slice(0, 12)})`);
+        const prBad = m.pr ? prProblem(m, await this.d.prs.inspect(m.repo, m.pr.number), sha) : 'no pull request recorded';
+        if (prBad) throw new GateChanged(prBad);
+        this.verifyPin(m); // after ALL the awaited reads, immediately before the privileged write
         await this.d.write.setState(m.issueId, auth.approval.id);
       });
     } catch (e) {
+      if (e instanceof GateChanged) return this.escalate(store, m, 'stale-commit', `Controller verification failed at approval: ${e.message}`);
       if (e instanceof TicketChanged) return this.escalate(store, m, 'ticket-changed', `${e.message}; the controller did not change the ticket`);
       throw e;
     }
@@ -397,7 +411,8 @@ export class Orchestrator {
   }
 
   /** Stops the run, preserves evidence, moves the ticket to the Blocked state, then tells Linear what happened. Always releases the lock. */
-  private async escalate(store: RunStore, m: Manifest, cls: FailureClass, reason: string): Promise<Manifest> {
+  /** `publicReason` is what Linear sees; `reason` (raw, may contain host paths) stays in the manifest and evidence. */
+  private async escalate(store: RunStore, m: Manifest, cls: FailureClass, reason: string, publicReason?: string): Promise<Manifest> {
     m.outcome = 'ESCALATED'; m.reason = reason; m.reasonClass = cls;
     try {
       m.escalationEvidence = store.evidence(m, 'escalation.json', JSON.stringify({
@@ -413,7 +428,7 @@ export class Orchestrator {
       else { await this.d.write.setState(m.issueId, m.linearStates.blockedId); m.blockedConfirmed = (await this.load(m.ticket)).state.id === m.linearStates.blockedId; }
     } catch (e) { m.blockedConfirmed = false; store.event(m, this.at(), 'blocked-transition-failed', { error: e instanceof Error ? e.message : 'unknown' }); }
     try {
-      await this.comment(store, m, m.attempts[m.attempts.length - 1], A.final(m, this.at(), { kind: 'escalated', summary: reason, reason, cls, evidenceRef: m.escalationEvidence, blockedConfirmed: m.blockedConfirmed }), true);
+      await this.comment(store, m, m.attempts[m.attempts.length - 1], A.final(m, this.at(), { kind: 'escalated', summary: reason, reason: publicReason ?? reason, cls, evidenceRef: m.escalationEvidence, blockedConfirmed: m.blockedConfirmed }), true);
     } catch (e) { store.event(m, this.at(), 'escalation-comment-failed', { error: e instanceof Error ? e.message : 'unknown' }); }
     this.save(store, m, 'escalation-recorded', { blockedConfirmed: m.blockedConfirmed });
     await this.cleanup(store, m).catch(() => undefined);
