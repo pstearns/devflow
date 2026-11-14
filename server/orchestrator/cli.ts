@@ -14,13 +14,15 @@ import { GithubPrs } from './pr.ts';
 import { Orchestrator, Rejected } from './controller.ts';
 import { PolicyError, PolicyGuard } from './policy.ts';
 import { DuplicateRun, RunStore } from './manifest.ts';
+import { prune, verify } from './retention.ts';
 import { TERMINAL } from './types.ts';
 
 const die = (msg: string, code = 1): never => { console.error(`DevFlow orchestrate: ${msg}`); process.exit(code); };
 
-const [cmd, ticketRaw] = process.argv.slice(2);
-if ((cmd !== 'run' && cmd !== 'release') || !ticketRaw) die('usage: orchestrate run <ISSUE> | orchestrate release <ISSUE>', 2);
-const ticket = ticketRaw!.toUpperCase();
+const [cmd, ticketRaw, ...rest] = process.argv.slice(2);
+const maintenance = cmd === 'prune' || cmd === 'verify';
+if (!maintenance && ((cmd !== 'run' && cmd !== 'release') || !ticketRaw)) die('usage: orchestrate run <ISSUE> | release <ISSUE> | prune [--apply] | verify', 2);
+const ticket = (maintenance ? '' : ticketRaw!).toUpperCase();
 
 // Trusted inputs (.env, devflow.config.json) come from DevFlow's OWN directory, never from the current directory: running this command from
 // inside a target repository must not let that repository supply credentials or policy. Works from source (server/orchestrator/) and from dist-server.
@@ -32,6 +34,23 @@ if (warn) console.warn(`DevFlow warning: ${warn}`);
 const loaded = loadConfig(process.env, root);
 if (!loaded.found) die(`no configuration at ${loaded.path}`);
 const cfg: Config = loaded.config;
+
+if (maintenance) {
+  // Evidence retention. Dry run unless --apply. Every distinct runs directory of the trusted config is handled once, with its own policy.
+  const apply = [ticketRaw, ...rest].includes('--apply');
+  const seen = new Set<string>(); let bad = false;
+  for (const oc of cfg.projects.flatMap((p) => (p.orchestration ? [p.orchestration] : []))) {
+    if (seen.has(oc.runsDir)) continue; seen.add(oc.runsDir);
+    if (cmd === 'verify') { const c = verify(oc.runsDir, oc.repoPath); console.log(`${oc.runsDir}: ${c.ok ? 'OK' : 'PROBLEMS'}\n  ${c.facts.join('\n  ')}${c.problems.map((p) => `\n  ! ${p}`).join('')}`); bad ||= !c.ok; continue; }
+    const r = await prune(oc.runsDir, oc.retention, { apply, repoPath: oc.repoPath });
+    console.log(`${oc.runsDir}: ${r.dryRun ? 'DRY RUN (add --apply to delete)' : 'APPLIED'}; ${r.before.runs} runs, ${(r.before.bytes / 1048576).toFixed(1)} MB${r.after ? ` -> ${r.after.runs} runs, ${(r.after.bytes / 1048576).toFixed(1)} MB` : ''}`);
+    for (const a of r.actions) console.log(`  ${a.kind} ${a.name} (${(a.bytes / 1048576).toFixed(1)} MB): ${a.reason}`);
+    for (const w of r.warnings) console.log(`  warning: ${w}`);
+    if (apply) { const c = verify(oc.runsDir, oc.repoPath); console.log(`  checkpoint: ${c.ok ? 'OK' : 'PROBLEMS'}${c.problems.map((p) => `\n    ! ${p}`).join('')}`); bad ||= !c.ok; }
+  }
+  if (!seen.size) die('no orchestration configured');
+  process.exit(bad ? 5 : 0);
+}
 
 if (cmd === 'release') {
   // Manual recovery for an interrupted run: marks it aborted and frees the ticket's lock. Never touches Linear. A team can have several

@@ -208,3 +208,20 @@ Per project, in `devflow.config.json` (omit the block to forbid orchestration fo
 - If CI only runs on `pull_request`, the draft PR created by the first push is what triggers it; with no CI at all the run escalates as `ci-timeout`.
 - The reviewer's final message is read from `/out` with `O_NOFOLLOW`, a regular-file check and a size cap, because the directory is agent-writable.
 - Node (and npm) are mounted read-only from the controller's own toolchain prefix so agents can run tests; other toolchains need an equivalent mount (not configurable yet).
+
+### Evidence retention and cleanup (`npm run orchestrate -- prune [--apply]` / `verify`)
+
+Defaults (override per project under `orchestration.retention`): passed runs 30 days, failed/escalated runs **90 days** (failures are always kept at least as
+long as successes), a failed run's clone 7 days (the clone is the only large, reproducible part; all evidence stays), minimum age 14 days before anything is
+removed to satisfy the storage limit, storage limit 2048 MB per runs directory.
+
+- **Dry run is the default**; `--apply` deletes. Every deletion is first appended to `<runsDir>/pruned.jsonl` (run, ticket, outcome, approved SHA, bytes, reason).
+- **Never touched:** active (non-terminal) runs, any ticket that holds a lock, runs younger than `minAgeDays`, anything that is not a real directory directly under
+  `runsDir` named `<ISSUE>-<runId>` with a parseable manifest matching its directory (symlinks and odd entries are reported and kept), and the evidence of any run
+  younger than its retention period.
+- **Storage pressure** removes only already-eligible runs: passed first, then failed, oldest first. If that cannot reach the limit it says so and stops; it never
+  deletes younger evidence to hit a number.
+- Deleting a run also removes its private `refs/devflow/<run>/*` refs in the controller's repository. Pushed `devflow/*` branches and PRs are the owner's to remove.
+- **Checkpoint:** `prune --apply` re-verifies automatically; `verify` can be run any time. It reports non-terminal runs without a lock (interrupted), terminal runs that
+  still hold a lock, locks without a run, passed runs that kept a clone, missing `manifest.json`/`events.jsonl`, and a corrupt `pruned.jsonl`. Non-zero exit on any problem.
+- Run it on a schedule you own (nothing in DevFlow runs it automatically). Credentials are never in the runs directory: agent logins are staged outside it and deleted after every call.

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { isObj, str, arr } from './util.ts';
 import type { PromptDef } from '../shared/types.ts';
 import { TOOL_RE } from './orchestrator/policy.ts';
+import { DEFAULT_RETENTION, type RetentionPolicy } from './orchestrator/retention.ts';
 
 export interface KnowledgeCfg { title: string; kind: 'obsidian' | 'repo' | 'url'; path?: string; repo?: string; ref?: string; url?: string }
 /** Names of Linear labels/states that carry lifecycle meaning. Configuration, not code: nothing project-specific is built in. */
@@ -45,6 +46,7 @@ export interface OrchestrationCfg {
   agentTimeoutMinutes: number;
   claude: { bin: string; allowedTools: string[] };
   codex: { bin: string };
+  retention: RetentionPolicy; // evidence retention and pruning limits (see orchestrator/retention.ts)
 }
 export const DEFAULT_CLAUDE_TOOLS = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(npm test:*)', 'Bash(npm run:*)', 'Bash(npx tsc:*)'];
 /** Explicit team-level entry: authorizes writes for the team's issues that no config project covers, and carries the team-level policy. */
@@ -143,6 +145,13 @@ function parseOrchestration(raw: unknown, id: string, repos: string[]): Orchestr
   };
   const mins = (k: string, d: number, max: number) => (typeof raw[k] === 'number' && raw[k] >= 1 ? Math.min(max, raw[k] as number) : d);
   const tools = (v: unknown) => strList(v, DEFAULT_CLAUDE_TOOLS).map((t) => { if (!TOOL_RE.test(t)) throw new Error(`${at}.claude.allowedTools entry "${t.slice(0, 60)}" is not a plain tool pattern like Read or Bash(git commit:*)`); return t; });
+  const retention = (v: unknown): RetentionPolicy => {
+    const r = isObj(v) ? v : {};
+    const n = (k: keyof RetentionPolicy, lo: number, hi: number) => { const x = r[k]; if (x === undefined) return DEFAULT_RETENTION[k]; if (typeof x !== 'number' || !Number.isFinite(x) || x < lo || x > hi) throw new Error(`${at}.retention.${k} must be a number between ${lo} and ${hi}`); return x; };
+    const pol = { passDays: n('passDays', 1, 3650), failureDays: n('failureDays', 1, 3650), cloneDays: n('cloneDays', 1, 3650), minAgeDays: n('minAgeDays', 1, 3650), maxTotalMB: n('maxTotalMB', 100, 1_048_576) };
+    if (pol.failureDays < pol.passDays) throw new Error(`${at}.retention.failureDays must be >= passDays: failures are preserved at least as long as successes`);
+    return pol;
+  };
   const claude = isObj(raw.claude) ? raw.claude : {};
   const codex = isObj(raw.codex) ? raw.codex : {};
   const bin = (v: unknown, what: string) => { const b = str(v, 500) ?? ''; if (!b.startsWith('/') || /\s/.test(b)) throw new Error(`${at}.${what}.bin must be an explicit absolute path to the executable (no PATH lookup, no arguments)`); return b; };
@@ -153,6 +162,7 @@ function parseOrchestration(raw: unknown, id: string, repos: string[]): Orchestr
     ciChecks: strList(raw.ciChecks, []), ciTimeoutMinutes: mins('ciTimeoutMinutes', 20, 120), agentTimeoutMinutes: mins('agentTimeoutMinutes', 30, 240),
     claude: { bin: bin(claude.bin, 'claude'), allowedTools: tools(claude.allowedTools) },
     codex: { bin: bin(codex.bin, 'codex') },
+    retention: retention(raw.retention),
   };
 }
 
