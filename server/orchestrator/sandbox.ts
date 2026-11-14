@@ -4,7 +4,7 @@
 // Network stays on because both agents must reach their model API (see README: egress is not filtered).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, constants as fsc } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, constants as fsc } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -92,6 +92,27 @@ export function readAgentFile(path: string, maxBytes: number, mustStayInside?: s
 // ---------------------------------------------------------------- credentials: copies, never the user's real home
 const shaOf = (b: string | Buffer) => createHash('sha256').update(b).digest('hex');
 
+/**
+ * Removes a tree the AGENT may have locked (chmod 000 on its own home). Owner access is restored first by a traversal that never follows
+ * symlinks, then the tree is deleted, so credential copies cannot be left behind by a hostile permission change.
+ */
+export function forceRemove(p: string) {
+  const unlock = (d: string) => {
+    let st; try { st = lstatSync(d); } catch { return; }
+    if (st.isSymbolicLink()) return;
+    if (st.isDirectory()) { try { chmodSync(d, 0o700); } catch { return; } for (const e of readdirSync(d)) unlock(join(d, e)); }
+    else { try { chmodSync(d, 0o600); } catch { /* best effort */ } }
+  };
+  unlock(p);
+  rmSync(p, { recursive: true, force: true });
+}
+
+/** Restores owner access (no symlink following) so the credential file can be read back even if the agent locked its directory. */
+function forceUnlockFor(dir: string) {
+  const walk = (d: string) => { let st; try { st = lstatSync(d); } catch { return; } if (st.isSymbolicLink() || !st.isDirectory()) return; try { chmodSync(d, 0o700); } catch { return; } for (const e of readdirSync(d)) walk(join(d, e)); };
+  walk(dir);
+}
+
 /** Start time of a process in clock ticks (field 22 of /proc/<pid>/stat), so a recycled PID is not mistaken for the original owner. */
 function procStart(pid: number): string | undefined {
   try { const st = readFileSync(`/proc/${pid}/stat`, 'utf8'); return st.slice(st.lastIndexOf(')') + 2).split(' ')[19]; } catch { return undefined; }
@@ -124,7 +145,7 @@ export function sweepStaleStaging(o: { graceMs?: number; orphanMs?: number; pare
       if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== process.getuid!()) continue;
       const age = now - st.mtimeMs, owner = ownerState(p);
       if (owner === 'alive' || (owner === 'dead' && age < graceMs) || (owner === 'none' && age < orphanMs)) continue;
-      rmSync(p, { recursive: true, force: true }); releaseOwner(p); removed.push(name);
+      forceRemove(p); releaseOwner(p); removed.push(name);
     } catch { /* raced with its owner: leave it */ }
   }
   return removed;
@@ -152,6 +173,7 @@ export function stageHome(kind: 'claude' | 'codex', hostHome: string, parent = t
     try {
       // The staged file was writable by the agent: it may have become a symlink (or sit under one). Only bytes read through a no-follow
       // descriptor, from a regular JSON-object file, are ever written back, and only if the host copy did not change meanwhile.
+      forceUnlockFor(dir);
       const fresh = readAgentFile(staged, 1024 * 1024, dir);
       if (before && fresh !== undefined && existsSync(cred.host)) {
         let valid = false; try { const j = JSON.parse(fresh) as unknown; valid = typeof j === 'object' && j !== null && !Array.isArray(j); } catch { /* not JSON: refuse */ }
@@ -160,7 +182,7 @@ export function stageHome(kind: 'claude' | 'codex', hostHome: string, parent = t
           writeFileSync(tmp, fresh, { mode: 0o600 }); renameSync(tmp, cred.host);
         }
       }
-    } finally { rmSync(dir, { recursive: true, force: true }); releaseOwner(dir); }
+    } finally { forceRemove(dir); releaseOwner(dir); }
   };
   return kind === 'claude'
     ? { dir, mounts: [{ src: dir, dst: '/home/agent', rw: true }], tmpfs: [], env: {}, finish }

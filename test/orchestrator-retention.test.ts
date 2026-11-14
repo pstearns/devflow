@@ -234,6 +234,25 @@ describe('stale credential staging sweep', () => {
       for (const gone of [dead, recycled, orphanOld]) { expect(existsSync(gone)).toBe(false); expect(existsSync(`${gone}.owner`)).toBe(false); }
     } finally { rmSync(parent, { recursive: true, force: true }); }
   });
+  it('an agent that chmod 000s its own home cannot defeat cleanup: finish() and the sweep both remove it (and a refreshed login is still written back)', async () => {
+    const sb = await import('../server/orchestrator/sandbox.ts');
+    const parent = mkdtempSync(join(tmpdir(), 'devflow-sweep-')); const home = mkdtempSync(join(tmpdir(), 'devflow-fakehome-'));
+    try {
+      mkdirSync(join(home, '.claude')); writeFileSync(join(home, '.claude', '.credentials.json'), '{"c":1}');
+      const st = sb.stageHome('claude', home, parent);
+      writeFileSync(join(st.dir, '.claude', '.credentials.json'), '{"c":2}');
+      chmodSync(join(st.dir, '.claude'), 0o000); chmodSync(st.dir, 0o500); // what a hostile agent could do before exiting
+      st.finish();
+      expect(existsSync(st.dir)).toBe(false); expect(existsSync(`${st.dir}.owner`)).toBe(false);
+      expect(readFileSync(join(home, '.claude', '.credentials.json'), 'utf8')).toBe('{"c":2}'); // rotation not lost
+      // the sweep handles an already-abandoned locked directory too
+      const d = join(parent, 'devflow-codex-home-lock11'); mkdirSync(join(d, 'sub'), { recursive: true }); writeFileSync(join(d, 'sub', 'auth.json'), '{}');
+      writeFileSync(`${d}.owner`, JSON.stringify({ pid: 999_999, start: '1' })); chmodSync(join(d, 'sub'), 0o000); chmodSync(d, 0o000);
+      const old = (Date.now() - 600_000) / 1000; _u(d, old, old);
+      expect(sb.sweepStaleStaging({ parent })).toEqual(['devflow-codex-home-lock11']);
+      expect(existsSync(d)).toBe(false);
+    } finally { try { execFileSync('chmod', ['-R', 'u+rwX', parent]); } catch { /* */ } rmSync(parent, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
+  });
   it('only touches exactly-named staging dirs of this user, never follows links, never touches unrelated names', async () => {
     const { sb, parent, mk } = await setup();
     const other = mk('devflow-unrelated-xyz789', 900), odd = mk('devflow-codex-home-has space', 900);
