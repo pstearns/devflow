@@ -37,7 +37,7 @@ There is no background polling. The header shows the age of the oldest source; o
 |---|---|
 | `LINEAR_API_KEY` | Personal API key, permission **Read** |
 | `LINEAR_WRITE_API_KEY` (optional) | A *separate* Linear personal API key, permission **Write**, ideally limited to the configured team(s). Enables the Actions menu. Must differ from `LINEAR_API_KEY` or writes stay disabled. DevFlow itself writes only to scopes your config authorizes. |
-| `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions (and Commit statuses if available) |
+| `GITHUB_TOKEN` | Fine-grained PAT limited to the configured repos, all **Read-only**: Metadata, Pull requests, Contents, Actions. For `orchestrate`, **Commit statuses: read is required** (external CI must be ruled out; without it the gate fails closed). |
 
 DevFlow never uses the `gh` CLI or any ambient identity. These keys are not the sign-in password. Tokens stay on the server: not sent to the browser, not logged, never in error text. `.env` and `devflow.config.json` are git-ignored; DevFlow warns at startup if `.env` is readable by other users.
 
@@ -151,3 +151,77 @@ Without the write key, or outside an authorized scope, actions are visible but d
 - **Human review** uses the latest decisive review per reviewer. Changes requested fails it; an approval passes it.
 - **Independent review** is *Passed* only from evidence you configure in `review.*`: a findings label fails it, a named check or a passed label passes it. Otherwise it is *Unknown* (pending on an open PR with sources configured).
 - **Milestone progress** = completed / (issues − canceled).
+
+
+## Agent orchestration (M1)
+
+Per project, in `devflow.config.json` (omit the block to forbid orchestration for that project):
+
+```json
+"orchestration": {
+  "repo": "your-org/your-repo",          // must be in the project's github.repos
+  "repoPath": "/abs/path/to/clone",      // the controller's own clone; `origin` must be that repo
+  "runsDir": "/abs/path/to/devflow-runs",
+  "baseBranch": "main",
+  "startedState": "In Progress",         // started-type state
+  "approvalState": "In Review",          // PASS lands here; must NOT be completed/canceled
+  "blockedState": "Blocked",             // every escalation lands here; must exist (checked before work starts)
+  "infraRetries": 2,                     // per environment step; never consumes a repair
+  "ciChecks": ["build"],                 // required check names; empty = all reported checks, green on two polls
+  "ciTimeoutMinutes": 20, "agentTimeoutMinutes": 30,
+  "claude": { "bin": "/abs/path/to/claude", "allowedTools": ["Read", "Edit", "Bash(git commit:*)"] },
+  "codex": { "bin": "/abs/path/to/codex" }  // BOTH binaries must be explicit absolute paths (no PATH lookup); the directory containing each is mounted read-only (Codex needs its sibling helpers)
+}
+```
+
+**Controller authority and policy isolation.** The controller is privileged (Linear writes, git push, PRs, agent dispatch), so its authority has one source: the owner's `devflow.config.json` and `.env` in DevFlow's own directory. The CLI changes into that directory before loading anything, so running it from inside a target repository cannot make that repository supply credentials or policy. Before each run, `policy.ts` verifies and pins: the config is a regular file owned by you, not group/world-writable, and outside `repoPath` and `runsDir`; both agent executables exist, are owned by you or root, are not group/world-writable, are not inside a repository or run directory, and their directories contain no controller-sensitive path (the whole directory is mounted into the sandbox); `runsDir` and `repoPath` do not overlap; the Node toolchain prefix that gets mounted contains no controller data and is not group/world-writable; `allowedTools` are plain tool patterns (no flags, commas, newlines). The digest of all of that is recorded in the manifest and re-verified inside every privileged operation (each push, PR call and Linear transition, including every retry), before each agent dispatch and each non-recovery Linear comment, and at the gate; only the escalation path, which must be able to tell you the policy failed, skips it; any change or inability to verify stops the run (`policy-violation`) and nothing further is executed. Nothing from a ticket, repository, commit, agent output or agent environment is ever read as policy: a repository's `devflow.config.json`, `.env`, `.claude/`, `AGENTS.md` and the like are ordinary data. Commits that touch `.github/`, `.claude/`, `.codex/`, `.cursor/`, `.vscode/`, `.zed/`, `.devflow/`, `.husky/`, `.env*`, `devflow.config*`, `.mcp.json`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` or `.gitmodules` are rejected as implementation failures. No orchestrator module uses a shell; every subprocess is an argv array. The controller never reads Linear comments, and ticket text is passed to agents as quoted data.
+
+**Linear audit trail.** One authoritative ticket, six milestone comments in a fixed shape (header, *what happened*, *why*, *evidence*): 1 execution authorized and started (who authorized, from Linear's own history; approved scope; base SHA; agent roles and versions; policy digest; limits); 2 implementation completed (commit, parent, PR, controller checks); 3 CI verified (per-check results for that SHA); 4 independent review completed (verdict, controller verification row, quoted agent findings); 5 repair requested (reason, counters; the following 2 is titled "Repair N completed"); 6 final status (awaiting owner approval or escalated, attempt table, retry counters, owner action required). A run with one repair is 8 comments. The reviewer's verdict is a claim: it is published and acted on only after the controller's gate confirms the review is for this SHA, CI is green on it, the remote branch and PR head are at it, all changed files are attested, and policy is intact. Agent-authored text is always quoted and labelled unverified, with `@` mentions, markdown links and images neutralized. Comments carry no host paths, environment or credentials (controller diagnostics are redacted to `(redacted-path)`; the raw text stays in local evidence; all agent-derived text has line endings normalised, backslashes, brackets, angle brackets, `@` and `://` neutralised, and is quoted); evidence is referenced relative to `runsDir`. The manifest, append-only `events.jsonl` and evidence files remain the detailed technical record.
+
+**Per-project resolution.** The agent runner and the policy pin are built from the authorized ticket's own project block (a team can have several projects with different binaries and tool policy); the CLI re-reads the config from disk and re-resolves that same project id for every verification.
+
+**Git handling.** Privileged git calls that only touch local objects run with the owner's global/system git config disabled (no configured filter or alias can be selected by repository `.gitattributes`); only push/ls-remote/fetch-origin use the ambient credentials. The reviewer snapshot is written from tree and blob objects directly (exact committed bytes, symlinks and the executable bit preserved, `..`/`.git` path components refused). Protected-path checks cover every path touched by any new commit, not just the final diff, so a file touched and reverted inside the history is rejected; a repair then rebuilds the *unpushed* commits from the base. Bundle import runs with `transfer.fsckObjects`.
+
+**Gate details.** Changed files are computed with `--no-renames`, so moving a protected file shows as deleting it. CI evidence is complete or an error (check runs and commit statuses are paginated; a partial list is never green) and is re-read (not trusted from the earlier poll) at the gate and on every approval attempt; red or not-yet-green stops the run. Authorization is re-checked immediately before the start transition, and an escalation writes the Blocked state only if the ticket is still where DevFlow left it and still authorized; otherwise it leaves the owner's state alone and says so. Credential-shaped strings and absolute host paths are scrubbed from all agent prose before it is published (raw output stays in local evidence).
+
+**Live ticket revalidation.** Every approval attempt (including retries after backoff) re-reads the live ticket and requires the same authorizing project scope, continued write authorization, the approval label still present and the ticket still in the state DevFlow put it in. If the owner moved, re-scoped or un-approved it, the run stops with `ticket-changed` and DevFlow writes no state at all; escalation never reopens a completed/canceled ticket.
+
+**Pull requests.** DevFlow reuses an existing PR only if it is open, a draft, from the run branch of this repository, onto the configured base; and the same checks plus the head SHA run at the final gate, so a PR marked ready or retargeted mid-run blocks the PASS.
+
+**Feature-branch-only writes.** `git push` is refused in code for any destination other than `devflow/<ticket>-<run>` and any source other than a private `refs/devflow/<run>/attempt-N` ref, and is never forced; PRs can only be opened from such a branch and are always drafts. The run also records whether the base branch is protected on GitHub; enabling a ruleset on it is still recommended because a write-capable token could otherwise push to it outside DevFlow.
+
+**Credentials.** `LINEAR_API_KEY` (read), `LINEAR_WRITE_API_KEY` (a different key; the write client has create-only `commentCreate`), `GITHUB_TOKEN` (read; CI and PR-head polling), `GITHUB_WRITE_TOKEN` (a different token with *Pull requests: write*; the only GitHub write, `POST /pulls` with `draft:true`, no ready/merge/close/comment methods exist). The controller pushes one `devflow/<ticket>-<run>` branch with your own git credentials. Agents get none of these. Agent logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`) are **copied** into a throw-away home per invocation (nothing else from `~/.claude` or `~/.codex`: no settings, hooks, MCP servers, history). If the agent refreshed its token and the host file was unchanged meanwhile, the refreshed file is written back atomically. `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` or `OPENAI_API_KEY` in the controller's environment are passed through to the matching agent only.
+
+**Isolation (bubblewrap, no image, no daemon).** Both agents: new user/mount/pid/ipc/uts namespaces, cleared environment, read-only root, read-only `/usr`, own tmpfs `/tmp` and home, network on (see limits). The implementer additionally gets its clone at `/work` (read-write) and nothing of the host: not `$HOME`, not `repoPath`, not `.env`, not `~/.ssh`, not `/mnt`, not the Docker socket. The clone is a standalone repository seeded by `git fetch` from the base commit, with no remote and objects copied, so it cannot alter or push to the real repository. The controller never runs git against the agent's directory: after Claude exits, `git bundle create` of the run branch runs in a fresh sandbox (links the agent planted inside `.git` that point at host paths dangle there, so the build simply fails), the bundle is read back through a no-follow regular-file read into controller-owned evidence, and only that file is fetched (`bundle verify`, hooks disabled). The commit is then verified in the controller's repo (ancestry, non-empty diff, no edits under `.github/`). The reviewer gets only an exported tree of the SHA, read-only, with no `.git` (exported with `checkout-index`, because `git archive` honours `export-ignore`), plus one writable `/out` for its final message. The snapshot is hashed before and after; any change discards the review as tampering (no retry). A sandbox is a hard requirement: without working bubblewrap the preflight fails and nothing runs. The preflight also refuses a missing, unparseable or incompatible binary: each CLI must report a version and its own `--help` must list every flag the controller passes (`CLAUDE_FLAGS`/`CODEX_FLAGS` in `agents.ts`).
+
+**Failure classes.** *Repair* (counts toward the limit of 3; the first attempt is no exception): review FAIL, red CI, no usable commit, a commit that touches protected files. *Infrastructure* (retried `infraRetries` times, never counts): sandbox/CLI/login failure, agent timeout or abnormal exit without delivering, push, PR creation or head mismatch, GitHub/Linear API errors. Other stops: `review-invalid` (malformed output twice), `reviewer-tamper`, `stale-commit`, `ticket-changed`, `ci-timeout`. Every stop writes `escalation.json` (class, reason, attempts, infra events, PR, branch), comments its hash on the ticket and moves it to `blockedState`.
+
+**Run directory** `<runsDir>/<ISSUE>-<runId>/`: `manifest.json`, `events.jsonl`, `escalation.json` (if any), `clone/` (kept unless PASS), `attempt-N/{claude-prompt,claude-output,ci.json,codex-prompt,codex-output[-tryK],review.json,changes.patch,review*/context/}`. Locks: `<runsDir>/locks/<ISSUE>.lock`.
+
+**Cleanup.** Review snapshots and scratch `out*` dirs are deleted after validation (the SHA reproduces them). Staged credential homes are deleted after every invocation. After PASS the clone and the private `refs/devflow/<run>/*` refs are removed, but only when the approved SHA is on the remote branch. Evidence is never deleted. `runsDir` is outside the repository; prune old run directories yourself.
+
+**Known limits (M1).**
+- Network egress is not filtered: both agents must reach their model API, so the sandbox cannot be network-isolated. A prompt-injected agent could send what it can read (its own clone/snapshot and its own login copy) elsewhere. It cannot read anything else of yours.
+- The agent logins are copies, and the reviewer/implementer each hold *their own* login for the duration of a call. Treat a compromised agent as having its own subscription token.
+- Reviewer honesty is not verifiable: the controller checks format, SHA, nonce and coverage, not that the reviewer reasoned well.
+- Bubblewrap needs unprivileged user namespaces (works under WSL2; may not in some CI containers, where the sandbox tests skip and the run refuses).
+- If CI only runs on `pull_request`, the draft PR created by the first push is what triggers it; with no CI at all the run escalates as `ci-timeout`.
+- The reviewer's final message is read from `/out` with `O_NOFOLLOW`, a regular-file check and a size cap, because the directory is agent-writable.
+- Node (and npm) are mounted read-only from the controller's own toolchain prefix so agents can run tests; other toolchains need an equivalent mount (not configurable yet).
+
+### Evidence retention and cleanup (`npm run orchestrate -- prune [--apply]` / `verify`)
+
+Defaults (override per project under `orchestration.retention`): passed runs 30 days, failed/escalated runs **90 days** (failures are always kept at least as
+long as successes), a failed run's clone 7 days (the clone is the only large, reproducible part; all evidence stays), minimum age 14 days before anything is
+removed to satisfy the storage limit, storage limit 2048 MB per runs directory.
+
+- **Dry run is the default**; `--apply` deletes. Every deletion is first appended to `<runsDir>/pruned.jsonl` (run, ticket, outcome, approved SHA, bytes, reason).
+- **Never touched:** active (non-terminal) runs, any ticket that holds a lock, runs younger than `minAgeDays`, anything that is not a real directory directly under
+  `runsDir` named `<ISSUE>-<runId>` with a parseable manifest matching its directory (symlinks and odd entries are reported and kept), and the evidence of any run
+  younger than its retention period.
+- **Storage pressure** removes only already-eligible runs: passed first, then failed, oldest first. If that cannot reach the limit it says so and stops; it never
+  deletes younger evidence to hit a number.
+- Deleting a run also removes its private `refs/devflow/<run>/*` refs in the controller's repository. Pushed `devflow/*` branches and PRs are the owner's to remove.
+- **Checkpoint:** `prune --apply` re-verifies automatically; `verify` can be run any time. It reports non-terminal runs without a lock (interrupted), terminal runs that
+  still hold a lock, locks without a run, passed runs that kept a clone, missing `manifest.json`/`events.jsonl`, and a corrupt `pruned.jsonl`. Non-zero exit on any problem.
+- Run it on a schedule you own (nothing in DevFlow runs it automatically). Credentials are never in the runs directory: agent logins are staged outside it and deleted after every call.
