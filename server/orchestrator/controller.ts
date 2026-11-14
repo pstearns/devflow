@@ -57,9 +57,16 @@ export const Q_AUTHORIZER = 'query Authorizer($id: String!) { issue(id: $id) { h
  * Files the implementer may not touch: CI definitions and every file an agent or tool would treat as configuration/instructions. A commit
  * that edits them is an implementation failure, so "green CI" and agent behaviour can never be authored by the thing being checked.
  */
-const PROTECTED_PREFIX = ['.github/', '.claude/', '.codex/', '.cursor/', '.vscode/', '.zed/', '.devflow/', '.husky/'];
-const PROTECTED_NAME = /^(\.env(\..*)?|devflow\.config.*|\.mcp\.json|AGENTS\.md|CLAUDE\.md|GEMINI\.md|\.gitmodules)$/;
-export const isProtectedPath = (f: string) => PROTECTED_PREFIX.some((p) => f.startsWith(p)) || PROTECTED_NAME.test(basename(f));
+const PROTECTED_DIRS = ['.github', '.claude', '.codex', '.cursor', '.vscode', '.zed', '.devflow', '.husky'];
+const PROTECTED_NAME = /^(\.env(\..*)?|devflow\.config.*|\.mcp\.json|agents\.md|claude\.md|gemini\.md|\.gitmodules)$/;
+/**
+ * Matched on every path segment (so the directory ROOT itself, e.g. a symlink or gitlink named `.claude`, is covered, at any depth) and
+ * case-insensitively (so `.CLAUDE/` or `AGENTS.MD` cannot alias them on a case-insensitive checkout).
+ */
+export const isProtectedPath = (f: string) => {
+  const segs = f.toLowerCase().split('/');
+  return segs.some((x) => PROTECTED_DIRS.includes(x)) || PROTECTED_NAME.test(basename(f).toLowerCase());
+};
 
 type Auth = ReturnType<Orchestrator['authorize']>;
 
@@ -200,7 +207,7 @@ export class Orchestrator {
       const dir = `attempt-${n}`;
 
       // 1. Claude implements / repairs, inside the sandbox. Environment failures retry without consuming this attempt.
-      const prompt = n === 0 ? implementPrompt(ctx, m) : repairPrompt(ctx, m, findings, ciFailure, n);
+      const prompt = n === 0 ? implementPrompt(ctx, m) : repairPrompt(ctx, m, findings, ciFailure, n, a.startSha);
       store.evidence(m, `${dir}/claude-prompt.txt`, prompt);
       const res = await this.runClaude(store, m, a, oc, prompt, dir);
 
@@ -537,7 +544,7 @@ Rules:
 - Do not modify CI definitions, agent/tool configuration or instruction files (.github/, .claude/, .env*, AGENTS.md, CLAUDE.md, devflow.config*): such commits are rejected. There is no remote and no network credential, by design: do not try to push.
 - An independent reviewer will examine the exact commit afterwards.`;
 }
-function repairPrompt(ctx: Ctx, m: Manifest, findings: Finding[], ci: string | undefined, n: number) {
+function repairPrompt(ctx: Ctx, m: Manifest, findings: Finding[], ci: string | undefined, n: number, accepted: string) {
   const list = findings.map((f) => `- [${f.severity}] ${f.id} ${f.file}${f.line ? `:${f.line}` : ''} — ${f.title}\n  ${f.detail}\n  evidence: ${f.evidence}`).join('\n');
   return `Repair attempt ${n} of ${MAX_REPAIRS} for ${ctx.identifier}: ${ctx.title}. You are in the same repository, branch \`${m.branch}\`.
 Your previous attempt was not accepted. Fix exactly what is listed; do not widen scope.
@@ -546,7 +553,7 @@ ${ci ? `CI FAILED:\n${ci}\n` : ''}${list ? `INDEPENDENT REVIEW FINDINGS (from a 
 Ticket specification:
 ${ctx.description}
 
-Commit your fix as a NEW commit on this branch (do not amend or rewrite history that was already accepted). EXCEPTION: if a commit was rejected for touching a protected file (.github/, .env*, agent or tool configuration), that commit was never pushed and no commit in the branch may touch such a file even if a later commit reverts it: rebuild the branch from the base commit (\`git reset --soft ${m.baseSha}\` and commit again without those files). Run the tests. Leave nothing uncommitted. Do not modify CI definitions, agent/tool configuration or instruction files. Do not push.`;
+Commit your fix as a NEW commit on this branch (do not amend or rewrite history that was already accepted). EXCEPTION: if a commit was rejected for touching a protected file (.github/, .env*, agent or tool configuration), that commit was never pushed and no commit in the branch may touch such a file even if a later commit reverts it: rebuild ONLY the unaccepted commits on top of the last accepted commit ${accepted} (\`git reset --soft ${accepted}\`, remove the forbidden files from the index and working tree, commit again). Never reset below ${accepted}: it was already pushed. Run the tests. Leave nothing uncommitted. Do not modify CI definitions, agent/tool configuration or instruction files. Do not push.`;
 }
 function reviewPrompt(ctx: Ctx, sha: string, nonce: string) {
   return `You are an INDEPENDENT code reviewer. You are read-only: do not attempt to modify anything.

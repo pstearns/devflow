@@ -73,10 +73,18 @@ export class GithubCi implements CiProvider {
 
   private async statuses(repo: string, sha: string): Promise<CheckItem[]> {
     try {
-      const st = await this.gh.get(`/repos/${repo}/commits/${sha}/status`, { per_page: 100 });
-      const sl = isObj(st) && Array.isArray(st.statuses) ? st.statuses : [];
-      if (isObj(st) && typeof st.total_count === 'number' && st.total_count > sl.length) throw new SourceError('invalid', 'incomplete commit-status list: refusing to treat partial CI evidence as green');
-      return normalizeCommitStatuses({ statuses: sl });
+      const out: unknown[] = [];
+      let total = Infinity;
+      for (let page = 1; out.length < total; page++) {
+        if (page > 10) throw new SourceError('invalid', 'incomplete commit-status list: refusing to treat partial CI evidence as green');
+        const st = await this.gh.get(`/repos/${repo}/commits/${sha}/status`, { per_page: 100, page });
+        const sl = isObj(st) && Array.isArray(st.statuses) ? st.statuses : [];
+        total = isObj(st) && typeof st.total_count === 'number' ? st.total_count : sl.length;
+        out.push(...sl);
+        if (!sl.length) break;
+      }
+      if (out.length < total) throw new SourceError('invalid', 'incomplete commit-status list: refusing to treat partial CI evidence as green');
+      return normalizeCommitStatuses({ statuses: out });
     } catch (e) {
       if (!(e instanceof SourceError) || e.kind !== 'auth') throw e;
       return [UNREADABLE_STATUSES]; // external CI cannot be ruled out: never green

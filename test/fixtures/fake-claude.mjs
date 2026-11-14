@@ -29,6 +29,14 @@ if (!repair) {
   if (scenario === 'touch-ci' || scenario === 'touch-ci-always') { mkdirSync('.github/workflows', { recursive: true }); writeFileSync('.github/workflows/ci.yml', 'name: ci\non: push\njobs: {}\n'); }
 } else if (scenario === 'never-fixes' || scenario === 'touch-ci-always') {
   writeFileSync('src/slugify.mjs', BUGGY + `// repair try ${Date.now()}\n`);
+} else if (scenario === 'review-then-touch' && /Repair attempt 1 /.test(prompt)) {
+  // attempt 1: a protected file lands on top of the already-pushed commit A
+  writeFileSync('src/slugify.mjs', BUGGY + '// still wrong\n'); mkdirSync('.github/workflows', { recursive: true }); writeFileSync('.github/workflows/ci.yml', 'name: ci\n'); git('add', 'src', '.github');
+} else if (scenario === 'review-then-touch') {
+  // attempt 2: follow the controller's instruction literally: rebuild the unaccepted suffix on top of the LAST ACCEPTED commit it names
+  const accepted = /git reset --soft ([0-9a-f]{40})/.exec(prompt)[1];
+  git('reset', '-q', '--soft', accepted); git('rm', '-rq', '--cached', '--ignore-unmatch', '.github'); execFileSync('rm', ['-rf', '.github']);
+  mkdirSync('src', { recursive: true }); writeFileSync('src/slugify.mjs', FIXED); writeFileSync('test/slugify.test.mjs', test('hello-world'));
 } else {
   if (scenario === 'touch-ci') execFileSync('git', ['reset', '-q', '--hard', 'HEAD~1']); // rebuild the unpushed branch WITHOUT the forbidden file in any commit
   mkdirSync('src', { recursive: true }); mkdirSync('test', { recursive: true });

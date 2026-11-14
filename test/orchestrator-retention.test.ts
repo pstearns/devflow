@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_RETENTION, plan, prune, scan, verify, type RetentionPolicy } from '../server/orchestrator/retention.ts';
@@ -63,18 +63,45 @@ describe('retention policy', () => {
     expect(r.after!.bytes).toBeLessThan(r.before.bytes);
   });
 
-  it('under storage pressure removes only age-eligible runs, passed first then failed, oldest first, and reports when it cannot reach the limit', async () => {
+  it('under storage pressure only clones are dropped early (oldest first); whole runs are NEVER removed before their retention period, and the report says so', async () => {
     const pol: RetentionPolicy = { passDays: 3650, failureDays: 3650, cloneDays: 3650, minAgeDays: 14, maxTotalMB: 100 };
-    const big = 40 * 1024; // 40 MB each
-    const pOld = run({ outcome: 'PASS', ageDays: 50, kb: big }), pMid = run({ outcome: 'PASS', ageDays: 20, kb: big }), fOld = run({ ageDays: 90, kb: big }), young = run({ outcome: 'PASS', ageDays: 3, kb: big });
+    const mb = 1024; // kb
+    const a = run({ outcome: 'PASS', ageDays: 50, kb: 1, cloneKb: 60 * mb }), b = run({ ageDays: 20, kb: 1, cloneKb: 60 * mb }), c = run({ outcome: 'PASS', ageDays: 3, kb: 1, cloneKb: 60 * mb });
     const p = plan(scan(root, NOW), pol);
-    expect(p.actions.map((a) => a.name)).toEqual([pOld, pMid]); // passed before failed, oldest first, stops once under the limit (4*40=160 -> 80)
-    expect(existsSync(join(root, fOld))).toBe(true); expect(existsSync(join(root, young))).toBe(true);
-    const tight = plan(scan(root, NOW), { ...pol, maxTotalMB: 100 });
-    expect(tight.warnings).toEqual([]);
-    const impossible = plan(scan(root, NOW), { ...pol, maxTotalMB: 100, minAgeDays: 100 });
-    expect(impossible.actions).toEqual([]);
-    expect(impossible.warnings.join(' ')).toMatch(/over the 100 MB limit/);
+    expect(p.actions.map((x) => `${x.kind} ${x.name}`)).toEqual([`drop-clone ${a}`, `drop-clone ${b}`]); // 180 MB -> 60 MB, oldest first, stops when under the limit
+    expect(p.warnings).toEqual([]);
+    expect(c).toBeDefined();
+    // evidence-only pressure: a 15-day-old escalated run of 150 MB must NOT be deleted although the limit is exceeded
+    run({ ageDays: 15, kb: 150 * mb });
+    const q = plan(scan(root, NOW), { ...pol, maxTotalMB: 100, failureDays: 90 });
+    expect(q.actions.every((x) => x.kind === 'drop-clone')).toBe(true);
+    expect(q.warnings.join(' ')).toMatch(/over the 100 MB limit.*nothing was deleted to meet the number/);
+  });
+
+  it('re-decides under the ticket lock: a run that starts, changes state, or swaps its directory between the scan and the delete is skipped', async () => {
+    const mk = () => { const name = run({ outcome: 'PASS', ageDays: 45 }); return { name, ticket: name.split('-').slice(0, 2).join('-') }; };
+    // 1. another controller takes the ticket lock after the scan
+    let x = mk();
+    let r = await prune(root, small, { apply: true, now: NOW, beforeAction: (n) => { if (n === x.name) writeFileSync(join(root, 'locks', `${x.ticket}.lock`), '{}'); } });
+    expect(r.applied).toEqual([]); expect(r.warnings.join('\n')).toMatch(/is locked/); expect(existsSync(join(root, x.name))).toBe(true);
+    rmSync(join(root, 'locks', `${x.ticket}.lock`)); rmSync(join(root, x.name), { recursive: true });
+    // 2. the run's manifest flips to an active state
+    x = mk();
+    r = await prune(root, small, { apply: true, now: NOW, beforeAction: (n) => { if (n === x.name) { const f = join(root, x.name, 'manifest.json'); writeFileSync(f, JSON.stringify({ ...JSON.parse(readFileSync(f, 'utf8')), state: 'implementing' })); } } });
+    expect(r.applied).toEqual([]); expect(r.warnings.join('\n')).toMatch(/no longer eligible/); expect(existsSync(join(root, x.name))).toBe(true);
+    rmSync(join(root, x.name), { recursive: true });
+    // 3. the directory is replaced (new inode) by something else of the same name
+    x = mk();
+    const victim = mkdtempSync(join(tmpdir(), 'devflow-victim-')); writeFileSync(join(victim, 'precious'), 'x');
+    r = await prune(root, small, { apply: true, now: NOW, beforeAction: (n) => { if (n === x.name) { const m = readFileSync(join(root, x.name, 'manifest.json'), 'utf8'); renameSync(join(root, x.name), join(root, `${x.name}.moved`)); mkdirSync(join(root, x.name)); writeFileSync(join(root, x.name, 'manifest.json'), m); } } });
+    expect(r.applied).toEqual([]); expect(r.warnings.join('\n')).toMatch(/identity changed/); expect(existsSync(join(victim, 'precious'))).toBe(true);
+    rmSync(victim, { recursive: true, force: true });
+  });
+
+  it('the lock it takes is released afterwards, and a normal prune leaves no lock behind', async () => {
+    run({ outcome: 'PASS', ageDays: 45 });
+    await prune(root, small, { apply: true, now: NOW });
+    expect(readdirSync(join(root, 'locks'))).toEqual([]);
   });
 
   it('writes an append-only index entry BEFORE deleting, and removes the pruned run’s private git refs', async () => {
@@ -143,6 +170,17 @@ describe('cleanup verification checkpoint', () => {
     expect(c.ok).toBe(false);
     const text = c.problems.join('\n');
     for (const re of [/non-terminal state "verifying-commit" but no lock/, /terminal run still holds the ATL-700 lock/, /lock ATL-701: no active run/, /passed run still has its clone/, /missing events\.jsonl/, /pruned\.jsonl line 2/]) expect(text).toMatch(re);
+  });
+  it('a missing runs directory, or a run-shaped directory with a missing/corrupt/mismatched manifest, is a checkpoint FAILURE (and is still preserved)', () => {
+    expect(verify(join(root, 'nope'), undefined, NOW)).toMatchObject({ ok: false });
+    mkdirSync(join(root, 'ATL-5-nomanifest1')); mkdirSync(join(root, 'ATL-6-corrupt1xx')); writeFileSync(join(root, 'ATL-6-corrupt1xx', 'manifest.json'), '{nope');
+    mkdirSync(join(root, 'notes')); // not run-shaped: fine
+    const c = verify(root, undefined, NOW);
+    expect(c.ok).toBe(false);
+    expect(c.problems.join('\n')).toMatch(/ATL-5-nomanifest1: manifest missing or unreadable/);
+    expect(c.problems.join('\n')).toMatch(/ATL-6-corrupt1xx/);
+    expect(c.problems.join('\n')).not.toMatch(/notes/);
+    expect(existsSync(join(root, 'ATL-5-nomanifest1'))).toBe(true);
   });
   it('after an applied prune the checkpoint holds and every remaining manifest still parses', async () => {
     run({ outcome: 'PASS', ageDays: 50 }); const keep = run({ ageDays: 30, cloneKb: 10 }); run({ ageDays: 120 });

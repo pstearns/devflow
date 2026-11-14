@@ -135,10 +135,25 @@ describe('untrusted repository content is data, never policy', () => {
     expect(src).not.toMatch(/loadConfig|loadEnvFile|process\.loadEnvFile|JSON\.parse\(readFileSync\([^)]*(clone|repoPath)/);
   });
   it('commits that touch configuration/CI/agent-instruction files are rejected as implementation failures', () => {
-    for (const f of ['.github/workflows/ci.yml', '.claude/settings.json', '.codex/config.toml', '.cursor/mcp.json', '.vscode/mcp.json', '.devflow/policy.json', '.husky/pre-commit', '.env', '.env.local', 'sub/.env', 'devflow.config.json', 'devflow.config.example.json', '.mcp.json', 'AGENTS.md', 'sub/CLAUDE.md', 'GEMINI.md', '.gitmodules'])
+    for (const f of ['.github/workflows/ci.yml', '.claude/settings.json', '.codex/config.toml', '.cursor/mcp.json', '.vscode/mcp.json', '.devflow/policy.json', '.husky/pre-commit', '.env', '.env.local', 'sub/.env', 'devflow.config.json', 'devflow.config.example.json', '.mcp.json', 'AGENTS.md', 'sub/CLAUDE.md', 'GEMINI.md', '.gitmodules',
+      // directory ROOTS (a symlink or gitlink named like the directory), any case, any depth
+      '.claude', '.codex', '.github', '.CLAUDE/settings.json', '.Github/workflows/x.yml', 'AGENTS.MD', 'Claude.md', 'sub/.claude', 'docs/.github/x', 'docs/agents.md'])
       expect(isProtectedPath(f), f).toBe(true);
-    for (const f of ['src/slugify.mjs', 'README.md', 'docs/agents.md', 'test/a.test.mjs', 'github/x.md', 'src/.envelope.ts'])
+    for (const f of ['src/slugify.mjs', 'README.md', 'test/a.test.mjs', 'github/x.md', 'src/.envelope.ts', 'docs/claude-notes.md', 'src/claude.ts', 'agents/index.ts'])
       expect(isProtectedPath(f), f).toBe(false);
+  });
+  it.skipIf(!usable)('repair after a rejected protected-file commit rebuilds ONLY the unaccepted suffix on top of the last ACCEPTED (pushed) commit, and passes the ancestry check and a non-force push', async () => {
+    const w = world({ scenario: 'review-then-touch' });
+    const m = await w.orch.run('ATL-22');
+    expect(m.attempts).toHaveLength(3);
+    expect(m.attempts[0]!.review!.verdict).toBe('FAIL');            // A: valid, pushed, rejected by review
+    expect(m.attempts[1]!.failure).toMatch(/protected configuration/); // B: touched .github on top of A, never pushed
+    expect(m.outcome).toBe('PASS');                                  // C: rebuilt on top of A
+    const prompt = readFileSync(join(runDir(w), 'attempt-2', 'claude-prompt.txt'), 'utf8');
+    expect(prompt).toContain(`git reset --soft ${m.attempts[0]!.headSha}`);
+    expect(prompt).not.toContain(`git reset --soft ${m.baseSha}`);
+    expect(execFileSync('git', ['merge-base', '--is-ancestor', m.attempts[0]!.headSha!, m.approvedSha!], { cwd: w.origin }).length).toBe(0);
+    expect(execFileSync('git', ['log', '--format=', '--name-only', `${m.baseSha}..${m.approvedSha}`], { cwd: w.origin, encoding: 'utf8' }).split('\n').filter((f) => f.startsWith('.github'))).toEqual([]);
   });
   it.skipIf(!usable)('a hostile-config commit by the implementer is rejected before push, CI or review, however many times it is tried', async () => {
     const w = world({ scenario: 'touch-ci-always' });
@@ -264,7 +279,7 @@ describe('Codex review findings (regressions)', () => {
     expect(w.ci.calls).toHaveLength(1); // the rejected commit was never pushed, CI'd or reviewed
     const done = await import('node:fs').then((f) => f.readFileSync(join(runDir(w), 'attempt-1', 'claude-prompt.txt'), 'utf8'));
     expect(done).toContain('protected configuration');
-    expect(done).toContain('git reset --soft');
+    expect(done).toContain(`git reset --soft ${m.baseSha}`); // nothing accepted yet, so the last accepted commit IS the base
     expect(execFileSync('git', ['log', '--format=', '--name-only', `${m.baseSha}..${m.approvedSha}`], { cwd: w.origin, encoding: 'utf8' }).trim().split('\n').filter((f) => f.startsWith('.github'))).toEqual([]); // no pushed commit ever touched it
   });
 });
