@@ -2,6 +2,8 @@
 // and asserts that it fails. They need bubblewrap (skipped, loudly, where user namespaces are unavailable).
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -240,9 +242,9 @@ describe('git push surface: feature branches only', () => {
   it('refuses any destination that is not a devflow run branch, and any source that is not a private run ref', async () => {
     const src = sourceRepo();
     for (const branch of ['main', 'master', 'release/1', 'devflow/x', 'devflow/atl-1', 'HEAD', 'refs/heads/main', 'devflow/atl-1-abcdef1 --force'])
-      expect(() => G.pushRef(src, 'refs/devflow/abc123/attempt-0', branch), branch).toThrow(/not a DevFlow run branch/);
+      await expect(G.pushRef(src, 'refs/devflow/abc123/attempt-0', branch), branch).rejects.toThrow(/not a DevFlow run branch/);
     for (const ref of ['refs/heads/main', 'HEAD', 'refs/devflow/abc/attempt-0 --delete', '+refs/devflow/abc/attempt-0'])
-      expect(() => G.pushRef(src, ref, 'devflow/atl-1-abcdef1'), ref).toThrow(/private refs\/devflow/);
+      await expect(G.pushRef(src, ref, 'devflow/atl-1-abcdef1'), ref).rejects.toThrow(/private refs\/devflow/);
   });
   it('a real push goes only to the run branch and never touches main', async () => {
     const src = sourceRepo(), bare = uniq('bare.git');
@@ -253,6 +255,37 @@ describe('git push surface: feature branches only', () => {
     expect(sh(bare, 'rev-parse', 'refs/heads/main')).toBe(main);
     expect(sh(bare, 'rev-parse', 'refs/heads/devflow/atl-1-abcdef1')).toBe(sh(src, 'rev-parse', 'HEAD'));
     expect(sh(bare, 'for-each-ref', '--format=%(refname)').split('\n').sort()).toEqual(['refs/heads/devflow/atl-1-abcdef1', 'refs/heads/main']);
+  });
+});
+
+describe('git push credential routing', () => {
+  it('authenticates with the explicit write token, never the ambient read token or a global credential helper', async () => {
+    const seen: string[] = [];
+    const server = createServer((req, res) => {
+      const auth = req.headers.authorization;
+      if (!auth) { res.writeHead(401, { 'www-authenticate': 'Basic realm="t"' }).end(); return; }
+      seen.push(Buffer.from(auth.replace(/^Basic /, ''), 'base64').toString('utf8')); res.writeHead(403).end('denied');
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const src = sourceRepo(); sh(src, 'remote', 'add', 'origin', `http://127.0.0.1:${(server.address() as AddressInfo).port}/o/r.git`);
+    sh(src, 'update-ref', 'refs/devflow/abc123/attempt-0', 'HEAD');
+    const globalCfg = uniq('gitconfig'); // a global helper that answers with the READ token, like `gh auth git-credential` with GITHUB_TOKEN set
+    writeFileSync(globalCfg, '[credential]\n\thelper = "!f() { echo username=reader; echo password=READ-TOKEN; }; f"\n');
+    const before = ['GIT_CONFIG_GLOBAL', 'GITHUB_TOKEN', 'GH_TOKEN'].map((k) => [k, process.env[k]] as const);
+    const leftovers = () => readdirSync(tmpdir()).filter((f) => f.startsWith('devflow-askpass-')).length, dirsBefore = leftovers();
+    process.env.GIT_CONFIG_GLOBAL = globalCfg; process.env.GITHUB_TOKEN = 'READ-TOKEN'; process.env.GH_TOKEN = 'READ-TOKEN';
+    try {
+      await expect(G.pushRef(src, 'refs/devflow/abc123/attempt-0', 'devflow/atl-1-abcdef1', 'WRITE-TOKEN')).rejects.toThrow(/403/);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((c) => c === 'x-access-token:WRITE-TOKEN'), seen.join(',')).toBe(true);
+      seen.length = 0;
+      await expect(G.pushRef(src, 'refs/devflow/abc123/attempt-0', 'devflow/atl-1-abcdef1')).rejects.toThrow(); // no token: fails closed
+      expect(seen.join(',')).not.toContain('READ-TOKEN');
+      expect(leftovers()).toBe(dirsBefore); // askpass directory removed on success and failure
+    } finally {
+      for (const [k, v] of before) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      await new Promise((r) => server.close(r));
+    }
   });
 });
 

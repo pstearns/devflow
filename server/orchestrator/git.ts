@@ -1,7 +1,8 @@
 // Thin, shell-free git helpers. Every call is execFile with an argument array: no string is ever interpreted by a shell.
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { RUN_BRANCH_RE } from './types.ts';
 
@@ -72,12 +73,41 @@ export async function importBundle(repo: string, bundleFile: string, branch: str
   return resolveRef(repo, ref);
 }
 export const deleteRef = (repo: string, ref: string) => git(repo, ['update-ref', '-d', ref]).catch(() => '');
-/** Non-force push of one private ref to one branch. Runs in the controller only, with the user's own git credentials. */
-export function pushRef(repo: string, ref: string, branch: string) {
+/**
+ * Askpass script: holds NO secret. git runs it as `script "<prompt>"`; the token arrives only through the child's environment
+ * (never argv, a URL or a file).
+ */
+const ASKPASS = `#!/bin/sh
+case "$1" in
+  Username*) printf '%s\\n' x-access-token ;;
+  *) printf '%s\\n' "$DEVFLOW_PUSH_TOKEN" ;;
+esac
+`;
+const AMBIENT_GH_TOKENS = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'];
+
+/**
+ * Non-force push of one private ref to one branch. Runs in the controller only. It authenticates with the explicit write `token` and never
+ * with an ambient credential: the user's credential helpers are disabled for this call (a `gh auth git-credential` helper would otherwise
+ * answer with the read-only GITHUB_TOKEN from the environment), and the ambient GitHub token variables are removed from the child.
+ * Without a token nothing is supplied, so a GitHub push fails closed instead of borrowing another credential.
+ */
+export async function pushRef(repo: string, ref: string, branch: string, token?: string) {
   // Feature-branch-only writes, enforced here and not just by remote protection: no other destination name can be pushed, ever.
   if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to push: "${branch.slice(0, 80)}" is not a DevFlow run branch (devflow/<ticket>-<run>)`);
   if (!/^refs\/devflow\/[A-Za-z0-9]+\/attempt-\d$/.test(ref)) throw new Error('refusing to push: source must be a private refs/devflow/<run>/attempt-N ref');
-  return git(repo, ['push', '--no-follow-tags', 'origin', `${ref}:refs/heads/${branch}`], ambientEnv()); // never --force; the only call that uses the owner's git credentials
+  const env = ambientEnv();
+  for (const k of AMBIENT_GH_TOKENS) delete env[k];
+  delete env.GIT_ASKPASS; delete env.SSH_ASKPASS; delete env.DEVFLOW_PUSH_TOKEN;
+  const dir = mkdtempSync(join(tmpdir(), 'devflow-askpass-')); // mode 0700, owner only
+  try {
+    if (token) {
+      const script = join(dir, 'askpass.sh');
+      writeFileSync(script, ASKPASS, { mode: 0o700 });
+      env.GIT_ASKPASS = script; env.DEVFLOW_PUSH_TOKEN = token;
+    }
+    // `-c credential.helper=` resets the helper list, so no global/system helper runs. Never --force. The token is not in argv.
+    return await git(repo, ['-c', 'credential.helper=', 'push', '--no-follow-tags', 'origin', `${ref}:refs/heads/${branch}`], env);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 function blobs(repo: string, oids: string[]): Promise<Buffer[]> {
