@@ -67,6 +67,11 @@ describe('trusted policy: what counts as verifiable (fail closed)', () => {
     for (const bad of ['--dangerously-skip-permissions', 'Bash(rm -rf /),Read', 'Read\nBash', '', '-p', 'Bash(git status:*) --add-dir /'])
       expect(() => verifyPolicy({ ...oc(w), claude: { ...oc(w).claude, allowedTools: ['Read', bad] } }, w.configPath), JSON.stringify(bad)).toThrow(/plain tool pattern/);
   });
+  it('the digest changes if maxRepairs changes, so the limit cannot be altered under a running run', () => {
+    const w = world();
+    expect(verifyPolicy({ ...oc(w), maxRepairs: 1 }, w.configPath).digest).not.toBe(verifyPolicy({ ...oc(w), maxRepairs: 3 }, w.configPath).digest);
+  });
+
   it('the digest changes if the config bytes or an executable changes', () => {
     const w = world();
     const before = verifyPolicy(oc(w), w.configPath).digest;

@@ -148,6 +148,31 @@ describe('three failed repairs escalate', () => {
     expect(existsSync(join(w.runsDir, 'locks', 'ATL-22.lock'))).toBe(false);
   });
 
+  it('maxRepairs: 1 stops on the second FAIL with exactly one repair and says so in the audit trail', async () => {
+    const w = world({ scenario: 'never-fixes', maxRepairs: 1 });
+    const m = await w.orch.run('ATL-22');
+    expect(m.state).toBe('escalated');
+    expect(m.maxRepairs).toBe(1);
+    expect(m.reasonClass).toBe('repairs-exhausted');
+    expect(m.attempts).toHaveLength(2);
+    expect(w.calls).toEqual({ implement: 2, review: 2 });
+    const c = w.comments();
+    expect(c.filter((b) => /Milestone 4\/6/.test(b) && b.includes('**FAIL**'))).toHaveLength(2);
+    expect(c.at(-1)).toContain('Repair attempts used: 1/1');
+    expect(c.at(-2)).toContain('No repair available');
+    expect(c[0]).toContain('initial attempt + 1 repair;');
+    expect(stateOf(w)).toBe('Blocked');
+    expect(m.approvedSha).toBeUndefined();
+  });
+
+  it('maxRepairs: 0 allows no repair at all', async () => {
+    const w = world({ scenario: 'never-fixes', maxRepairs: 0 });
+    const m = await w.orch.run('ATL-22');
+    expect(m.state).toBe('escalated');
+    expect(m.attempts).toHaveLength(1);
+    expect(w.calls).toEqual({ implement: 1, review: 1 });
+  });
+
   it('a Claude run that commits nothing on the first attempt escalates without spending a reviewer', async () => {
     const w = world({ scenario: 'no-commit' });
     const m = await w.orch.run('ATL-22');

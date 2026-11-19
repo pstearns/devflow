@@ -22,7 +22,7 @@ import { RunStore } from './manifest.ts';
 import { PolicyError, type Pinned } from './policy.ts';
 import type { PullRequests } from './pr.ts';
 import { REVIEW_SCHEMA, ReviewInvalid, parseReviewOutput, validateReview } from './review.ts';
-import { MAX_REPAIRS, type AttemptRecord, type FailureClass, type Finding, type Manifest, type Review } from './types.ts';
+import { repairLimit, type AttemptRecord, type FailureClass, type Finding, type Manifest, type Review } from './types.ts';
 
 /** The ticket may not be executed (authorization, state, duplicate, configuration, failed preflight, unverifiable policy). Nothing was started. */
 export class Rejected extends Error {}
@@ -146,7 +146,7 @@ export class Orchestrator {
         version: 1, runId, ticket, issueId: ctx.id, title: ctx.title, project: auth.projectId, repo: oc.repo, baseBranch: oc.baseBranch, baseSha,
         branch: `devflow/${ticket.toLowerCase()}-${runId}`, clone: '', state: 'accepted', attempts: [], linearCommentIds: [], infra: [],
         linearStates: { startedId: auth.started.id, approvalId: auth.approval.id, blockedId: auth.blocked.id, blockedName: auth.blocked.name },
-        policyDigest: pinned.digest, agents: { claude: pf.versions?.claude, codex: pf.versions?.codex }, authorizedBy: who.who,
+        policyDigest: pinned.digest, maxRepairs: oc.maxRepairs, agents: { claude: pf.versions?.claude, codex: pf.versions?.codex }, authorizedBy: who.who,
         originalStateId: ctx.state.id, createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
       };
       m.clone = join(store.runDir(m), 'clone');
@@ -195,11 +195,11 @@ export class Orchestrator {
 
   // ---------------------------------------------------------------- the loop (n counts REPAIR attempts only)
   private async loop(store: RunStore, m: Manifest, ctx: Ctx, auth: Auth, pinned: Pinned): Promise<Manifest> {
-    const oc = auth.oc;
+    const oc = auth.oc, limit = repairLimit(m);
     let findings: Finding[] = [];
     let ciFailure: string | undefined;
     let startSha = m.baseSha;
-    for (let n = 0; n <= MAX_REPAIRS; n++) {
+    for (let n = 0; n <= limit; n++) {
       const a: AttemptRecord = { n, startSha };
       m.attempts.push(a);
       pinned.verify();
@@ -217,7 +217,7 @@ export class Orchestrator {
       if (bad) {
         a.failure = bad; this.save(store, m, 'attempt-failed', { attempt: n, reason: bad });
         findings = [controllerFinding(bad)]; ciFailure = undefined;
-        if (n === MAX_REPAIRS) break;
+        if (n === limit) break;
         continue;
       }
       const sha = a.headSha!;
@@ -250,7 +250,7 @@ export class Orchestrator {
       if (ci.state === 'failure') {
         a.failure = `CI failed: ${ci.detail}`;
         findings = []; ciFailure = ci.detail;
-        if (n === MAX_REPAIRS) break;
+        if (n === limit) break;
         continue;
       }
 
@@ -270,9 +270,9 @@ export class Orchestrator {
       if (review.verdict === 'PASS') return this.pass(store, m, auth, sha, pinned, gate);
       a.failure = `Review FAIL with ${review.findings.length} finding(s)`;
       findings = review.findings; ciFailure = undefined;
-      if (n === MAX_REPAIRS) break;
+      if (n === limit) break;
     }
-    return this.escalate(store, m, 'repairs-exhausted', `${MAX_REPAIRS} repair attempts did not produce a passing, CI-green, independently reviewed commit`);
+    return this.escalate(store, m, 'repairs-exhausted', `${limit} repair attempt${limit === 1 ? '' : 's'} did not produce a passing, CI-green, independently reviewed commit`);
   }
 
   /** The checks that must hold, from the controller's own observations, before a review result is published or acted on. */
@@ -546,7 +546,7 @@ Rules:
 }
 function repairPrompt(ctx: Ctx, m: Manifest, findings: Finding[], ci: string | undefined, n: number, accepted: string) {
   const list = findings.map((f) => `- [${f.severity}] ${f.id} ${f.file}${f.line ? `:${f.line}` : ''} — ${f.title}\n  ${f.detail}\n  evidence: ${f.evidence}`).join('\n');
-  return `Repair attempt ${n} of ${MAX_REPAIRS} for ${ctx.identifier}: ${ctx.title}. You are in the same repository, branch \`${m.branch}\`.
+  return `Repair attempt ${n} of ${repairLimit(m)} for ${ctx.identifier}: ${ctx.title}. You are in the same repository, branch \`${m.branch}\`.
 Your previous attempt was not accepted. Fix exactly what is listed; do not widen scope.
 
 ${ci ? `CI FAILED:\n${ci}\n` : ''}${list ? `INDEPENDENT REVIEW FINDINGS (from a different agent; verify each against the code before acting):\n${list}\n` : ''}

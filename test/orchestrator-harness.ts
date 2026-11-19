@@ -68,7 +68,7 @@ export class FakePrs implements PullRequests {
 }
 
 export interface WorldOpts {
-  scenario?: string; labels?: string[]; state?: string; blockedBy?: number[]; project?: string | null; omitOrchestration?: boolean;
+  scenario?: string; labels?: string[]; state?: string; blockedBy?: number[]; project?: string | null; omitOrchestration?: boolean; maxRepairs?: number;
   ci?: 'real' | 'timeout'; prs?: 'ok' | 'stale'; noLogin?: boolean; seed?: Record<string, string>; second?: boolean; onSleep?: () => void; linearOpts?: Parameters<typeof demoFetch>[1]; onLinearRead?: (n: number) => void;
   /** Real agents: run the REAL claude/codex binaries with the user's real logins (staged into the sandbox as copies). Synthetic repo/ticket only. */
   live?: { claudeBin: string; codexBin: string; description: string }; wrapAgents?: (inner: AgentRunner, w: { origin: string; repo: string }) => AgentRunner; secrets?: boolean;
@@ -88,7 +88,7 @@ export function makeWorld(o: WorldOpts = {}) {
     projects: [{
       id: 'atlas', name: 'Atlas', linear: { teamKey: 'ATL', projects: ['Atlas'] }, github: { repos: ['demo-org/atlas'] },
       orchestration: o.omitOrchestration ? undefined : {
-        repo: 'demo-org/atlas', repoPath: repo, baseBranch: 'main', runsDir, ciChecks: ['local-ci'], ciTimeoutMinutes: 1, agentTimeoutMinutes: 1,
+        repo: 'demo-org/atlas', repoPath: repo, baseBranch: 'main', runsDir, ciChecks: ['local-ci'], ...(o.maxRepairs === undefined ? {} : { maxRepairs: o.maxRepairs }), ciTimeoutMinutes: 1, agentTimeoutMinutes: 1,
         claude: o.live ? { bin: o.live.claudeBin, allowedTools: ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(node:*)', 'Bash(npm test:*)'] } : { bin: join(FIX, 'fake-claude.mjs') },
         codex: { bin: o.live ? o.live.codexBin : join(FIX, 'fake-codex.mjs') }, ...(o.live ? { agentTimeoutMinutes: 15 } : {}),
       },

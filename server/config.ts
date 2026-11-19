@@ -3,6 +3,7 @@ import { isObj, str, arr } from './util.ts';
 import type { PromptDef } from '../shared/types.ts';
 import { TOOL_RE } from './orchestrator/policy.ts';
 import { DEFAULT_RETENTION, type RetentionPolicy } from './orchestrator/retention.ts';
+import { MAX_REPAIRS } from './orchestrator/types.ts';
 
 export interface KnowledgeCfg { title: string; kind: 'obsidian' | 'repo' | 'url'; path?: string; repo?: string; ref?: string; url?: string }
 /** Names of Linear labels/states that carry lifecycle meaning. Configuration, not code: nothing project-specific is built in. */
@@ -40,6 +41,7 @@ export interface OrchestrationCfg {
   startedState: string; // Linear state the ticket moves to when a run is accepted
   approvalState: string; // Linear state that means "waiting for the owner" (PASS)
   blockedState: string; // Linear state for escalations; must exist so a failure can always be recorded
+  maxRepairs: number; // repair attempts after the first implementation (0-3, default 3); `1` = one remediation cycle, a second FAIL escalates
   infraRetries: number; // retries of an infrastructure step; never consumes a repair attempt
   ciChecks: string[]; // check/workflow names that must be green on the SHA (empty = at least one check, all green)
   ciTimeoutMinutes: number;
@@ -152,13 +154,15 @@ function parseOrchestration(raw: unknown, id: string, repos: string[]): Orchestr
     if (pol.failureDays < pol.passDays) throw new Error(`${at}.retention.failureDays must be >= passDays: failures are preserved at least as long as successes`);
     return pol;
   };
+  const maxRepairs = raw.maxRepairs === undefined ? MAX_REPAIRS : raw.maxRepairs;
+  if (typeof maxRepairs !== 'number' || !Number.isInteger(maxRepairs) || maxRepairs < 0 || maxRepairs > MAX_REPAIRS) throw new Error(`${at}.maxRepairs must be an integer from 0 to ${MAX_REPAIRS}`);
   const claude = isObj(raw.claude) ? raw.claude : {};
   const codex = isObj(raw.codex) ? raw.codex : {};
   const bin = (v: unknown, what: string) => { const b = str(v, 500) ?? ''; if (!b.startsWith('/') || /\s/.test(b)) throw new Error(`${at}.${what}.bin must be an explicit absolute path to the executable (no PATH lookup, no arguments)`); return b; };
   return {
     repo, repoPath: abs('repoPath'), baseBranch: str(raw.baseBranch, 100) ?? 'main', runsDir: abs('runsDir'),
     startedState: str(raw.startedState, 100) ?? 'In Progress', approvalState: str(raw.approvalState, 100) ?? 'In Review',
-    blockedState: str(raw.blockedState, 100) ?? 'Blocked', infraRetries: typeof raw.infraRetries === 'number' ? Math.min(5, Math.max(0, Math.floor(raw.infraRetries))) : 2,
+    blockedState: str(raw.blockedState, 100) ?? 'Blocked', maxRepairs, infraRetries: typeof raw.infraRetries === 'number' ? Math.min(5, Math.max(0, Math.floor(raw.infraRetries))) : 2,
     ciChecks: strList(raw.ciChecks, []), ciTimeoutMinutes: mins('ciTimeoutMinutes', 20, 120), agentTimeoutMinutes: mins('agentTimeoutMinutes', 30, 240),
     claude: { bin: bin(claude.bin, 'claude'), allowedTools: tools(claude.allowedTools) },
     codex: { bin: bin(codex.bin, 'codex') },
