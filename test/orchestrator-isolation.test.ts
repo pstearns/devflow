@@ -279,12 +279,31 @@ describe('git push credential routing', () => {
       expect(seen.length).toBeGreaterThan(0);
       expect(seen.every((c) => c === 'x-access-token:WRITE-TOKEN'), seen.join(',')).toBe(true);
       seen.length = 0;
-      await expect(G.pushRef(src, 'refs/devflow/abc123/attempt-0', 'devflow/atl-1-abcdef1')).rejects.toThrow(); // no token: fails closed
-      expect(seen.join(',')).not.toContain('READ-TOKEN');
+      await expect(G.pushRef(src, 'refs/devflow/abc123/attempt-0', 'devflow/atl-1-abcdef1')).rejects.toThrow(/no GITHUB_WRITE_TOKEN/); // no token: fails closed before git talks to the network
+      expect(seen).toEqual([]);
+      sh(src, 'config', 'http.extraHeader', 'Authorization: Bearer READ-TOKEN'); // a repo-local credential source is refused, not honored
+      await expect(G.pushRef(src, 'refs/devflow/abc123/attempt-0', 'devflow/atl-1-abcdef1', 'WRITE-TOKEN')).rejects.toThrow(/could supply another credential/);
+      expect(seen).toEqual([]);
       expect(leftovers()).toBe(dirsBefore); // askpass directory removed on success and failure
     } finally {
       for (const [k, v] of before) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
       await new Promise((r) => server.close(r));
+    }
+  });
+});
+
+describe('git push refuses ambient-credential remotes', () => {
+  const ref = 'refs/devflow/abc123/attempt-0', br = 'devflow/atl-1-abcdef1';
+  it('refuses an ssh origin, including one reached through url.insteadOf', async () => {
+    const a = sourceRepo(); sh(a, 'remote', 'add', 'origin', 'git@github.com:o/r.git'); sh(a, 'update-ref', ref, 'HEAD');
+    await expect(G.pushRef(a, ref, br, 'T')).rejects.toThrow(/https remote or a local path/);
+    const b = sourceRepo(); sh(b, 'remote', 'add', 'origin', 'https://github.com/o/r.git'); sh(b, 'config', 'url.ssh://git@github.com/.insteadOf', 'https://github.com/'); sh(b, 'update-ref', ref, 'HEAD');
+    await expect(G.pushRef(b, ref, br, 'T')).rejects.toThrow(/https remote or a local path/);
+  });
+  it('refuses repo-local credential, askpass and proxy settings', async () => {
+    for (const [k, v] of [['credential.helper', 'store'], ['core.askPass', '/x'], ['http.proxy', 'http://p']] as const) {
+      const a = sourceRepo(); sh(a, 'remote', 'add', 'origin', 'https://github.com/o/r.git'); sh(a, 'update-ref', ref, 'HEAD'); sh(a, 'config', k, v);
+      await expect(G.pushRef(a, ref, br, 'T'), k).rejects.toThrow(/could supply another credential/);
     }
   });
 });

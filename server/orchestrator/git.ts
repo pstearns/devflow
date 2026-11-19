@@ -84,20 +84,32 @@ case "$1" in
 esac
 `;
 const AMBIENT_GH_TOKENS = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'];
+/** Variables that can inject git configuration, an askpass program or an SSH identity into the child. */
+const AMBIENT_GIT_INJECTION = ['GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'SSH_AUTH_SOCK', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'DEVFLOW_PUSH_TOKEN'];
+/** Repository-local settings that could supply a credential or authorization header other than the explicit token. */
+const CREDENTIAL_KEY = /(^|\.)(extraheader|credential(\.|$)|askpass|proxy)/i;
+const NETWORK_URL = /^(https?:\/\/|ssh:\/\/|git:\/\/|[^/\s@]+@[^/\s:]+:)/i;
 
 /**
  * Non-force push of one private ref to one branch. Runs in the controller only. It authenticates with the explicit write `token` and never
- * with an ambient credential: the user's credential helpers are disabled for this call (a `gh auth git-credential` helper would otherwise
- * answer with the read-only GITHUB_TOKEN from the environment), and the ambient GitHub token variables are removed from the child.
- * Without a token nothing is supplied, so a GitHub push fails closed instead of borrowing another credential.
+ * with an ambient credential. Config is isolated (global/system config ignored, git/ssh injection variables and ambient GitHub tokens
+ * removed, helpers and extraHeader reset); a repository-local credential/header/askpass/proxy setting, or an effective push URL that is
+ * SSH/git or `ssh://`-style, is refused. A network (http/https) push without a token is refused, so nothing falls back to another
+ * credential. Errors are scrubbed of the token.
  */
 export async function pushRef(repo: string, ref: string, branch: string, token?: string) {
   // Feature-branch-only writes, enforced here and not just by remote protection: no other destination name can be pushed, ever.
   if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to push: "${branch.slice(0, 80)}" is not a DevFlow run branch (devflow/<ticket>-<run>)`);
   if (!/^refs\/devflow\/[A-Za-z0-9]+\/attempt-\d$/.test(ref)) throw new Error('refusing to push: source must be a private refs/devflow/<run>/attempt-N ref');
-  const env = ambientEnv();
-  for (const k of AMBIENT_GH_TOKENS) delete env[k];
-  delete env.GIT_ASKPASS; delete env.SSH_ASKPASS; delete env.DEVFLOW_PUSH_TOKEN;
+  const env = cleanEnv(); // ignores global and system git config
+  for (const k of [...AMBIENT_GH_TOKENS, ...AMBIENT_GIT_INJECTION]) delete env[k];
+  for (const k of Object.keys(env)) if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) delete env[k];
+  const url = (await git(repo, ['remote', 'get-url', '--push', 'origin'], env)).trim(); // effective URL, after any insteadOf/pushInsteadOf rewrite
+  if (/^(ssh|git):\/\//i.test(url) || /^[^/\s@]+@[^/\s:]+:/.test(url)) throw new Error('refusing to push: origin must be an https remote or a local path (ssh/git remotes would use ambient credentials)');
+  const bad = (await git(repo, ['config', '--local', '--name-only', '--list'], env)).split('\n').find((k) => CREDENTIAL_KEY.test(k));
+  if (bad) throw new Error(`refusing to push: repository-local git setting "${bad.slice(0, 60)}" could supply another credential`);
+  const networked = NETWORK_URL.test(url);
+  if (networked && !token) throw new Error('refusing to push: no GITHUB_WRITE_TOKEN supplied');
   const dir = mkdtempSync(join(tmpdir(), 'devflow-askpass-')); // mode 0700, owner only
   try {
     if (token) {
@@ -105,8 +117,11 @@ export async function pushRef(repo: string, ref: string, branch: string, token?:
       writeFileSync(script, ASKPASS, { mode: 0o700 });
       env.GIT_ASKPASS = script; env.DEVFLOW_PUSH_TOKEN = token;
     }
-    // `-c credential.helper=` resets the helper list, so no global/system helper runs. Never --force. The token is not in argv.
-    return await git(repo, ['-c', 'credential.helper=', 'push', '--no-follow-tags', 'origin', `${ref}:refs/heads/${branch}`], env);
+    // Empty values reset the helper list and any extraHeader list. Never --force. The token is not in argv.
+    return await git(repo, ['-c', 'credential.helper=', '-c', 'http.extraHeader=', 'push', '--no-follow-tags', 'origin', `${ref}:refs/heads/${branch}`], env);
+  } catch (e) {
+    if (token && e instanceof Error) e.message = e.message.split(token).join('***').split(Buffer.from(`x-access-token:${token}`).toString('base64')).join('***');
+    throw e;
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
