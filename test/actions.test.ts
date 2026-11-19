@@ -35,7 +35,7 @@ describe('credential separation', () => {
     expect(f.store.issues.ATL!.find((x) => x.n === 3)!.labels).toEqual(['Feature']);
     const w = new LinearWriteClient(DEMO_WRITE_KEY, f);
     await expect(w.addLabel('bad id!', 'lbl-bug')).rejects.toThrow(); // ids are validated
-    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(w)).sort()).toEqual(['addLabel', 'constructor', 'id', 'removeLabel', 'run', 'setMilestone', 'setState'].sort()); // no generic send / delete
+    expect(Object.getOwnPropertyNames(Object.getPrototypeOf(w)).sort()).toEqual(['addLabel', 'constructor', 'createComment', 'id', 'removeLabel', 'run', 'setMilestone', 'setState'].sort()); // no generic send / delete
   });
   it('write stays disabled without a write credential', async () => {
     const { actions, ops } = await setup({}, false);
