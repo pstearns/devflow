@@ -3,7 +3,7 @@
 // comments are the readable summary. Rules enforced here: only controller-derived facts are stated as fact; anything an agent wrote is
 // shown quoted and labelled as unverified; no filesystem paths of the host, environment, or credentials are ever included.
 import type { AttemptRecord, Finding, Manifest, Review } from './types.ts';
-import { MAX_REPAIRS } from './types.ts';
+import { repairLimit } from './types.ts';
 
 const TOTAL = 6;
 export const MILESTONES = { started: 1, implemented: 2, ci: 3, review: 4, repair: 5, final: 6 } as const;
@@ -62,7 +62,7 @@ export function started(m: Manifest, at: string, f: StartFacts) {
       `Approved scope: ${line(f.scope, 200)}; repository \`${m.repo}\`, base \`${m.baseBranch}\` @ ${commit(m, m.baseSha)}; base branch protected on GitHub: ${String(f.baseProtected ?? 'unknown')}.`,
       `Agents (all inside a bubblewrap sandbox, no controller credentials): **implementer** Claude Code ${line(f.claude ?? '(version unknown)', 40)}; **independent reviewer** Codex ${line(f.codex ?? '(version unknown)', 40)}. The controller (${f.operator}) alone writes to Linear and GitHub.`,
       `Trusted controller policy digest \`${f.policyDigest.slice(0, 16)}\` (owner-controlled config; repository files are never policy).`,
-      `Limits: initial attempt + ${MAX_REPAIRS} repairs; environment failures are retried separately and never use a repair.`,
+      `Limits: initial attempt + ${repairLimit(m)} repair${repairLimit(m) === 1 ? '' : 's'}; environment failures are retried separately and never use a repair.`,
       `Run record: ${ev(m, 'manifest.json')} and ${ev(m, 'events.jsonl')} (retained on the DevFlow host).`,
     ],
   });
@@ -71,7 +71,7 @@ export function started(m: Manifest, at: string, f: StartFacts) {
 export function implemented(m: Manifest, a: AttemptRecord, at: string, f: { files: number; sha: string }) {
   const repair = a.n > 0;
   return frame(m, 2, repair ? `Repair ${a.n} completed` : undefined, at, {
-    what: `${repair ? `Claude's repair ${a.n} of ${MAX_REPAIRS}` : "Claude's initial implementation"} produced commit ${commit(m, f.sha)} (${f.files} file${f.files === 1 ? '' : 's'} changed) on branch \`${m.branch}\`; pushed; PR ${pr(m)}.`,
+    what: `${repair ? `Claude's repair ${a.n} of ${repairLimit(m)}` : "Claude's initial implementation"} produced commit ${commit(m, f.sha)} (${f.files} file${f.files === 1 ? '' : 's'} changed) on branch \`${m.branch}\`; pushed; PR ${pr(m)}.`,
     why: repair ? `The previous commit ${commit(m, a.startSha)} was rejected (see the preceding CI/review milestone); Claude was re-dispatched with the verified findings.` : 'The ticket was approved for execution; Claude implemented it in an isolated clone and committed.',
     evidence: [
       `Commit ${commit(m, f.sha)} (parent ${commit(m, a.startSha)}); the controller verified it descends from the previous commit and edits no protected files.`,
@@ -116,9 +116,9 @@ export function reviewed(m: Manifest, a: AttemptRecord, at: string, r: Review, g
 
 export function repairRequested(m: Manifest, n: number, reasonRaw: string) {
   const reason = line(redact(reasonRaw), 300);
-  return n < MAX_REPAIRS
-    ? `**Milestone 5/${TOTAL} — Repair requested.** Repair ${n + 1} of ${MAX_REPAIRS} requested from Claude. Reason: ${reason}. Retries used so far: repairs ${n}/${MAX_REPAIRS}, infrastructure ${m.infra.length}.`
-    : `**Milestone 5/${TOTAL} — No repair available.** ${reason}. All ${MAX_REPAIRS} repair attempts are used; the run will escalate.`;
+  return n < repairLimit(m)
+    ? `**Milestone 5/${TOTAL} — Repair requested.** Repair ${n + 1} of ${repairLimit(m)} requested from Claude. Reason: ${reason}. Retries used so far: repairs ${n}/${repairLimit(m)}, infrastructure ${m.infra.length}.`
+    : `**Milestone 5/${TOTAL} — No repair available.** ${reason}. All ${repairLimit(m)} repair attempts are used; the run will escalate.`;
 }
 
 export function final(m: Manifest, at: string, f: { kind: 'awaiting-owner' | 'escalated'; leftAlone?: string; summary: string; reason?: string; cls?: string; gate?: GateCheck[]; evidenceRef?: string; blockedConfirmed?: boolean }) {
@@ -130,7 +130,7 @@ export function final(m: Manifest, at: string, f: { kind: 'awaiting-owner' | 'es
     evidence: [
       pass ? `Gate: ${(f.gate ?? []).map((g) => `${g.ok ? '✅' : '❌'} ${line(g.name, 80)}`).join(' · ')}` : '',
       `Branch \`${m.branch}\` · draft PR ${pr(m)} · base \`${m.baseBranch}\` @ ${commit(m, m.baseSha)}`,
-      `Repair attempts used: ${m.attempts.filter((x) => x.n > 0).length}/${MAX_REPAIRS} · infrastructure retries: ${m.infra.length}${m.infra.length ? ` (${[...new Set(m.infra.map((i) => line(i.step, 30)))].join(', ')})` : ''} · review retries: ${m.attempts.reduce((s, x) => s + (x.reviewRetries ?? 0), 0)}`,
+      `Repair attempts used: ${m.attempts.filter((x) => x.n > 0).length}/${repairLimit(m)} · infrastructure retries: ${m.infra.length}${m.infra.length ? ` (${[...new Set(m.infra.map((i) => line(i.step, 30)))].join(', ')})` : ''} · review retries: ${m.attempts.reduce((s, x) => s + (x.reviewRetries ?? 0), 0)}`,
       `Run record ${ev(m, 'manifest.json')}${f.evidenceRef ? `, escalation record ${ev(m, f.evidenceRef)}` : ''}; event log ${ev(m, 'events.jsonl')}.`,
     ].filter(Boolean),
     extra: `${pass ? '**Owner action required:** review the draft PR and approve or reject it. Nothing is merged or deployed automatically.' : '**Owner action required:** read the reason above, fix the cause, and re-approve the ticket if you want another run.'}\n\n| Attempt | Commit | CI | Review | Outcome |\n|---|---|---|---|---|\n${rows.join('\n')}`,

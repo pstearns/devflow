@@ -79,7 +79,7 @@ export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new
   }
   for (const t of oc.claude.allowedTools) if (!TOOL_RE.test(t)) throw new PolicyError(`claude.allowedTools entry "${t.slice(0, 60)}" is not a plain tool pattern`);
   const body = JSON.stringify({ repo: oc.repo, repoPath: repo, runsDir: runs, base: oc.baseBranch, started: oc.startedState, approval: oc.approvalState, blocked: oc.blockedState,
-    ci: oc.ciChecks, tools: oc.claude.allowedTools, claude: oc.claude.bin, codex: oc.codex.bin, cfgBytes: createHash('sha256').update(readFileSync(cfgReal.real)).digest('hex'), sigs });
+    maxRepairs: oc.maxRepairs, ci: oc.ciChecks, tools: oc.claude.allowedTools, claude: oc.claude.bin, codex: oc.codex.bin, cfgBytes: createHash('sha256').update(readFileSync(cfgReal.real)).digest('hex'), sigs });
   return { digest: createHash('sha256').update(body).digest('hex'), configPath: cfgReal.real, checkedAt: now.toISOString() };
 }
 

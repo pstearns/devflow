@@ -4,14 +4,17 @@ export type RunState =
   | 'accepted' | 'implementing' | 'verifying-commit' | 'ci' | 'reviewing' | 'publishing' | 'repairing'
   | 'awaiting-owner' | 'escalated' | 'aborted';
 export const TERMINAL: RunState[] = ['awaiting-owner', 'escalated', 'aborted'];
+/** Default and hard ceiling for repair attempts; a project may lower it with `orchestration.maxRepairs`. */
 export const MAX_REPAIRS = 3;
+/** The limit that applies to one run: recorded in the manifest at acceptance, so later reads and comments can never disagree with the loop. */
+export const repairLimit = (m: { maxRepairs?: number }) => m.maxRepairs ?? MAX_REPAIRS;
 
 export type Severity = 'blocker' | 'major' | 'minor' | 'note';
 export interface Finding { id: string; severity: Severity; file: string; line?: number; title: string; detail: string; evidence: string }
 export interface Review { verdict: 'PASS' | 'FAIL'; commit: string; nonce: string; summary: string; reviewedFiles: string[]; findings: Finding[] }
 
 export interface AttemptRecord {
-  n: number; // 0 = initial implementation, 1..3 = repairs
+  n: number; // 0 = initial implementation, 1..maxRepairs = repairs
   startSha: string; headSha?: string;
   agent?: { exitCode: number | null; timedOut: boolean; log: string };
   ci?: { state: 'success' | 'failure' | 'timeout'; detail: string; evidence: string };
@@ -34,6 +37,7 @@ export interface Manifest {
   gate?: { name: string; ok: boolean; detail: string }[];
   originalStateId: string; startConfirmed?: boolean;
   policyDigest: string; agents: { claude?: string; codex?: string }; authorizedBy?: string;
+  maxRepairs?: number; // repair attempts allowed for this run (absent in older manifests => MAX_REPAIRS)
   attempts: AttemptRecord[]; approvedSha?: string; linearCommentIds: string[];
   createdAt: string; updatedAt: string; cleanup: { clone: 'pending' | 'removed' | 'kept'; note?: string };
 }

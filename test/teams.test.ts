@@ -300,3 +300,14 @@ describe('custom readiness labels cannot be edited as ordinary labels', () => {
     expect(base.ops()).toEqual([]);
   });
 });
+
+describe('orchestration.maxRepairs', () => {
+  const base = { id: 'p', name: 'P', linear: { teamKey: 'PS', projects: [] }, github: { repos: ['o/r'] } };
+  const orch = (extra: Record<string, unknown>) => ({ projects: [{ ...base, orchestration: { repo: 'o/r', repoPath: '/a/clone', runsDir: '/a/runs', claude: { bin: '/b/claude' }, codex: { bin: '/b/codex' }, ...extra } }] });
+  it('defaults to 3, accepts 0-3, and rejects everything else instead of ignoring or clamping it', () => {
+    expect(parseConfig(orch({})).projects[0]!.orchestration!.maxRepairs).toBe(3);
+    expect(parseConfig(orch({ maxRepairs: 1 })).projects[0]!.orchestration!.maxRepairs).toBe(1);
+    expect(parseConfig(orch({ maxRepairs: 0 })).projects[0]!.orchestration!.maxRepairs).toBe(0);
+    for (const bad of [4, -1, 1.5, '1', null, NaN]) expect(() => parseConfig(orch({ maxRepairs: bad }))).toThrow(/maxRepairs must be an integer from 0 to 3/);
+  });
+});
