@@ -29,6 +29,14 @@ jobs:
           sudo apt-get install -y -q bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --unshare-all --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 /usr/bin/true && echo "bwrap works"
+      # The controller refuses a group/world-writable Node toolchain (fail closed). Hosted runners ship one that is
+      # group-writable, so tighten it here; the check itself stays strict.
+      - name: Make the Node toolchain non-group-writable
+        run: |
+          prefix="$(dirname "$(dirname "$(readlink -f "$(command -v node)")")")"
+          echo "Node prefix: $prefix"
+          sudo chmod -R go-w "$prefix"
+          stat -c '%A %n' "$prefix" "$prefix/bin"
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
