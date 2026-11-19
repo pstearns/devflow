@@ -85,6 +85,7 @@ const orch = new Orchestrator({
   write: new LinearWriteClient(writeKey!),
   ci: new GithubCi(gh),
   prs: new GithubPrs(gh, ghWrite!),
+  pushToken: ghWrite!,
   policy: (_oc, projectId) => new PolicyGuard(() => {
     const fresh = loadConfig(process.env, root).config.projects.find((p) => p.id === projectId)?.orchestration;
     if (!fresh) throw new PolicyError(`project "${projectId}" no longer has an orchestration block in the trusted config`);

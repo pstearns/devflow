@@ -39,6 +39,10 @@ export interface Deps {
   write: Pick<LinearWriteClient, 'createComment' | 'setState'>;
   ci: CiProvider;
   prs: PullRequests;
+  /** The GitHub WRITE token, used explicitly for `git push` (never the read token, never ambient git credentials). */
+  pushToken?: string;
+  /** Test seam only (the CLI never sets it): replaces the GitHub push so hermetic tests can use a local bare repository. */
+  push?: (repoPath: string, ref: string, branch: string) => Promise<unknown>;
   /** Built from the AUTHORIZED ticket's own project configuration (never "the first project of the team"), so the runner, the policy pin and the controller always agree. */
   agents: (oc: OrchestrationCfg, projectId: string) => AgentRunner;
   /** Trusted-policy guard for that same project. Required: a controller that cannot verify its own policy does not run. */
@@ -225,7 +229,7 @@ export class Orchestrator {
 
       // 3. push, confirm the REMOTE has exactly this SHA, ensure a DRAFT PR, confirm GitHub's PR head is this SHA
       await this.infra(store, m, 'push', async () => {
-        await G.pushRef(oc.repoPath, this.ref(m, n), m.branch);
+        await (this.d.push ?? ((p, r, b) => G.pushRef(p, r, b, m.repo, this.d.pushToken)))(oc.repoPath, this.ref(m, n), m.branch);
         const remote = await G.remoteHead(oc.repoPath, m.branch);
         if (remote !== sha) throw new Error(`remote branch is at ${remote?.slice(0, 12) ?? 'nothing'} after push, expected ${sha.slice(0, 12)}`);
       });
