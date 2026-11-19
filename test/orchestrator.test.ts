@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
-import { makeWorld, DEMO_WRITE_KEY } from './orchestrator-harness.ts';
+import { makeWorld, gitHttpRemote, WRITE, DEMO_WRITE_KEY } from './orchestrator-harness.ts';
 import { bwrapUsable } from '../server/orchestrator/sandbox.ts';
 import { Rejected } from '../server/orchestrator/controller.ts';
 import { DuplicateRun } from '../server/orchestrator/manifest.ts';
@@ -449,4 +450,27 @@ describe('orchestration config', () => {
     expect(() => parseConfig({ projects: [{ ...base, orchestration: { ...o, claude: { bin: '/x/claude', allowedTools: ['Bash(git status:*),Bash(rm -rf /)'] } } }] })).toThrow(/plain tool pattern/);
   });
   it('is absent unless configured', () => expect(parseConfig({ projects: [base] }).projects[0]!.orchestration).toBeUndefined());
+});
+
+describe('push and verification use only the approved GitHub destination', () => {
+  it('the whole controller path ignores a hostile repository and environment: the pushed commit is checked at the approved destination', async () => {
+    const w = world({ scenario: 'correct-first' });
+    const good = await w.gitHttp(), evil = await gitHttpRemote(undefined, 'never');
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: w.repo, stdio: 'pipe' });
+    git('config', `url.${evil.host}/.insteadOf`, `${good.host}/`); git('config', `url.${evil.host}/.pushInsteadOf`, `${good.host}/`);
+    git('config', 'uploadpack.hideRefs', 'refs/devflow'); git('config', 'transfer.hideRefs', 'refs/devflow'); git('config', 'http.extraHeader', 'Authorization: Bearer READ-TOKEN');
+    const keep = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GITHUB_TOKEN', 'GH_TOKEN'].map((k) => [k, process.env[k]] as const);
+    Object.assign(process.env, { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil.host}/.insteadOf`, GIT_CONFIG_VALUE_0: `${good.host}/`, GITHUB_TOKEN: 'READ-TOKEN', GH_TOKEN: 'READ-TOKEN' });
+    try {
+      const m = await w.orch.run('atl-22');
+      expect(m.state).toBe('awaiting-owner');
+      expect(w.remoteHead(m.branch)).toBe(m.approvedSha);
+      expect(evil.log, 'nothing reached the hostile destination').toEqual([]);
+      const creds = good.log.map((q) => q.cred).filter(Boolean);
+      expect(creds.length).toBeGreaterThan(0); expect(creds.every((c) => c === `x-access-token:${WRITE}`)).toBe(true);
+      const pushAt = good.log.findIndex((q) => /service=git-receive-pack/.test(q.url));
+      expect(pushAt, 'the push went to the approved destination').toBeGreaterThanOrEqual(0);
+      expect(good.log.slice(pushAt + 1).some((q) => /service=git-upload-pack/.test(q.url)), 'the pushed commit was verified at the approved destination').toBe(true);
+    } finally { for (const [k, v] of keep) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } evil.close(); }
+  });
 });

@@ -1,15 +1,14 @@
 // NEGATIVE tests: each one tries to do something an agent must not be able to do, through the SAME sandbox builders production uses,
 // and asserts that it fails. They need bubblewrap (skipped, loudly, where user namespaces are unavailable).
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { execFileSync, spawn } from 'node:child_process';
-import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { implementerSandbox, makeBundle, reviewerSandbox, runInSandbox, type RoleSandbox } from '../server/orchestrator/agents.ts';
 import { bwrapArgs, bwrapUsable, stageHome } from '../server/orchestrator/sandbox.ts';
 import * as G from '../server/orchestrator/git.ts';
+import { gitHttpRemote } from './orchestrator-harness.ts';
 import { GithubPrs } from '../server/orchestrator/pr.ts';
 import { SourceError } from '../server/util.ts';
 
@@ -240,29 +239,11 @@ describe.skipIf(!usable)('untrusted clone cannot execute code in, or read from, 
 
 describe('git push: one fixed destination, one credential', () => {
   const REF = 'refs/devflow/abc123/attempt-0', BRANCH = 'devflow/atl-1-abcdef1', WRITE = 'WRITE-TOKEN-1234567890', READ = 'READ-TOKEN-0987654321';
-  const servers: Server[] = [];
-  afterEach(async () => { await Promise.all(servers.splice(0).map((x) => new Promise((r) => x.close(r)))); });
-  /** A smart-HTTP git remote over a bare repo that records every request and the decoded Basic credential; `good` controls whether it accepts WRITE. */
-  async function remote(bare: string | undefined, accept = WRITE) {
-    const log: { url: string; cred?: string }[] = [];
-    const srv = createServer((req, res) => {
-      const auth = req.headers.authorization, cred = auth ? Buffer.from(auth.replace(/^Basic /, ''), 'base64').toString('utf8') : undefined;
-      log.push({ url: req.url ?? '', cred });
-      if (cred !== `x-access-token:${accept}` || !bare) { res.writeHead(cred ? 403 : 401, { 'www-authenticate': 'Basic realm="t"' }).end('denied'); return; }
-      const [path, query = ''] = (req.url ?? '').split('?');
-      const cgi = spawn('git', ['http-backend'], { env: { PATH: process.env.PATH, GIT_PROJECT_ROOT: bare, GIT_HTTP_EXPORT_ALL: '1', REQUEST_METHOD: req.method, PATH_INFO: path!.replace(/^\/o\/r\.git/, ''), QUERY_STRING: query, CONTENT_TYPE: req.headers['content-type'] ?? '', REMOTE_USER: 'x', GIT_CONFIG_NOSYSTEM: '1' } });
-      req.pipe(cgi.stdin); const out: Buffer[] = []; cgi.stdout.on('data', (d: Buffer) => out.push(d));
-      cgi.on('close', () => {
-        const buf = Buffer.concat(out), i = buf.indexOf('\r\n\r\n'), head = buf.subarray(0, i).toString(), headers: Record<string, string> = {}; let status = 200;
-        for (const l of head.split('\r\n')) { const [k, ...v] = l.split(': '); if (k!.toLowerCase() === 'status') status = parseInt(v.join(': ')); else headers[k!] = v.join(': '); }
-        res.writeHead(status, headers).end(buf.subarray(i + 4));
-      });
-    });
-    servers.push(srv); await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
-    return { log, host: `http://127.0.0.1:${(srv.address() as AddressInfo).port}` };
-  }
-  const bareRepo = () => { const b = uniq('bare.git'); mkdirSync(b); sh(b, 'init', '-q', '--bare', '-b', 'main'); sh(b, 'config', 'http.receivepack', 'true'); return b; };
-  const pushLeftovers = () => readdirSync(tmpdir()).filter((f) => f.startsWith('devflow-push-')).length;
+  const servers: { close: () => void }[] = [];
+  afterEach(() => { for (const x of servers.splice(0)) x.close(); });
+  /** The approved GitHub repository (served from `bare`) or, with no bare, a destination that must never be reached. */
+  const remote = async (bare: string | undefined, accept = WRITE) => { const r = await gitHttpRemote(bare, accept); servers.push(r); return r; };
+  const bareRepo = () => { const b = uniq('bare.git'); mkdirSync(b); sh(b, 'init', '-q', '--bare', '-b', 'main'); return b; };
   const withEnv = async (vars: Record<string, string>, fn: () => Promise<void>) => {
     const before = Object.keys(vars).map((k) => [k, process.env[k]] as const); Object.assign(process.env, vars);
     try { await fn(); } finally { for (const [k, v] of before) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
@@ -282,14 +263,14 @@ describe('git push: one fixed destination, one credential', () => {
   it('a real push goes only to the run branch, with the write token, and cleans up', async () => {
     const bare = bareRepo(), src = sourceRepo(); sh(src, 'push', '-q', bare, 'HEAD:refs/heads/main');
     const main = sh(bare, 'rev-parse', 'refs/heads/main'); writeFileSync(join(src, 'n.txt'), 'n'); sh(src, 'add', '-A'); sh(src, 'commit', '-q', '-m', 'work'); sh(src, 'update-ref', REF, 'HEAD');
-    const r = await remote(bare), left = pushLeftovers();
-    await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host);
+    const r = await remote(bare), tmp = uniq('tmp'); mkdirSync(tmp); // a private TMPDIR, so concurrent test files cannot affect the leftover check
+    await withEnv({ TMPDIR: tmp }, async () => { await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host); });
     expect(sh(bare, 'rev-parse', 'refs/heads/main')).toBe(main);
     expect(sh(bare, 'rev-parse', `refs/heads/${BRANCH}`)).toBe(sh(src, 'rev-parse', 'HEAD'));
     expect(sh(bare, 'for-each-ref', '--format=%(refname)').split('\n').sort()).toEqual([`refs/heads/${BRANCH}`, 'refs/heads/main']);
     expect(r.log.every((q) => q.url.startsWith('/o/r.git/'))).toBe(true);
     expect(r.log.filter((q) => q.cred).every((q) => q.cred === `x-access-token:${WRITE}`)).toBe(true);
-    expect(pushLeftovers()).toBe(left);
+    expect(readdirSync(tmp)).toEqual([]);
   });
 
   it('hostile git settings and environment cannot change the destination or the credential', async () => {
@@ -310,6 +291,26 @@ describe('git push: one fixed destination, one credential', () => {
     expect(sh(bare, 'rev-parse', `refs/heads/${BRANCH}`)).toBe(sh(src, 'rev-parse', 'HEAD'));
     const creds = good.log.map((q) => q.cred).filter(Boolean);
     expect(creds.length).toBeGreaterThan(0); expect(creds.every((c) => c === `x-access-token:${WRITE}`), creds.join(',')).toBe(true);
+  });
+
+  it('does not depend on the source repository configuration (uploadpack.hideRefs hides the run ref from a fetch)', async () => {
+    const bare = bareRepo(), src = sourceRepo(), r = await remote(bare);
+    sh(src, 'update-ref', REF, 'HEAD'); sh(src, 'config', 'uploadpack.hideRefs', 'refs/devflow'); sh(src, 'config', 'transfer.hideRefs', 'refs/devflow');
+    const probe = uniq('probe'); mkdirSync(probe); sh(probe, 'init', '-q', '--bare');
+    expect(() => sh(probe, 'fetch', '-q', src, `${REF}:${REF}`), 'a fetch from the source is blocked by that setting').toThrow();
+    await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host);
+    expect(sh(bare, 'rev-parse', `refs/heads/${BRANCH}`)).toBe(sh(src, 'rev-parse', 'HEAD'));
+  });
+
+  it('remoteHead asks the fixed destination with the write token, refuses bad input, and returns undefined for a missing branch', async () => {
+    const bare = bareRepo(), src = sourceRepo(), r = await remote(bare); sh(src, 'update-ref', REF, 'HEAD');
+    expect(await G.remoteHead(BRANCH, 'o/r', WRITE, r.host)).toBeUndefined();
+    await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host);
+    expect(await G.remoteHead(BRANCH, 'o/r', WRITE, r.host)).toBe(sh(src, 'rev-parse', 'HEAD'));
+    expect(r.log.filter((q) => q.cred).every((q) => q.cred === `x-access-token:${WRITE}`)).toBe(true);
+    await expect(G.remoteHead('main', 'o/r', WRITE, r.host)).rejects.toThrow(/not a DevFlow run branch/);
+    await expect(G.remoteHead(BRANCH, 'o/r', undefined, r.host)).rejects.toThrow(/no GITHUB_WRITE_TOKEN/);
+    await expect(G.remoteHead(BRANCH, 'https://evil/o/r', WRITE, r.host)).rejects.toThrow(/owner\/name/);
   });
 
   it('removes the token from git errors before they are truncated, even across the cut', async () => {

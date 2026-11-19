@@ -46,12 +46,6 @@ export async function lineCount(cwd: string, sha: string, file: string): Promise
     return blob.toString('utf8').split('\n').length;
   } catch { return undefined; }
 }
-/** SHA of a branch on origin, or undefined if it does not exist. Asks the remote, never a possibly stale local ref. */
-export async function remoteHead(cwd: string, branch: string) {
-  const out = (await git(cwd, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], ambientEnv())).trim();
-  return out ? out.split(/\s+/)[0] : undefined;
-}
-
 /**
  * The implementer's workspace: a standalone repository (its own .git, objects copied not hardlinked, NO remote), seeded from the
  * base commit. Nothing in it points back at the user's repository, so a sandboxed agent can neither alter that repo nor push.
@@ -83,36 +77,57 @@ case "$1" in
 esac
 `;
 const REPO_SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-/** The only variables the push child inherits (TLS trust, proxy, search path). Everything else, including every GIT_* and credential variable, is dropped. */
-const PUSH_ENV_KEEP = ['PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
+/** The only variables a GitHub-facing git child inherits (TLS trust, proxy, search path). Everything else, including every GIT_* and credential variable, is dropped. */
+const GH_ENV_KEEP = ['PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
+const GH_C = ['-c', 'credential.helper=', '-c', 'http.extraHeader=', '-c', 'http.followRedirects=false'];
 
 /**
- * Non-force push of one private ref to one run branch of ONE fixed destination: `<host>/<repo>.git`, where `repo` is the approved
- * "owner/name" and `host` is https://github.com (the parameter exists only so tests can point at a local server; production never passes it).
- * It never reads `origin`, pushurl, URL rewrites or any inherited git setting: the ref is copied into a throwaway bare repository this
- * function creates, and the push runs from there with an allowlisted environment, HOME in the throwaway directory, global/system config
- * off, helpers and extraHeader reset, and the explicit write `token` supplied through a secret-free askpass. No token, no push.
+ * Runs `fn` against ONE fixed destination, `<host>/<repo>.git`, where `repo` is the approved "owner/name" and `host` is https://github.com (the
+ * parameter exists only so tests can point at a local server; production never passes it). `fn` gets the exact URL, a private 0700 directory
+ * (removed afterwards) and an environment that holds only the allowlisted variables, HOME inside that directory, config files off, and the explicit
+ * write `token` supplied through a secret-free askpass. `origin`, pushurl, URL rewrites and every inherited git setting are never consulted.
+ */
+async function toGitHub<T>(repo: string, token: string | undefined, host: string, fn: (url: string, dir: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
+  if (!REPO_SLUG.test(repo) || repo.split('/').some((x) => x === '.' || x === '..')) throw new Error('refusing to use GitHub: repository must be "owner/name"');
+  if (!token || /\s/.test(token)) throw new Error('refusing to use GitHub: no GITHUB_WRITE_TOKEN supplied');
+  const dir = mkdtempSync(join(tmpdir(), 'devflow-push-')); // mode 0700
+  try {
+    const script = join(dir, 'askpass.sh'); writeFileSync(script, ASKPASS, { mode: 0o700 });
+    const env: NodeJS.ProcessEnv = {
+      HOME: dir, XDG_CONFIG_HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
+      GIT_ALLOW_PROTOCOL: new URL(host).protocol.slice(0, -1), GIT_ASKPASS: script, DEVFLOW_PUSH_TOKEN: token,
+    };
+    for (const k of GH_ENV_KEEP) if (process.env[k] !== undefined) env[k] = process.env[k];
+    return await fn(`${host}/${repo}.git`, dir, env);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/** SHA of a run branch on the approved GitHub repository, or undefined if it does not exist. Asks the remote itself, never a local ref or `origin`. */
+export async function remoteHead(branch: string, repo: string, token: string | undefined, host = 'https://github.com') {
+  if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to read: "${branch.slice(0, 80)}" is not a DevFlow run branch`);
+  return toGitHub(repo, token, host, async (url, dir, env) => {
+    const out = (await git(dir, [...GH_C, 'ls-remote', '--heads', url, `refs/heads/${branch}`], env, undefined, [token!])).trim();
+    return out ? out.split(/\s+/)[0] : undefined;
+  });
+}
+
+/**
+ * Non-force push of one private ref to one run branch of the fixed destination (see toGitHub). The commit is handed to a throwaway bare
+ * repository by SHA and the source's object directory (alternates), so nothing in the source repository's own configuration, including
+ * upload-pack settings such as hideRefs or hooks, is ever consulted; the push runs from that throwaway repository. No token, no push.
  */
 export async function pushRef(repoPath: string, ref: string, branch: string, repo: string, token: string | undefined, host = 'https://github.com') {
   // Feature-branch-only writes, enforced here and not just by remote protection: no other destination name can be pushed, ever.
   if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to push: "${branch.slice(0, 80)}" is not a DevFlow run branch (devflow/<ticket>-<run>)`);
   if (!/^refs\/devflow\/[A-Za-z0-9]+\/attempt-\d$/.test(ref)) throw new Error('refusing to push: source must be a private refs/devflow/<run>/attempt-N ref');
-  if (!REPO_SLUG.test(repo) || repo.split('/').some((x) => x === '.' || x === '..')) throw new Error('refusing to push: repository must be "owner/name"');
-  if (!token || /\s/.test(token)) throw new Error('refusing to push: no GITHUB_WRITE_TOKEN supplied');
-  const dir = mkdtempSync(join(tmpdir(), 'devflow-push-')); // mode 0700
-  try {
-    const bare = join(dir, 'r.git'), script = join(dir, 'askpass.sh');
-    writeFileSync(script, ASKPASS, { mode: 0o700 });
-    const env: NodeJS.ProcessEnv = {
-      HOME: dir, XDG_CONFIG_HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
-    };
-    for (const k of PUSH_ENV_KEEP) if (process.env[k] !== undefined) env[k] = process.env[k];
+  return toGitHub(repo, token, host, async (url, dir, env) => {
+    const bare = join(dir, 'r.git'), sha = await resolveRef(repoPath, ref), objects = (await git(repoPath, ['rev-parse', '--path-format=absolute', '--git-path', 'objects'])).trim();
     await git(dir, ['init', '-q', '--bare', '--template=', bare], env);
-    await git(bare, ['fetch', '-q', '--no-tags', repoPath, `${ref}:${ref}`], { ...env, GIT_ALLOW_PROTOCOL: 'file' }); // local copy only: no token, no network
-    Object.assign(env, { GIT_ALLOW_PROTOCOL: new URL(host).protocol.slice(0, -1), GIT_ASKPASS: script, DEVFLOW_PUSH_TOKEN: token });
-    // Explicit URL: no remote exists. `credential.helper=`/`http.extraHeader=` reset any list. Never --force. The token is not in argv.
-    return await git(bare, ['-c', 'credential.helper=', '-c', 'http.extraHeader=', '-c', 'http.followRedirects=false', 'push', '--no-follow-tags', `${host}/${repo}.git`, `${ref}:refs/heads/${branch}`], env, undefined, [token]);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+    writeFileSync(join(bare, 'objects', 'info', 'alternates'), `${objects}\n`);
+    await git(bare, ['update-ref', ref, sha], env);
+    // Explicit URL: no remote exists. Never --force. The token is not in argv.
+    return git(bare, [...GH_C, 'push', '--no-follow-tags', url, `${ref}:refs/heads/${branch}`], env, undefined, [token!]);
+  });
 }
 
 function blobs(repo: string, oids: string[]): Promise<Buffer[]> {
