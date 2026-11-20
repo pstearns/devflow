@@ -73,13 +73,19 @@ export interface Config {
   prompts: PromptDef[];
 }
 
+/**
+ * Clipboard-only templates; DevFlow never runs them. `{{ticket}}`, `{{project}}` and `{{milestone}}` are filled from the current
+ * selection; anything not selected renders as "<x not selected>" with an instruction not to guess (see fillPrompt in web/src/lib.ts).
+ */
+const SEL = '{{ticket}} (project {{project}}, milestone {{milestone}})';
+const ESCALATE = 'After three failed approaches, stop and escalate to the owner.';
 export const DEFAULT_PROMPTS: PromptDef[] = [
-  { id: 'discover', label: 'Discover ticket', template: 'Discover {{ticket}} in {{project}}. Read the Linear issue and linked project knowledge; list gaps, risks and open questions. Do not implement.' },
-  { id: 'execute', label: 'Execute approved ticket', template: 'Execute approved ticket {{ticket}} in {{project}}. Follow the ticket as written and the repo contracts; open a PR when done.' },
-  { id: 'review', label: 'Independent review', template: 'Independently review the PR for {{ticket}} in {{project}} against the ticket and repo contracts. Record findings explicitly; do not edit code.' },
-  { id: 'resolve', label: 'Resolve review findings', template: 'Resolve the recorded review findings on the PR for {{ticket}} in {{project}}. Address each finding and report what changed.' },
-  { id: 'resume', label: 'Resume ticket', template: 'Resume {{ticket}} in {{project}}. Check the current branch, PR, CI and review state first, then continue from where it stopped.' },
-  { id: 'milestone', label: 'Review milestone', template: 'Review milestone "{{milestone}}" in {{project}}: summarise task states, blockers, and what is needed to finish it.' },
+  { id: 'discover', label: 'Discover ticket', template: `Discover ${SEL}. Read-only: no status or code changes. Read the Linear issue, related knowledge, dependencies and repo contracts. List gaps, risks and open questions, then classify it as Ready, Waiting on prerequisite or Blocked, with the reason.` },
+  { id: 'execute', label: 'Execute approved ticket', template: `Execute ${SEL} with Claude Code only. First verify the ticket is explicitly approved Ready and check its branch/PR state; stop if not. Use a dedicated branch, follow the ticket and repo contracts, run tests and scans, and open a PR with acceptance evidence. Do not merge or change protected settings. ${ESCALATE}` },
+  { id: 'review', label: 'Independent review', template: `Review the PR for ${SEL} with Codex only. Read-only: no edits, commits or pushes. Verify the exact latest head SHA, then inspect the full diff, tests, ticket, repo contracts and raw CI/security outputs. Give each finding a severity, location, evidence and remedy. End with PASS, FAIL or INCOMPLETE for the reviewed SHA.` },
+  { id: 'resolve', label: 'Resolve review findings', template: `Resolve the review findings on the PR for ${SEL} with Claude. Report each finding as fixed or disputed with evidence against the current head SHA. Rerun checks and request Codex re-review on the new SHA. Do not bypass checks or merge. ${ESCALATE}` },
+  { id: 'resume', label: 'Resume ticket', template: `Resume ${SEL} with Claude. Inspect the current issue, branch, PR, CI and review state first. Resume the last verified action without duplicating work, verify Ready approval before editing, and stop for any owner decision. Do not merge. ${ESCALATE}` },
+  { id: 'milestone', label: 'Review milestone', template: 'Review milestone "{{milestone}}" in {{project}}. Read-only: no status or code changes. Summarize Done, Ready, Waiting on prerequisite, Blocked and unapproved Backlog. Identify the critical path and next executable task.' },
 ];
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,40}$/i;
