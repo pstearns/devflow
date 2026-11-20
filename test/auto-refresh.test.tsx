@@ -159,7 +159,7 @@ function dashboard(doc = fakeDoc()) {
   };
   return { d, state, calls, reply, controls, doc };
 }
-type Ctl = ReactElement<{ onClick?: () => void; onToggle?: () => void }>;
+type Ctl = ReactElement<{ disabled?: boolean; onClick?: () => void; onToggle?: () => void }>;
 const FULL_PASSIVE = { url: '/api/snapshot?refresh=1', interaction: 'passive' };
 const FULL_USER = { url: '/api/snapshot?refresh=1', interaction: 'user' };
 
@@ -192,16 +192,6 @@ describe('dashboard auto-refresh', () => {
     expect(h.doc.listeners.size).toBe(0);
     await vi.advanceTimersByTimeAsync(120_000);
     expect(h.calls).toHaveLength(1);
-  });
-
-  it('leaving the dashboard (the unmount cleanup) stops auto-refresh', async () => {
-    const h = dashboard();
-    h.d.setAutoRefresh(true);
-    h.d.setAutoRefresh(false); // what useSnapshot's unmount cleanup runs
-    expect(vi.getTimerCount()).toBe(0);
-    expect(h.doc.listeners.size).toBe(0);
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(h.calls).toEqual([]);
   });
 
   it('a hidden tab makes no automatic requests; becoming visible resumes on a fresh 30 s interval', async () => {
@@ -251,22 +241,50 @@ describe('dashboard auto-refresh', () => {
     h.d.setAutoRefresh(false);
   });
 
-  it('an auto-refresh that finishes after a newer issue read or action result does not overwrite it', async () => {
+  it('keeps manual Refresh clickable during an automatic request and runs it once after that request', async () => {
     const h = dashboard();
     h.d.setAutoRefresh(true);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(h.calls).toEqual([FULL_PASSIVE]);
-    void h.d.openIssue('PS-1');
+    expect(h.controls().html).toMatch(/<button[^>]*>Refresh<\/button>/);
+    expect(h.controls().button.props.disabled).toBe(false);
+    h.controls().button.props.onClick!();
+    h.controls().button.props.onClick!();
+    expect(h.calls).toEqual([FULL_PASSIVE]);
+    await h.reply(0, snapA);
+    expect(h.calls).toEqual([FULL_PASSIVE, FULL_USER]);
     await h.reply(1, snapB);
     expect(h.state.snap).toBe(snapB);
-    await h.reply(0, snapA); // assembled before the issue read; arrives last
+    h.d.setAutoRefresh(false);
+  });
+
+  it('defers an issue or team request until the automatic refresh settles', async () => {
+    const h = dashboard();
+    h.d.setAutoRefresh(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    void h.d.openIssue('PS-1');
+    void h.d.openTeam('PS');
+    expect(h.state.issueLoading).toBe('PS-1');
+    expect(h.state.teamLoading).toBe('PS');
+    expect(h.calls).toEqual([FULL_PASSIVE]);
+    await h.reply(0, snapA);
+    expect(h.state.snap).toBeUndefined();
+    expect(h.calls.map((call) => call.url)).toEqual(['/api/snapshot?refresh=1', '/api/issue/PS-1', '/api/team/PS']);
+    await h.reply(1, snapB);
+    await h.reply(2, snapB);
     expect(h.state.snap).toBe(snapB);
+    h.d.setAutoRefresh(false);
+  });
+
+  it('an auto-refresh that finishes after an action result does not overwrite it', async () => {
+    const h = dashboard();
+    h.d.setAutoRefresh(true);
     await vi.advanceTimersByTimeAsync(30_000);
     h.d.applySnapshot(snapB);
-    await h.reply(2, snapA);
+    await h.reply(0, snapA);
     expect(h.state.snap).toBe(snapB);
     await vi.advanceTimersByTimeAsync(30_000);
-    await h.reply(3, snapA); // nothing newer arrived: applied normally
+    await h.reply(1, snapA);
     expect(h.state.snap).toBe(snapA);
     h.d.setAutoRefresh(false);
   });
