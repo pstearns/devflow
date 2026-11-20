@@ -25,7 +25,7 @@ function TicketCard({ i, pr, onOpen, now, snap, onResult }: { i: Issue; pr?: Pul
         <div className="mt-1.5 space-y-0.5 text-[12px]">
           <div><Ext href={pr.url} className="mono">PR #{pr.number}</Ext> <span className="text-muted">{pr.draft ? 'draft' : pr.state} · <Time iso={pr.updatedAt} now={now} /></span></div>
           <div className="flex gap-3"><span title="CI"><span className="text-muted">CI </span><Pill status={pr.ci} /></span></div>
-          <div className="flex gap-3"><span><span className="text-muted">Review </span><Pill status={pr.independentReview} label={pr.independentReview.value === 'unknown' ? 'Unknown' : undefined} /></span></div>
+          <div className="flex gap-3"><span><span className="text-muted">Review </span><Pill status={i.gates.review} label={i.gates.review.value === 'unknown' ? 'Unknown' : undefined} /></span></div>
         </div>
       ) : (i.stage && !['backlog', 'discovery', 'ready'].includes(i.stage)) ? <div className="mt-1 text-[12px] text-muted">No linked PR evidence</div> : null}
     </div>

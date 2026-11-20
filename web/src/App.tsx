@@ -3,7 +3,7 @@ import { Lifecycle } from './components/Lifecycle.tsx';
 import { ScopeDetail, TicketDetail } from './components/Detail.tsx';
 import { Time, btn, select } from './components/ui.tsx';
 import type { Snapshot } from '../../shared/types.ts';
-import { VIEWS, inSel, logout, selOf, useRoute, useSessionGuard, useSnapshot, relTime } from './lib.ts';
+import { VIEWS, inSel, logout, selOf, useRoute, useSessionGuard, useSnapshot, relTime, type Live } from './lib.ts';
 import { Overview } from './views/Overview.tsx';
 import { Milestones } from './views/Milestones.tsx';
 import { Pipeline } from './views/Pipeline.tsx';
@@ -16,6 +16,23 @@ function useTheme(): [string, () => void] {
     try { localStorage.setItem('devflow-theme', t); } catch { /* storage unavailable */ }
   }, [t]);
   return [t, () => setT(t === 'dark' ? 'light' : 'dark')];
+}
+
+export function AutoRefreshToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" role="switch" aria-checked={on} className={`${btn} whitespace-nowrap`} onClick={onToggle}
+      title="Refresh automatically every 30 seconds while this page is visible">Auto-refresh: {on ? 'On' : 'Off'}</button>
+  );
+}
+
+/** The header's Refresh button and, right beside it, the Auto-refresh switch. */
+export function RefreshControls({ loading, refresh, autoOn, setAutoRefresh }: Pick<Live, 'loading' | 'refresh' | 'autoOn' | 'setAutoRefresh'>) {
+  return (
+    <>
+      <button className={btn} onClick={refresh} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
+      <AutoRefreshToggle on={autoOn} onToggle={() => setAutoRefresh(!autoOn)} />
+    </>
+  );
 }
 
 export function App() {
@@ -115,7 +132,7 @@ export function App() {
               {bad.length > 0 && !live.error ? ` · ${bad.length} source issue${bad.length > 1 ? 's' : ''}` : ''}
             </span>
           </button>
-          <button className={btn} onClick={live.refresh} disabled={live.loading}>{live.loading ? 'Refreshing…' : 'Refresh'}</button>
+          <RefreshControls loading={live.loading} refresh={live.refresh} autoOn={live.autoOn} setAutoRefresh={live.setAutoRefresh} />
           <button className={btn} onClick={toggleTheme} aria-label="Toggle theme">{theme === 'dark' ? 'Light' : 'Dark'}</button>
           <button className={btn} onClick={logout} title="End this session on the server and return to the sign-in page">Log out</button>
         </div>
@@ -140,7 +157,7 @@ export function App() {
               ))}
             </tbody>
           </table>
-          <p className="mt-1 text-[11px] text-muted">Stale = last refresh failed; the previous good data is still shown. DevFlow does not poll: data is read when you open the dashboard, press Refresh, or open an issue. Data older than {Math.round(snap.staleAfterSeconds / 60)} min is marked stale.</p>
+          <p className="mt-1 text-[11px] text-muted">Stale = last refresh failed; the previous good data is still shown. Data is read when you open the dashboard, press Refresh, or open an issue; with Auto-refresh on, also every 30 s while the page is visible. Data older than {Math.round(snap.staleAfterSeconds / 60)} min is marked stale.</p>
         </div>
       )}
 

@@ -17,6 +17,7 @@ export function Overview({ snap, issues, sel, go, now }: {
     { label: 'Ready', n: issues.filter((i) => matchesStatusFilter(i, READY_TILE_FILTER)).length, sub: 'unblocked, not started', params: { ...READY_TILE_FILTER } },
     { label: 'In progress', n: issues.filter((i) => i.stage === 'implementation' || i.stage === 'ci').length, sub: 'implementation / CI', params: { status: 'progress' } },
     { label: 'In review', n: issues.filter((i) => i.stage === 'review' || i.stage === 'merge').length, sub: 'review / awaiting merge', params: { status: 'review' } },
+    { label: 'Close in Linear', n: issues.filter((i) => i.stage === 'closeout').length, sub: 'PR merged', params: { status: 'closeout' } },
     { label: 'Blocked', n: issues.filter((i) => i.readiness === 'blocked').length, sub: 'blocker, blocked state or label', params: { blocked: '1' }, tone: 'bad' },
     { label: 'Done', n: issues.filter((i) => i.stage === 'done').length, sub: `${issues.filter((i) => i.completedAt && Date.parse(i.completedAt) > weekAgo).length} in last 7d`, params: { status: 'done' } },
   ];
@@ -36,7 +37,7 @@ export function Overview({ snap, issues, sel, go, now }: {
   return (
     <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_380px]">
       <div className="min-w-0 space-y-3">
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
           {tiles.map((t) => (
             <button key={t.label} onClick={() => go({ view: 'milestones', params: t.params }, true)} className="rounded-md border border-line bg-panel p-2.5 text-left hover:border-accent">
               <div className="text-[11px] uppercase tracking-wider text-muted">{t.label}</div>

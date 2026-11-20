@@ -66,12 +66,12 @@ export function IssueActions({ issue, snap, onResult, compact }: { issue: Issue;
         </div>,
         document.body,
       )}
-      {kind && <ActionDialog kind={kind} issue={issue} onClose={() => setKind(undefined)} onResult={(s, m) => { setKind(undefined); onResult(s, m); }} />}
+      {kind && <ActionDialog kind={kind} issue={issue} writeConfigured={w.enabled} onClose={() => setKind(undefined)} onResult={(s, m) => { setKind(undefined); onResult(s, m); }} />}
     </div>
   );
 }
 
-function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: Issue; onClose: () => void; onResult: (s: Snapshot, m: string) => void }) {
+function ActionDialog({ kind, issue, writeConfigured, onClose, onResult }: { kind: Kind; issue: Issue; writeConfigured: boolean; onClose: () => void; onResult: (s: Snapshot, m: string) => void }) {
   const [opts, setOpts] = useState<ActionOptions>();
   const [loadErr, setLoadErr] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -123,7 +123,9 @@ function ActionDialog({ kind, issue, onClose, onResult }: { kind: Kind; issue: I
         </div>
         {!opts && !loadErr && <p className="text-muted">Reading live options from Linear…</p>}
         {loadErr && <p className="text-bad">Could not read Linear: {loadErr}</p>}
-        {opts && disabled && <p className="mb-2 rounded border border-warn/50 bg-warn/10 p-2 text-warn">{opts.reason}. Set <span className="mono">LINEAR_WRITE_API_KEY</span> (a separate Linear key with Write permission) and restart DevFlow. Read-only features are unaffected.</p>}
+        {opts && disabled && <p className="mb-2 rounded border border-warn/50 bg-warn/10 p-2 text-warn">{opts.reason}. {writeConfigured
+          ? 'Change this ticket in Linear, or explicitly configure its scope for writes in DevFlow.'
+          : <>Set <span className="mono">LINEAR_WRITE_API_KEY</span> (a separate Linear key with Write permission) and restart DevFlow.</>}</p>}
 
         {opts && kind === 'labels' && (
           <div className="space-y-2">

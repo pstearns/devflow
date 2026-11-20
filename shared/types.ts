@@ -16,7 +16,7 @@ export interface Status {
   evidence: Evidence[];
 }
 
-export type Stage = 'backlog' | 'discovery' | 'ready' | 'implementation' | 'ci' | 'review' | 'merge' | 'done';
+export type Stage = 'backlog' | 'discovery' | 'ready' | 'implementation' | 'ci' | 'review' | 'merge' | 'closeout' | 'done';
 export const STAGES: { id: Stage; label: string }[] = [
   { id: 'backlog', label: 'Backlog' },
   { id: 'discovery', label: 'Discovery' },
@@ -25,6 +25,7 @@ export const STAGES: { id: Stage; label: string }[] = [
   { id: 'ci', label: 'CI' },
   { id: 'review', label: 'Independent Review' },
   { id: 'merge', label: 'Human Merge' },
+  { id: 'closeout', label: 'Close in Linear' },
   { id: 'done', label: 'Done' },
 ];
 
