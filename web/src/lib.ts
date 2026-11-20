@@ -233,19 +233,21 @@ export interface DashboardDeps { api?: typeof api; doc?: VisibilityDoc; interval
  * Every dashboard read (full snapshot, one issue, one team) and the Auto-refresh switch, outside React so the exact
  * behavior the dashboard uses can be tested. Manual reads behave as before. A scheduled auto-refresh is skipped while
  * ANY read is running, and its result is dropped if a targeted read or an action result arrived after it started, so a
- * snapshot assembled earlier never overwrites newer data.
+ * snapshot assembled earlier never overwrites newer data. A user read waits for an active automatic refresh before it starts.
  */
 export function createDashboardReads(sink: DashboardSink, deps: DashboardDeps = {}) {
   const call = deps.api ?? api;
   let fullBusy = false;
   let targeted = 0; // issue/team reads in flight
   let gen = 0; // bumped by every targeted read and action result
+  let autoJob: Promise<void> | undefined;
+  let manualWaiting = false;
   let stopAuto: (() => void) | undefined;
 
   const load = async (force: boolean, interaction: 'user' | 'passive' = 'user', supersedable = false) => {
     if (fullBusy) return;
     fullBusy = true;
-    sink.setLoading(true);
+    if (!supersedable) sink.setLoading(true);
     const at = gen;
     try {
       const r = await call(`/api/snapshot${force ? '?refresh=1' : ''}`, { interaction });
@@ -254,13 +256,14 @@ export function createDashboardReads(sink: DashboardSink, deps: DashboardDeps = 
       if (!supersedable || at === gen) { sink.setSnap(s); sink.setError(undefined); }
     } catch (e) {
       if (!supersedable || at === gen) sink.setError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server (it may have stopped)');
-    } finally { fullBusy = false; sink.setLoading(false); }
+    } finally { fullBusy = false; if (!supersedable) sink.setLoading(false); }
   };
 
   const targetedRead = async (url: string, key: string, setL: (k: string | undefined) => void, setE: (e: string | undefined) => void) => {
     gen++; targeted++;
     setL(key); setE(undefined);
     try {
+      if (autoJob) await autoJob;
       const r = await call(url, { interaction: 'user' });
       if (!r.ok) throw new Error(await readError(r));
       sink.setSnap((await r.json()) as Snapshot);
@@ -270,7 +273,21 @@ export function createDashboardReads(sink: DashboardSink, deps: DashboardDeps = 
   };
 
   /** The same re-read as Refresh, sent as a passive request (does not extend the session). */
-  const autoRefresh = async () => { if (!fullBusy && targeted === 0) await load(true, 'passive', true); };
+  const autoRefresh = async () => {
+    if (fullBusy || targeted > 0 || manualWaiting) return;
+    autoJob = load(true, 'passive', true);
+    try { await autoJob; } finally { autoJob = undefined; }
+  };
+
+  const refresh = async () => {
+    if (manualWaiting) return;
+    if (autoJob) {
+      manualWaiting = true;
+      sink.setLoading(true);
+      try { await autoJob; } finally { manualWaiting = false; }
+    }
+    await load(true);
+  };
 
   const setAutoRefresh = (on: boolean) => {
     if (on === (stopAuto !== undefined)) return;
@@ -281,7 +298,7 @@ export function createDashboardReads(sink: DashboardSink, deps: DashboardDeps = 
 
   return {
     load,
-    refresh: () => { void load(true); }, // the Refresh button
+    refresh: () => { void refresh(); }, // the Refresh button
     autoRefresh,
     setAutoRefresh,
     isAutoOn: () => stopAuto !== undefined,
