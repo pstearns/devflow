@@ -315,3 +315,18 @@ export interface ActionOptions {
 
 export interface ActionResult { ok: true; verified: true; message: string; snapshot: Snapshot }
 export interface ActionFailure { ok: false; code: string; error: string; checks?: ActionCheck[] }
+
+export interface RunActivityEvent {
+  id: string;
+  at: string;
+  actor: 'claude' | 'codex' | 'ci' | 'devflow';
+  title: string;
+  detail?: string;
+}
+
+export interface RunActivitySnapshot {
+  runId: string | null;
+  state: string | null;
+  activeAgent: 'claude' | 'codex' | null;
+  events: RunActivityEvent[];
+}

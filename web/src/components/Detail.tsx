@@ -3,6 +3,7 @@ import { IssueActions } from './Actions.tsx';
 import { IssueLabels } from './Labels.tsx';
 import { Lifecycle } from './Lifecycle.tsx';
 import { Prompts } from './Prompts.tsx';
+import { RunActivity } from './RunActivity.tsx';
 import { Card, EvidenceList, Ext, Pill, Tag, Time, btn } from './ui.tsx';
 import { copyText, type Sel } from '../lib.ts';
 import { useState } from 'react';
@@ -126,6 +127,8 @@ export function TicketDetail({ issue, snap, onOpen, loading, error, onResult }: 
         {issue.labels.length > 0 && <div className="mt-1"><IssueLabels labels={issue.labels} defs={labelDefs} /></div>}
         <div className="text-[12px] text-muted">{scopeName} · open in Linear to edit freely; DevFlow changes only what the Actions menu allows</div>
       </div>
+
+      {snap.mode === 'live' && <RunActivity key={issue.identifier} identifier={issue.identifier} />}
 
       <Card title="Lifecycle"><div className="p-2"><Lifecycle issue={issue} /></div></Card>
 
