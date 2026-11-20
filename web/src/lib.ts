@@ -367,11 +367,16 @@ export function bucketOf(i: Issue): Bucket {
 export const matchesStatusFilter = (i: Issue, f: { status?: string; blocked?: string }): boolean => (!f.status || bucketOf(i) === f.status) && matchesBlocked(i, f.blocked);
 export const READY_TILE_FILTER = { status: 'ready', blocked: '0' } as const;
 
+const PROMPT_FIELDS = ['ticket', 'project', 'milestone'] as const;
+/**
+ * Fills `{{ticket}}`, `{{project}}` and `{{milestone}}` from the current selection. A missing or blank value is never guessed:
+ * it renders as "<ticket not selected>" and, when the template uses it, a closing line tells the agent to ask instead.
+ */
 export function fillPrompt(p: PromptDef, ctx: { project?: string; ticket?: string; milestone?: string }): string {
-  return p.template
-    .replaceAll('{{project}}', ctx.project ?? '<project>')
-    .replaceAll('{{ticket}}', ctx.ticket ?? '<ticket>')
-    .replaceAll('{{milestone}}', ctx.milestone ?? '<milestone>');
+  const missing = PROMPT_FIELDS.filter((k) => p.template.includes(`{{${k}}}`) && !ctx[k]?.trim());
+  // One pass, so a selected name that itself contains "{{...}}" is inserted verbatim and never expanded.
+  const text = p.template.replace(/\{\{(ticket|project|milestone)\}\}/g, (_, k: (typeof PROMPT_FIELDS)[number]) => ctx[k]?.trim() || `<${k} not selected>`);
+  return missing.length ? `${text}\nNot selected: ${missing.join(', ')}. Do not guess; ask the owner if it is needed.` : text;
 }
 
 export async function copyText(text: string): Promise<boolean> {
