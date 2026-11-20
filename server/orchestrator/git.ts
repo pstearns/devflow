@@ -84,7 +84,7 @@ const GH_C = ['-c', 'credential.helper=', '-c', 'http.extraHeader=', '-c', 'http
 /**
  * Runs `fn` against ONE fixed destination, `<host>/<repo>.git`, where `repo` is the approved "owner/name" and `host` is https://github.com (the
  * parameter exists only so tests can point at a local server; production never passes it). `fn` gets the exact URL, a private 0700 directory
- * (removed afterwards) and an environment that holds only the allowlisted variables, HOME inside that directory, config files off, and the explicit
+ * bare repository (removed afterwards) and an environment that holds only the allowlisted variables, HOME in the scratch directory, config files off, and the explicit
  * write `token` supplied through a secret-free askpass. `origin`, pushurl, URL rewrites and every inherited git setting are never consulted.
  */
 async function toGitHub<T>(repo: string, token: string | undefined, host: string, fn: (url: string, dir: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
@@ -98,15 +98,17 @@ async function toGitHub<T>(repo: string, token: string | undefined, host: string
       GIT_ALLOW_PROTOCOL: new URL(host).protocol.slice(0, -1), GIT_ASKPASS: script, DEVFLOW_PUSH_TOKEN: token,
     };
     for (const k of GH_ENV_KEEP) if (process.env[k] !== undefined) env[k] = process.env[k];
-    return await fn(`${host}/${repo}.git`, dir, env);
+    const bare = join(dir, 'r.git');
+    await git(dir, ['init', '-q', '--bare', '--template=', bare], env);
+    return await fn(`${host}/${repo}.git`, bare, env);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 /** SHA of a run branch on the approved GitHub repository, or undefined if it does not exist. Asks the remote itself, never a local ref or `origin`. */
 export async function remoteHead(branch: string, repo: string, token: string | undefined, host = 'https://github.com') {
   if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to read: "${branch.slice(0, 80)}" is not a DevFlow run branch`);
-  return toGitHub(repo, token, host, async (url, dir, env) => {
-    const out = (await git(dir, [...GH_C, 'ls-remote', '--heads', url, `refs/heads/${branch}`], env, undefined, [token!])).trim();
+  return toGitHub(repo, token, host, async (url, bare, env) => {
+    const out = (await git(bare, [...GH_C, 'ls-remote', '--heads', url, `refs/heads/${branch}`], env, undefined, [token!])).trim();
     return out ? out.split(/\s+/)[0] : undefined;
   });
 }
@@ -120,9 +122,8 @@ export async function pushRef(repoPath: string, ref: string, branch: string, rep
   // Feature-branch-only writes, enforced here and not just by remote protection: no other destination name can be pushed, ever.
   if (!RUN_BRANCH_RE.test(branch)) throw new Error(`refusing to push: "${branch.slice(0, 80)}" is not a DevFlow run branch (devflow/<ticket>-<run>)`);
   if (!/^refs\/devflow\/[A-Za-z0-9]+\/attempt-\d$/.test(ref)) throw new Error('refusing to push: source must be a private refs/devflow/<run>/attempt-N ref');
-  return toGitHub(repo, token, host, async (url, dir, env) => {
-    const bare = join(dir, 'r.git'), sha = await resolveRef(repoPath, ref), objects = (await git(repoPath, ['rev-parse', '--path-format=absolute', '--git-path', 'objects'])).trim();
-    await git(dir, ['init', '-q', '--bare', '--template=', bare], env);
+  return toGitHub(repo, token, host, async (url, bare, env) => {
+    const sha = await resolveRef(repoPath, ref), objects = (await git(repoPath, ['rev-parse', '--path-format=absolute', '--git-path', 'objects'])).trim();
     writeFileSync(join(bare, 'objects', 'info', 'alternates'), `${objects}\n`);
     await git(bare, ['update-ref', ref, sha], env);
     // Explicit URL: no remote exists. Never --force. The token is not in argv.
