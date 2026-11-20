@@ -254,15 +254,16 @@ export function relTime(iso: string | undefined, now = Date.now()): string {
 }
 export const fullTime = (iso?: string) => (iso ? new Date(iso).toLocaleString() : '');
 
-export type Bucket = 'backlog' | 'discovery' | 'ready' | 'progress' | 'review' | 'done' | 'canceled' | 'other';
+export type Bucket = 'backlog' | 'discovery' | 'ready' | 'progress' | 'review' | 'closeout' | 'done' | 'canceled' | 'other';
 export const BUCKETS: { id: Bucket; label: string }[] = [
   { id: 'backlog', label: 'Backlog' }, { id: 'discovery', label: 'Discovery' }, { id: 'ready', label: 'Ready' }, { id: 'progress', label: 'In progress' },
-  { id: 'review', label: 'In review' }, { id: 'done', label: 'Done' }, { id: 'canceled', label: 'Canceled' },
+  { id: 'review', label: 'In review' }, { id: 'closeout', label: 'Close in Linear' }, { id: 'done', label: 'Done' }, { id: 'canceled', label: 'Canceled' },
 ];
 export function bucketOf(i: Issue): Bucket {
   if (i.state.type === 'canceled') return 'canceled';
   switch (i.stage) {
     case 'done': return 'done';
+    case 'closeout': return 'closeout';
     case 'review': case 'merge': return 'review';
     case 'implementation': case 'ci': return 'progress';
     case 'ready': return 'ready';

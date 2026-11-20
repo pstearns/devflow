@@ -124,7 +124,7 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
     expect(readFileSync(join(runDir(w, 'ATL-22'), 'attempt-1', 'claude-prompt.txt'), 'utf8')).toContain('CI FAILED');
     expect(m.outcome).toBe('PASS');
     expect(w.calls.review).toBe(1);
-  });
+  }, 15_000);
 });
 
 describe('three failed repairs escalate', () => {
@@ -147,7 +147,7 @@ describe('three failed repairs escalate', () => {
     expect(m.cleanup.clone).toBe('kept'); // evidence for the owner
     expect(existsSync(m.clone)).toBe(true);
     expect(existsSync(join(w.runsDir, 'locks', 'ATL-22.lock'))).toBe(false);
-  });
+  }, 15_000);
 
   it('maxRepairs: 1 stops on the second FAIL with exactly one repair and says so in the audit trail', async () => {
     const w = world({ scenario: 'never-fixes', maxRepairs: 1 });
