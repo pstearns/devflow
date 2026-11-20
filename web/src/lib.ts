@@ -166,7 +166,8 @@ export interface Live {
   error?: string; // last fetch error (snapshot may still be shown from an earlier success)
   loading: boolean;
   refresh: () => void; // explicit user action: re-read everything
-  autoRefresh: () => Promise<void>; // the same re-read, sent as a passive request (does not extend the session)
+  autoOn: boolean; // Auto-refresh switch; OFF on every page load, never persisted
+  setAutoRefresh: (on: boolean) => void;
   openIssue: (identifier: string) => void; // re-read just this issue if its detail is missing/stale
   openTeam: (key: string) => void; // read one accessible team that has not been read yet
   teamLoading?: string;
@@ -194,59 +195,102 @@ export function useSnapshot(): Live {
   const [issueError, setIssueError] = useState<string>();
   const [teamLoading, setTeamLoading] = useState<string>();
   const [teamError, setTeamError] = useState<string>();
+  const [autoOn, setAutoOn] = useState(false);
   const snapRef = useRef<Snapshot>(undefined);
-  const busy = useRef(false);
   snapRef.current = snap;
+  const [d] = useState(() => createDashboardReads({ setSnap, setError, setLoading, setIssueLoading, setIssueError, setTeamLoading, setTeamError, setAutoOn }));
 
-  const load = useCallback(async (force: boolean, interaction: 'user' | 'passive' = 'user') => {
-    if (busy.current) return;
-    busy.current = true;
-    setLoading(true);
-    try {
-      const r = await api(`/api/snapshot${force ? '?refresh=1' : ''}`, { interaction });
-      if (!r.ok) throw new Error(await readError(r));
-      setSnap((await r.json()) as Snapshot); setError(undefined);
-    } catch (e) {
-      setError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server (it may have stopped)');
-    } finally { busy.current = false; setLoading(false); }
-  }, []);
-
-  const openIssue = useCallback(async (identifier: string) => {
-    setIssueLoading(identifier); setIssueError(undefined);
-    try {
-      const r = await api(`/api/issue/${encodeURIComponent(identifier)}`, { interaction: 'user' });
-      if (!r.ok) throw new Error(await readError(r));
-      setSnap((await r.json()) as Snapshot);
-    } catch (e) {
-      setIssueError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server');
-    } finally { setIssueLoading(undefined); }
-  }, []);
-
-  const openTeam = useCallback(async (key: string) => {
-    setTeamLoading(key); setTeamError(undefined);
-    try {
-      const r = await api(`/api/team/${encodeURIComponent(key)}`, { interaction: 'user' });
-      if (!r.ok) throw new Error(await readError(r));
-      setSnap((await r.json()) as Snapshot);
-    } catch (e) {
-      setTeamError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server');
-    } finally { setTeamLoading(undefined); }
-  }, []);
-
-  useEffect(() => { load(false); }, [load]);
+  useEffect(() => { d.load(false); }, [d]);
   useEffect(() => {
     const onVisible = () => {
       const s = snapRef.current;
-      if (document.visibilityState === 'visible' && s && Date.now() - Date.parse(s.dataAt) > s.staleAfterSeconds * 1000) load(false, 'passive'); // returning to a tab is not a user interaction
+      if (document.visibilityState === 'visible' && s && Date.now() - Date.parse(s.dataAt) > s.staleAfterSeconds * 1000) d.load(false, 'passive'); // returning to a tab is not a user interaction
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [load]);
-  return { snap, error, loading, refresh: () => load(true), autoRefresh: () => load(true, 'passive'), openIssue, openTeam, teamLoading, teamError, applySnapshot: setSnap, issueLoading, issueError };
+  }, [d]);
+  useEffect(() => () => d.setAutoRefresh(false), [d]); // leaving the dashboard stops auto-refresh (timer and listener)
+  return { snap, error, loading, refresh: d.refresh, autoOn, setAutoRefresh: d.setAutoRefresh, openIssue: d.openIssue, openTeam: d.openTeam, teamLoading, teamError, applySnapshot: d.applySnapshot, issueLoading, issueError };
 }
 
 export const AUTO_REFRESH_MS = 30_000;
 type VisibilityDoc = Pick<Document, 'visibilityState' | 'addEventListener' | 'removeEventListener'>;
+
+/** Where the dashboard's read state goes (React state setters in the app; plain recorders in tests). */
+export interface DashboardSink {
+  setSnap: (s: Snapshot) => void;
+  setError: (e: string | undefined) => void;
+  setLoading: (b: boolean) => void;
+  setIssueLoading: (id: string | undefined) => void;
+  setIssueError: (e: string | undefined) => void;
+  setTeamLoading: (key: string | undefined) => void;
+  setTeamError: (e: string | undefined) => void;
+  setAutoOn: (on: boolean) => void;
+}
+export interface DashboardDeps { api?: typeof api; doc?: VisibilityDoc; intervalMs?: number }
+
+/**
+ * Every dashboard read (full snapshot, one issue, one team) and the Auto-refresh switch, outside React so the exact
+ * behavior the dashboard uses can be tested. Manual reads behave as before. A scheduled auto-refresh is skipped while
+ * ANY read is running, and its result is dropped if a targeted read or an action result arrived after it started, so a
+ * snapshot assembled earlier never overwrites newer data.
+ */
+export function createDashboardReads(sink: DashboardSink, deps: DashboardDeps = {}) {
+  const call = deps.api ?? api;
+  let fullBusy = false;
+  let targeted = 0; // issue/team reads in flight
+  let gen = 0; // bumped by every targeted read and action result
+  let stopAuto: (() => void) | undefined;
+
+  const load = async (force: boolean, interaction: 'user' | 'passive' = 'user', supersedable = false) => {
+    if (fullBusy) return;
+    fullBusy = true;
+    sink.setLoading(true);
+    const at = gen;
+    try {
+      const r = await call(`/api/snapshot${force ? '?refresh=1' : ''}`, { interaction });
+      if (!r.ok) throw new Error(await readError(r));
+      const s = (await r.json()) as Snapshot;
+      if (!supersedable || at === gen) { sink.setSnap(s); sink.setError(undefined); }
+    } catch (e) {
+      if (!supersedable || at === gen) sink.setError(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server (it may have stopped)');
+    } finally { fullBusy = false; sink.setLoading(false); }
+  };
+
+  const targetedRead = async (url: string, key: string, setL: (k: string | undefined) => void, setE: (e: string | undefined) => void) => {
+    gen++; targeted++;
+    setL(key); setE(undefined);
+    try {
+      const r = await call(url, { interaction: 'user' });
+      if (!r.ok) throw new Error(await readError(r));
+      sink.setSnap((await r.json()) as Snapshot);
+    } catch (e) {
+      setE(e instanceof Error && e.message ? e.message : 'Cannot reach the DevFlow server');
+    } finally { targeted--; setL(undefined); }
+  };
+
+  /** The same re-read as Refresh, sent as a passive request (does not extend the session). */
+  const autoRefresh = async () => { if (!fullBusy && targeted === 0) await load(true, 'passive', true); };
+
+  const setAutoRefresh = (on: boolean) => {
+    if (on === (stopAuto !== undefined)) return;
+    if (on) stopAuto = startAutoRefresh(autoRefresh, deps.doc ?? document, deps.intervalMs);
+    else { stopAuto?.(); stopAuto = undefined; }
+    sink.setAutoOn(on);
+  };
+
+  return {
+    load,
+    refresh: () => { void load(true); }, // the Refresh button
+    autoRefresh,
+    setAutoRefresh,
+    isAutoOn: () => stopAuto !== undefined,
+    openIssue: (identifier: string) => targetedRead(`/api/issue/${encodeURIComponent(identifier)}`, identifier, sink.setIssueLoading, sink.setIssueError),
+    openTeam: (key: string) => targetedRead(`/api/team/${encodeURIComponent(key)}`, key, sink.setTeamLoading, sink.setTeamError),
+    applySnapshot: (s: Snapshot) => { gen++; sink.setSnap(s); },
+    busy: () => fullBusy || targeted > 0,
+  };
+}
 
 /**
  * Optional auto-refresh (off by default, never persisted). While the page is visible, calls `refresh` every
@@ -271,13 +315,6 @@ export function startAutoRefresh(refresh: () => Promise<unknown> | unknown, doc:
   doc.addEventListener('visibilitychange', sync);
   sync();
   return () => { stopped = true; sync(); doc.removeEventListener('visibilitychange', sync); };
-}
-
-/** Runs startAutoRefresh while `enabled`; switching off or unmounting stops it. */
-export function useAutoRefresh(enabled: boolean, refresh: () => Promise<unknown>): void {
-  const ref = useRef(refresh);
-  ref.current = refresh;
-  useEffect(() => (enabled ? startAutoRefresh(() => ref.current()) : undefined), [enabled]);
 }
 
 export function relTime(iso: string | undefined, now = Date.now()): string {

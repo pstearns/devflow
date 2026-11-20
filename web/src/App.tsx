@@ -3,7 +3,7 @@ import { Lifecycle } from './components/Lifecycle.tsx';
 import { ScopeDetail, TicketDetail } from './components/Detail.tsx';
 import { Time, btn, select } from './components/ui.tsx';
 import type { Snapshot } from '../../shared/types.ts';
-import { VIEWS, inSel, logout, selOf, useRoute, useAutoRefresh, useSessionGuard, useSnapshot, relTime } from './lib.ts';
+import { VIEWS, inSel, logout, selOf, useRoute, useSessionGuard, useSnapshot, relTime, type Live } from './lib.ts';
 import { Overview } from './views/Overview.tsx';
 import { Milestones } from './views/Milestones.tsx';
 import { Pipeline } from './views/Pipeline.tsx';
@@ -25,6 +25,16 @@ export function AutoRefreshToggle({ on, onToggle }: { on: boolean; onToggle: () 
   );
 }
 
+/** The header's Refresh button and, right beside it, the Auto-refresh switch. */
+export function RefreshControls({ loading, refresh, autoOn, setAutoRefresh }: Pick<Live, 'loading' | 'refresh' | 'autoOn' | 'setAutoRefresh'>) {
+  return (
+    <>
+      <button className={btn} onClick={refresh} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
+      <AutoRefreshToggle on={autoOn} onToggle={() => setAutoRefresh(!autoOn)} />
+    </>
+  );
+}
+
 export function App() {
   const live = useSnapshot();
   useSessionGuard();
@@ -34,8 +44,6 @@ export function App() {
   const [now, setNow] = useState(Date.now());
   const [showHealth, setShowHealth] = useState(false);
   const [notice, setNotice] = useState<string>();
-  const [auto, setAuto] = useState(false); // per page load only; never persisted
-  useAutoRefresh(auto, live.autoRefresh);
   const onResult = (s: Snapshot, message: string) => { live.applySnapshot(s); setNotice(message); setTimeout(() => setNotice(undefined), 6000); };
   // Only re-renders relative-time labels; makes no request and stops while the tab is hidden.
   useEffect(() => {
@@ -124,8 +132,7 @@ export function App() {
               {bad.length > 0 && !live.error ? ` · ${bad.length} source issue${bad.length > 1 ? 's' : ''}` : ''}
             </span>
           </button>
-          <button className={btn} onClick={live.refresh} disabled={live.loading}>{live.loading ? 'Refreshing…' : 'Refresh'}</button>
-          <AutoRefreshToggle on={auto} onToggle={() => setAuto((a) => !a)} />
+          <RefreshControls loading={live.loading} refresh={live.refresh} autoOn={live.autoOn} setAutoRefresh={live.setAutoRefresh} />
           <button className={btn} onClick={toggleTheme} aria-label="Toggle theme">{theme === 'dark' ? 'Light' : 'Dark'}</button>
           <button className={btn} onClick={logout} title="End this session on the server and return to the sign-in page">Log out</button>
         </div>
