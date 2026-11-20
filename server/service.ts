@@ -4,6 +4,7 @@ import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, isFreshPrFor,
 import { LinearClient, discoverTeams, fetchLinearIssue, fetchTeamData, type TeamData, type TeamRef } from './linear.ts';
 import { configuredTeamKeys, repoOwners } from './scope.ts';
 import { buildSnapshot } from './snapshot.ts';
+import { runActivity } from './orchestrator/activity.ts';
 import { SourceError, clampResume, requestScope } from './util.ts';
 
 const REFRESH_DEADLINE_MS = 90_000;
@@ -87,6 +88,16 @@ export class SnapshotService {
   /** Opening one issue: re-read only that issue (and its PRs' evidence), and only if its detail is missing or stale. */
   /** Latest assembled snapshot without any I/O. */
   peek(): Snapshot | undefined { return this.last?.snap; }
+
+  /** Local, passive reads for the selected ticket. No Linear or GitHub requests. */
+  activity(identifier: string) {
+    const issue = this.peek()?.issues.find((i) => i.identifier === identifier.toUpperCase());
+    if (this.mode !== 'live' || !issue?.configProjectId) return undefined;
+    const project = this.cfg.projects.find((p) => p.id === issue.configProjectId);
+    const orchestration = project?.orchestration;
+    if (!project || !orchestration) return undefined;
+    return runActivity(orchestration.runsDir, issue, project.id, orchestration.repo);
+  }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {
     const base = this.last?.snap ?? (await this.get());
