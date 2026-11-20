@@ -3,7 +3,7 @@ import { Lifecycle } from './components/Lifecycle.tsx';
 import { ScopeDetail, TicketDetail } from './components/Detail.tsx';
 import { Time, btn, select } from './components/ui.tsx';
 import type { Snapshot } from '../../shared/types.ts';
-import { VIEWS, inSel, logout, selOf, useRoute, useSessionGuard, useSnapshot, relTime } from './lib.ts';
+import { VIEWS, inSel, logout, selOf, useRoute, useAutoRefresh, useSessionGuard, useSnapshot, relTime } from './lib.ts';
 import { Overview } from './views/Overview.tsx';
 import { Milestones } from './views/Milestones.tsx';
 import { Pipeline } from './views/Pipeline.tsx';
@@ -18,6 +18,13 @@ function useTheme(): [string, () => void] {
   return [t, () => setT(t === 'dark' ? 'light' : 'dark')];
 }
 
+export function AutoRefreshToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button type="button" role="switch" aria-checked={on} className={`${btn} whitespace-nowrap`} onClick={onToggle}
+      title="Refresh automatically every 30 seconds while this page is visible">Auto-refresh: {on ? 'On' : 'Off'}</button>
+  );
+}
+
 export function App() {
   const live = useSnapshot();
   useSessionGuard();
@@ -27,6 +34,8 @@ export function App() {
   const [now, setNow] = useState(Date.now());
   const [showHealth, setShowHealth] = useState(false);
   const [notice, setNotice] = useState<string>();
+  const [auto, setAuto] = useState(false); // per page load only; never persisted
+  useAutoRefresh(auto, live.autoRefresh);
   const onResult = (s: Snapshot, message: string) => { live.applySnapshot(s); setNotice(message); setTimeout(() => setNotice(undefined), 6000); };
   // Only re-renders relative-time labels; makes no request and stops while the tab is hidden.
   useEffect(() => {
@@ -116,6 +125,7 @@ export function App() {
             </span>
           </button>
           <button className={btn} onClick={live.refresh} disabled={live.loading}>{live.loading ? 'Refreshing…' : 'Refresh'}</button>
+          <AutoRefreshToggle on={auto} onToggle={() => setAuto((a) => !a)} />
           <button className={btn} onClick={toggleTheme} aria-label="Toggle theme">{theme === 'dark' ? 'Light' : 'Dark'}</button>
           <button className={btn} onClick={logout} title="End this session on the server and return to the sign-in page">Log out</button>
         </div>
@@ -140,7 +150,7 @@ export function App() {
               ))}
             </tbody>
           </table>
-          <p className="mt-1 text-[11px] text-muted">Stale = last refresh failed; the previous good data is still shown. DevFlow does not poll: data is read when you open the dashboard, press Refresh, or open an issue. Data older than {Math.round(snap.staleAfterSeconds / 60)} min is marked stale.</p>
+          <p className="mt-1 text-[11px] text-muted">Stale = last refresh failed; the previous good data is still shown. Data is read when you open the dashboard, press Refresh, or open an issue; with Auto-refresh on, also every 30 s while the page is visible. Data older than {Math.round(snap.staleAfterSeconds / 60)} min is marked stale.</p>
         </div>
       )}
 

@@ -166,6 +166,7 @@ export interface Live {
   error?: string; // last fetch error (snapshot may still be shown from an earlier success)
   loading: boolean;
   refresh: () => void; // explicit user action: re-read everything
+  autoRefresh: () => Promise<void>; // the same re-read, sent as a passive request (does not extend the session)
   openIssue: (identifier: string) => void; // re-read just this issue if its detail is missing/stale
   openTeam: (key: string) => void; // read one accessible team that has not been read yet
   teamLoading?: string;
@@ -182,8 +183,8 @@ async function readError(r: Response): Promise<string> {
 
 /**
  * Data is fetched only on: first load, the Refresh button, opening an issue whose detail is missing/stale,
- * and a hidden tab becoming visible again after the data went stale. There is no timer: an idle or hidden
- * tab makes zero requests.
+ * a hidden tab becoming visible again after the data went stale, and (only when the user switches it on for this
+ * page load) the 30-second auto-refresh. A hidden tab makes zero requests.
  */
 export function useSnapshot(): Live {
   const [snap, setSnap] = useState<Snapshot>();
@@ -241,7 +242,42 @@ export function useSnapshot(): Live {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [load]);
-  return { snap, error, loading, refresh: () => load(true), openIssue, openTeam, teamLoading, teamError, applySnapshot: setSnap, issueLoading, issueError };
+  return { snap, error, loading, refresh: () => load(true), autoRefresh: () => load(true, 'passive'), openIssue, openTeam, teamLoading, teamError, applySnapshot: setSnap, issueLoading, issueError };
+}
+
+export const AUTO_REFRESH_MS = 30_000;
+type VisibilityDoc = Pick<Document, 'visibilityState' | 'addEventListener' | 'removeEventListener'>;
+
+/**
+ * Optional auto-refresh (off by default, never persisted). While the page is visible, calls `refresh` every
+ * `intervalMs`. A tick is skipped while the previous refresh is still running (no queue, no duplicate request).
+ * A hidden page has no timer at all; becoming visible starts a fresh interval, so missed ticks never pile up.
+ * A failed refresh does not stop the schedule (errors are shown by the normal refresh error path).
+ * Returns a stop function that clears the timer and the visibility listener.
+ */
+export function startAutoRefresh(refresh: () => Promise<unknown> | unknown, doc: VisibilityDoc = document, intervalMs = AUTO_REFRESH_MS): () => void {
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let inFlight = false;
+  let stopped = false;
+  const tick = () => {
+    if (stopped || inFlight || doc.visibilityState !== 'visible') return;
+    inFlight = true;
+    Promise.resolve().then(refresh).catch(() => {}).finally(() => { inFlight = false; });
+  };
+  const sync = () => {
+    if (!stopped && doc.visibilityState === 'visible') { if (timer === undefined) timer = setInterval(tick, intervalMs); }
+    else if (timer !== undefined) { clearInterval(timer); timer = undefined; }
+  };
+  doc.addEventListener('visibilitychange', sync);
+  sync();
+  return () => { stopped = true; sync(); doc.removeEventListener('visibilitychange', sync); };
+}
+
+/** Runs startAutoRefresh while `enabled`; switching off or unmounting stops it. */
+export function useAutoRefresh(enabled: boolean, refresh: () => Promise<unknown>): void {
+  const ref = useRef(refresh);
+  ref.current = refresh;
+  useEffect(() => (enabled ? startAutoRefresh(() => ref.current()) : undefined), [enabled]);
 }
 
 export function relTime(iso: string | undefined, now = Date.now()): string {
