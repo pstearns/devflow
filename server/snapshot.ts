@@ -10,6 +10,8 @@ import { matchPrs } from './match.ts';
 import { ciStatus, humanReviewStatus, independentReviewStatus, status } from './status.ts';
 import { safeUrl } from './util.ts';
 import { computeGates } from './gate.ts';
+import { RunStore } from './orchestrator/manifest.ts';
+import type { Manifest } from './orchestrator/types.ts';
 
 export interface BuildInput {
   cfg: Config;
@@ -62,7 +64,9 @@ function pickPrimary(prs: PullRequest[]): PullRequest | undefined {
   return open[0] ?? prs.filter((p) => p.state === 'merged').sort(byUpdated)[0] ?? undefined;
 }
 
-export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, cfg: Config, now: number): void {
+type RunProgress = Pick<Manifest, 'runId' | 'state' | 'outcome' | 'pr' | 'repo' | 'branch' | 'approvedSha'>;
+
+export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, cfg: Config, now: number, run?: RunProgress): void {
   issue.openBlockers = issue.blockedBy.filter((b) => !b.resolved);
   const t = issue.state.type;
   const resolved = t === 'completed' || t === 'canceled';
@@ -77,6 +81,12 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, c
   issue.primaryPrKey = primary?.key;
   const lv = (label: string): Evidence => ({ source: 'Linear state', label, url: issue.url });
   const prEv = (pr: PullRequest, label: string): Evidence => ({ source: 'GitHub PR', label, url: pr.url });
+  const runEvidence: Evidence = { source: 'DevFlow run', label: `Run ${run?.runId}: ${run?.state}` };
+  const matchingDraft = primary?.state === 'open' && primary.draft && primary.number === run?.pr?.number &&
+    primary.repo === run?.repo && primary.headRef === run?.branch;
+  const approved = matchingDraft && run?.state === 'awaiting-owner' && run.outcome === 'PASS' &&
+    primary?.headSha === run.approvedSha && primary.ci.value === 'passed' &&
+    primary.humanReview.value !== 'failed' && primary.independentReview.value !== 'failed';
   issue.rework = [];
   issue.awaitingHuman = [];
   issue.stageEvidence = [];
@@ -85,8 +95,22 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, c
   if (t === 'canceled') stage = undefined, issue.stageEvidence.push(lv(`State: ${issue.state.name} (canceled)`));
   else if (t === 'completed') stage = 'done', issue.stageEvidence.push(lv(`State: ${issue.state.name}`));
   else if (primary && primary.state === 'merged') {
-    stage = 'merge';
+    stage = 'closeout';
     issue.stageEvidence.push(prEv(primary, `PR #${primary.number} merged`), lv(`Linear state is still "${issue.state.name}"`));
+  } else if (approved && primary) {
+    stage = 'merge';
+    issue.stageEvidence.push(runEvidence);
+    issue.awaitingHuman.push(`Owner approval for draft PR #${primary.number}`);
+  } else if (matchingDraft && run?.state === 'ci') {
+    stage = 'ci';
+    issue.stageEvidence.push(runEvidence);
+  } else if (matchingDraft && (run?.state === 'reviewing' || run?.state === 'publishing')) {
+    stage = 'review';
+    issue.stageEvidence.push(runEvidence);
+  } else if (matchingDraft && run?.state === 'repairing') {
+    stage = 'implementation';
+    issue.rework.push('DevFlow repair in progress');
+    issue.stageEvidence.push(runEvidence);
   } else if (primary) {
     const { ci, humanReview, independentReview } = primary;
     if (primary.draft) { stage = 'implementation'; issue.stageEvidence.push(prEv(primary, `PR #${primary.number} is a draft`)); }
@@ -123,7 +147,7 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, c
       : status('unknown', 'No linked PR evidence');
   issue.gates = {
     ci: primary ? primary.ci : noPr(),
-    review: primary ? primary.independentReview : noPr(),
+    review: approved ? status('passed', 'DevFlow verified independent review on the current PR head', [runEvidence]) : primary ? primary.independentReview : noPr(),
     merge: primary
       ? primary.state === 'merged' ? status('passed', `PR merged ${primary.mergedAt ?? ''}`.trim(), [prEv(primary, 'Merged')])
         : primary.state === 'open' ? status('pending', 'PR open, not merged', [prEv(primary, `PR #${primary.number} open`)])
@@ -209,7 +233,14 @@ export function buildSnapshot(inp: BuildInput): Snapshot {
   for (const i of issues) {
     const ref = i.linearProjectId ? refsByTeam.get(i.teamKey)?.get(i.linearProjectId) : undefined;
     const sc = resolveScope(cfg, i.teamKey, i.linearProjectId ? ref ?? { id: i.linearProjectId, name: i.linearProjectName ?? '' } : undefined);
-    deriveIssue(i, i.prKeys.map((k) => prByKey.get(k)!).filter(Boolean), sc.workflow, cfg, nowMs);
+    const project = sc.configProject;
+    let run: Manifest | undefined;
+    if (inp.mode === 'live' && i.state.type === 'started' && project?.orchestration) {
+      try { run = new RunStore(project.orchestration.runsDir).runsFor(i.identifier)[0]; }
+      catch { /* The Linear and GitHub evidence remains usable if the run directory is unavailable. */ }
+    }
+    const scopedRun = run?.startConfirmed && run.issueId === i.id && run.project === project?.id && sc.repos.includes(run.repo) ? run : undefined;
+    deriveIssue(i, i.prKeys.map((k) => prByKey.get(k)!).filter(Boolean), sc.workflow, cfg, nowMs, scopedRun);
   }
 
   // ---- teams as first-class navigation (discovered, then enriched with configuration)

@@ -8,13 +8,14 @@ import { TERMINAL, type Manifest } from './types.ts';
 export class DuplicateRun extends Error {}
 
 export class RunStore {
-  constructor(readonly runsDir: string) { mkdirSync(join(runsDir, 'locks'), { recursive: true, mode: 0o700 }); }
+  constructor(readonly runsDir: string) {}
 
   runDir(m: Pick<Manifest, 'ticket' | 'runId'>) { return join(this.runsDir, `${m.ticket}-${m.runId}`); }
   private lockPath(ticket: string) { return join(this.runsDir, 'locks', `${ticket}.lock`); }
 
   /** Atomic create-exclusive. A leftover lock (even from a dead process) blocks: a human must `release` it after looking. */
   acquire(ticket: string, runId: string) {
+    mkdirSync(join(this.runsDir, 'locks'), { recursive: true, mode: 0o700 });
     try {
       const fd = openSync(this.lockPath(ticket), 'wx', 0o600);
       writeFileSync(fd, JSON.stringify({ runId, pid: process.pid, at: new Date().toISOString() }));

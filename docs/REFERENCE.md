@@ -107,14 +107,15 @@ Without the write key, or outside an authorized scope, actions are visible but d
 
 ## Lifecycle stages
 
-**Backlog → Discovery → Ready → Implementation → CI → Independent Review → Human Merge → Done**, derived from Linear state and labels plus GitHub evidence. Classification labels (Idea, Bug, Security, Feature, Research, Tech Debt…) are shown and filterable but are never stages. Label and state names are per-scope configuration (`workflow`), not code.
+**Backlog → Discovery → Ready → Implementation → CI → Independent Review → Human Merge → Close in Linear → Done**, derived from Linear state and labels plus GitHub evidence. Classification labels (Idea, Bug, Security, Feature, Research, Tech Debt…) are shown and filterable but are never stages. Label and state names are per-scope configuration (`workflow`), not code.
 
 **Primary PR.** The most recently updated open linked PR, otherwise the most recently updated merged one. A PR closed without merging does not count.
 
 **Stage precedence**, first match wins:
 - A canceled Linear state is not staged. A completed Linear state is **Done**, whatever the PR says.
-- A merged primary PR is **Human Merge** (Linear still open), whatever its CI or review state.
+- A merged primary PR with an open Linear ticket is **Close in Linear**, regardless of its CI or review state.
 - An open PR: a draft, failing CI, or failing review → **Implementation** (rework). CI not Passed (pending or Unknown) → **CI**. Independent or human review Passed → **Human Merge**, awaiting the merge decision. Otherwise → **Independent Review**.
+- A draft PR from a DevFlow run follows the recorded run phase through CI, independent review and repair. **Human Merge** requires a verified run PASS matching the current PR head, green CI and no failing review.
 - No PR: a started issue is **Implementation** (**Independent Review** if its state name contains "review"). Backlog, triage and Todo issues are **Ready** (Todo state and the ready label), **Discovery** (a discovery label) or **Backlog**. The ready label on a non-Todo state is not treated as Ready.
 
 **Markers.**

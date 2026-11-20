@@ -4,6 +4,7 @@ import type { CheckItem, ReviewItem } from '../shared/types.ts';
 import { SnapshotService } from '../server/service.ts';
 import { demoConfig, demoFetch } from '../server/demo.ts';
 import { parseConfig } from '../server/config.ts';
+import { deriveIssue } from '../server/snapshot.ts';
 
 const chk = (name: string, state: CheckItem['state']): CheckItem => ({ name, state, rawStatus: 'completed', rawConclusion: state, source: 'check_run' });
 const rv = (user: string, state: string, at: string): ReviewItem => ({ user, state, at });
@@ -74,6 +75,33 @@ describe('snapshot over synthetic API', () => {
     expect(i('ATL-1').stage).toBe('done');
     expect(i('ATL-12').stage).toBeUndefined();
     expect(i('ATL-8').gates.ci.value).toBe('na');
+  });
+  it('routes a merged PR with an open Linear ticket to closeout', async () => {
+    const snap = await demoSnap();
+    const issue = snap.issues.find((i) => i.identifier === 'ATL-2')!;
+    const cfg = demoConfig();
+    const openIssue = { ...issue, state: { ...issue.state, name: 'Todo', type: 'unstarted' as const } };
+    deriveIssue(openIssue, snap.prs.filter((pr) => issue.prKeys.includes(pr.key)), cfg.projects[0]!.workflow, cfg, now);
+    expect(openIssue.stage).toBe('closeout');
+    expect(openIssue.awaitingHuman).toEqual([]);
+  });
+  it('projects a draft run through CI, review, repair and owner approval', async () => {
+    const snap = await demoSnap();
+    const issue = { ...snap.issues.find((i) => i.identifier === 'ATL-13')! };
+    const pr = { ...snap.prs.find((p) => p.key === issue.primaryPrKey)!, draft: true };
+    const cfg = demoConfig();
+    const run = { runId: 'demo01', pr: { number: pr.number, url: pr.url!, draft: true as const }, repo: pr.repo, branch: pr.headRef };
+    for (const [state, stage] of [['ci', 'ci'], ['reviewing', 'review'], ['repairing', 'implementation']] as const) {
+      deriveIssue(issue, [pr], cfg.projects[0]!.workflow, cfg, now, { ...run, state });
+      expect(issue.stage).toBe(stage);
+    }
+    const approved = { ...run, state: 'awaiting-owner' as const, outcome: 'PASS', approvedSha: pr.headSha };
+    deriveIssue(issue, [pr], cfg.projects[0]!.workflow, cfg, now, approved);
+    expect(issue.stage).toBe('merge');
+    expect(issue.gates.review.value).toBe('passed');
+    deriveIssue(issue, [{ ...pr, headSha: 'different' }], cfg.projects[0]!.workflow, cfg, now, approved);
+    expect(issue.stage).toBe('implementation');
+    expect(issue.awaitingHuman).toEqual([]);
   });
   it('classifies Backlog, Discovery and Ready from real Linear state + labels (not every backlog issue is Discovery)', async () => {
     const snap = await demoSnap();
