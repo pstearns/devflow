@@ -39,6 +39,10 @@ export interface Deps {
   write: Pick<LinearWriteClient, 'createComment' | 'setState'>;
   ci: CiProvider;
   prs: PullRequests;
+  /** The GitHub WRITE token, used explicitly for `git push` (never the read token, never ambient git credentials). */
+  pushToken?: string;
+  /** Test seam only (the CLI never sets it): the base URL of the git remote, so hermetic tests can serve the approved repository from a local server. */
+  gitHost?: () => Promise<string>;
   /** Built from the AUTHORIZED ticket's own project configuration (never "the first project of the team"), so the runner, the policy pin and the controller always agree. */
   agents: (oc: OrchestrationCfg, projectId: string) => AgentRunner;
   /** Trusted-policy guard for that same project. Required: a controller that cannot verify its own policy does not run. */
@@ -225,8 +229,8 @@ export class Orchestrator {
 
       // 3. push, confirm the REMOTE has exactly this SHA, ensure a DRAFT PR, confirm GitHub's PR head is this SHA
       await this.infra(store, m, 'push', async () => {
-        await G.pushRef(oc.repoPath, this.ref(m, n), m.branch);
-        const remote = await G.remoteHead(oc.repoPath, m.branch);
+        await G.pushRef(oc.repoPath, this.ref(m, n), m.branch, m.repo, this.d.pushToken, await this.d.gitHost?.());
+        const remote = await this.remoteHead(m);
         if (remote !== sha) throw new Error(`remote branch is at ${remote?.slice(0, 12) ?? 'nothing'} after push, expected ${sha.slice(0, 12)}`);
       });
       await this.infra(store, m, 'pull-request', async () => {
@@ -284,7 +288,7 @@ export class Orchestrator {
     let now: { state: string; detail: string } = { state: 'unreadable', detail: 'CI could not be re-read' };
     try { now = await this.d.ci.snapshot(m.repo, sha, { required: oc.ciChecks }); } catch { /* reported below */ }
     add('CI still green when re-read', now.state === 'success', now.state === 'success' ? 'current check results are green' : `${now.state}: ${now.detail}`);
-    const remote = await G.remoteHead(oc.repoPath, m.branch);
+    const remote = await this.remoteHead(m);
     add('remote branch at this SHA', remote === sha, `remote ${remote?.slice(0, 12) ?? 'none'}`);
     let pr: PrState | undefined;
     try { pr = m.pr ? await this.d.prs.inspect(m.repo, m.pr.number) : undefined; } catch { /* reported below */ }
@@ -336,7 +340,7 @@ export class Orchestrator {
 
   // ---------------------------------------------------------------- review
   private async review(store: RunStore, m: Manifest, a: AttemptRecord, ctx: Ctx, oc: OrchestrationCfg, sha: string): Promise<{ review: Review } | { fail: string; cls: FailureClass }> {
-    if ((await G.remoteHead(oc.repoPath, m.branch)) !== sha) return { fail: 'The branch moved before review started (stale commit)', cls: 'stale-commit' };
+    if ((await this.remoteHead(m)) !== sha) return { fail: 'The branch moved before review started (stale commit)', cls: 'stale-commit' };
     const base = join(store.runDir(m), `attempt-${a.n}`);
     const files = await G.changedFiles(oc.repoPath, m.baseSha, sha);
     const diff = await G.patch(oc.repoPath, m.baseSha, sha);
@@ -411,7 +415,7 @@ export class Orchestrator {
         const bad = this.liveProblem(live, m) ?? (live.state.id !== auth.started.id ? `the ticket is in "${live.state.name}", not the in-progress state DevFlow put it in` : undefined);
         if (bad) throw new TicketChanged(bad);
         // the review gate is re-run on every attempt, immediately before the transition: a retry must not ride a stale gate
-        const remote = await G.remoteHead(auth.oc.repoPath, m.branch);
+        const remote = await this.remoteHead(m);
         if (remote !== sha) throw new GateChanged(`the remote branch moved to ${remote?.slice(0, 12) ?? 'nothing'} before approval (reviewed ${sha.slice(0, 12)})`);
         const prBad = m.pr ? prProblem(m, await this.d.prs.inspect(m.repo, m.pr.number), sha) : 'no pull request recorded';
         if (prBad) throw new GateChanged(prBad);
@@ -478,10 +482,12 @@ export class Orchestrator {
   }
 
   /** Deletes only what is safe to lose. Evidence is never touched; the clone goes only after PASS, when its commit is on the remote. */
+  /** The run branch's head on the approved GitHub repository (fixed destination, write token), never `origin`. */
+  private async remoteHead(m: Manifest) { return G.remoteHead(m.branch, m.repo, this.d.pushToken, await this.d.gitHost?.()); }
   private async cleanup(store: RunStore, m: Manifest, repoPath?: string, sha?: string) {
     if (!repoPath || !sha) { m.cleanup = { clone: 'kept', note: 'kept for inspection (run did not pass)' }; this.save(store, m, 'cleanup'); return; }
     try {
-      const onRemote = (await G.remoteHead(repoPath, m.branch)) === sha;
+      const onRemote = (await this.remoteHead(m)) === sha;
       const root = resolve(store.runDir(m)) + sep;
       if (!onRemote) m.cleanup = { clone: 'kept', note: 'kept: the approved commit is not on the remote branch' };
       else if (!resolve(m.clone).startsWith(root)) m.cleanup = { clone: 'kept', note: 'kept: clone is outside the run directory' };

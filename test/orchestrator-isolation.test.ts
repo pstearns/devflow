@@ -8,6 +8,7 @@ import { join, resolve } from 'node:path';
 import { implementerSandbox, makeBundle, reviewerSandbox, runInSandbox, type RoleSandbox } from '../server/orchestrator/agents.ts';
 import { bwrapArgs, bwrapUsable, stageHome } from '../server/orchestrator/sandbox.ts';
 import * as G from '../server/orchestrator/git.ts';
+import { gitHttpRemote } from './orchestrator-harness.ts';
 import { GithubPrs } from '../server/orchestrator/pr.ts';
 import { SourceError } from '../server/util.ts';
 
@@ -236,23 +237,88 @@ describe.skipIf(!usable)('untrusted clone cannot execute code in, or read from, 
   });
 });
 
-describe('git push surface: feature branches only', () => {
-  it('refuses any destination that is not a devflow run branch, and any source that is not a private run ref', async () => {
+describe('git push: one fixed destination, one credential', () => {
+  const REF = 'refs/devflow/abc123/attempt-0', BRANCH = 'devflow/atl-1-abcdef1', WRITE = 'WRITE-TOKEN-1234567890', READ = 'READ-TOKEN-0987654321';
+  const servers: { close: () => void }[] = [];
+  afterEach(() => { for (const x of servers.splice(0)) x.close(); });
+  /** The approved GitHub repository (served from `bare`) or, with no bare, a destination that must never be reached. */
+  const remote = async (bare: string | undefined, accept = WRITE) => { const r = await gitHttpRemote(bare, accept); servers.push(r); return r; };
+  const bareRepo = () => { const b = uniq('bare.git'); mkdirSync(b); sh(b, 'init', '-q', '--bare', '-b', 'main'); return b; };
+  const withEnv = async (vars: Record<string, string>, fn: () => Promise<void>) => {
+    const before = Object.keys(vars).map((k) => [k, process.env[k]] as const); Object.assign(process.env, vars);
+    try { await fn(); } finally { for (const [k, v] of before) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  };
+
+  it('refuses a bad branch, a bad source ref, a bad repository name and a missing token, before any git runs', async () => {
     const src = sourceRepo();
     for (const branch of ['main', 'master', 'release/1', 'devflow/x', 'devflow/atl-1', 'HEAD', 'refs/heads/main', 'devflow/atl-1-abcdef1 --force'])
-      expect(() => G.pushRef(src, 'refs/devflow/abc123/attempt-0', branch), branch).toThrow(/not a DevFlow run branch/);
+      await expect(G.pushRef(src, REF, branch, 'o/r', WRITE), branch).rejects.toThrow(/not a DevFlow run branch/);
     for (const ref of ['refs/heads/main', 'HEAD', 'refs/devflow/abc/attempt-0 --delete', '+refs/devflow/abc/attempt-0'])
-      expect(() => G.pushRef(src, ref, 'devflow/atl-1-abcdef1'), ref).toThrow(/private refs\/devflow/);
+      await expect(G.pushRef(src, ref, BRANCH, 'o/r', WRITE), ref).rejects.toThrow(/private refs\/devflow/);
+    for (const repo of ['', 'o', 'o/r/x', '../r', 'o/..', 'o/r?x=1', 'o/r#f', 'https://evil/o/r', 'o/r\n'])
+      await expect(G.pushRef(src, REF, BRANCH, repo, WRITE), repo).rejects.toThrow(/owner\/name/);
+    for (const t of [undefined, '', 'a b']) await expect(G.pushRef(src, REF, BRANCH, 'o/r', t), String(t)).rejects.toThrow(/no GITHUB_WRITE_TOKEN/);
   });
-  it('a real push goes only to the run branch and never touches main', async () => {
-    const src = sourceRepo(), bare = uniq('bare.git');
-    mkdirSync(bare); sh(bare, 'init', '-q', '--bare', '-b', 'main'); sh(src, 'remote', 'add', 'origin', bare); sh(src, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
-    const main = sh(bare, 'rev-parse', 'refs/heads/main');
-    writeFileSync(join(src, 'n.txt'), 'n'); sh(src, 'add', '-A'); sh(src, 'commit', '-q', '-m', 'work'); sh(src, 'update-ref', 'refs/devflow/abc123/attempt-0', 'HEAD');
-    await G.pushRef(src, 'refs/devflow/abc123/attempt-0', 'devflow/atl-1-abcdef1');
+
+  it('a real push goes only to the run branch, with the write token, and cleans up', async () => {
+    const bare = bareRepo(), src = sourceRepo(); sh(src, 'push', '-q', bare, 'HEAD:refs/heads/main');
+    const main = sh(bare, 'rev-parse', 'refs/heads/main'); writeFileSync(join(src, 'n.txt'), 'n'); sh(src, 'add', '-A'); sh(src, 'commit', '-q', '-m', 'work'); sh(src, 'update-ref', REF, 'HEAD');
+    const r = await remote(bare), tmp = uniq('tmp'); mkdirSync(tmp); // a private TMPDIR, so concurrent test files cannot affect the leftover check
+    await withEnv({ TMPDIR: tmp }, async () => { await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host); });
     expect(sh(bare, 'rev-parse', 'refs/heads/main')).toBe(main);
-    expect(sh(bare, 'rev-parse', 'refs/heads/devflow/atl-1-abcdef1')).toBe(sh(src, 'rev-parse', 'HEAD'));
-    expect(sh(bare, 'for-each-ref', '--format=%(refname)').split('\n').sort()).toEqual(['refs/heads/devflow/atl-1-abcdef1', 'refs/heads/main']);
+    expect(sh(bare, 'rev-parse', `refs/heads/${BRANCH}`)).toBe(sh(src, 'rev-parse', 'HEAD'));
+    expect(sh(bare, 'for-each-ref', '--format=%(refname)').split('\n').sort()).toEqual([`refs/heads/${BRANCH}`, 'refs/heads/main']);
+    expect(r.log.every((q) => q.url.startsWith('/o/r.git/'))).toBe(true);
+    expect(r.log.filter((q) => q.cred).every((q) => q.cred === `x-access-token:${WRITE}`)).toBe(true);
+    expect(readdirSync(tmp)).toEqual([]);
+  });
+
+  it('hostile git settings and environment cannot change the destination or the credential', async () => {
+    const bare = bareRepo(), good = await remote(bare), evil = await remote(undefined, 'never'), src = sourceRepo();
+    sh(src, 'push', '-q', bare, 'HEAD:refs/heads/main'); writeFileSync(join(src, 'n.txt'), 'n'); sh(src, 'add', '-A'); sh(src, 'commit', '-q', '-m', 'w'); sh(src, 'update-ref', REF, 'HEAD');
+    // repository-local: origin, two pushurls, a rewrite of the real destination, a header, helper, askpass and proxy
+    sh(src, 'remote', 'add', 'origin', `${evil.host}/o/r.git`); sh(src, 'config', '--add', 'remote.origin.pushurl', `${evil.host}/o/r.git`); sh(src, 'config', '--add', 'remote.origin.pushurl', 'git@evil.example:o/r.git');
+    sh(src, 'config', `url.${evil.host}/.insteadOf`, `${good.host}/`); sh(src, 'config', `url.${evil.host}/.pushInsteadOf`, `${good.host}/`);
+    sh(src, 'config', 'http.extraHeader', `Authorization: Bearer ${READ}`); sh(src, 'config', 'credential.helper', `!f() { echo username=x-access-token; echo password=${READ}; }; f`);
+    sh(src, 'config', 'core.askPass', '/bin/false'); sh(src, 'config', 'http.proxy', evil.host);
+    const gcfg = uniq('gitconfig'), evilAsk = uniq('ask.sh'), hh = fakeHome();
+    const rewrite = `[url "${evil.host}/"]\n\tinsteadOf = ${good.host}/\n[http]\n\textraHeader = Authorization: Bearer ${READ}\n[credential]\n\thelper = "!f() { echo username=x-access-token; echo password=${READ}; }; f"\n`;
+    writeFileSync(gcfg, rewrite); writeFileSync(join(hh, '.gitconfig'), rewrite); writeFileSync(evilAsk, `#!/bin/sh\necho ${READ}\n`, { mode: 0o700 });
+    await withEnv({ GIT_CONFIG_GLOBAL: gcfg, HOME: hh, GITHUB_TOKEN: READ, GH_TOKEN: READ, GIT_ASKPASS: evilAsk, SSH_ASKPASS: evilAsk,
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: `url.${evil.host}/.insteadOf`, GIT_CONFIG_VALUE_0: `${good.host}/`, GIT_CONFIG_PARAMETERS: `'http.extraheader=Authorization: Bearer ${READ}'`, GIT_CURL_VERBOSE: '1', GIT_TRACE: '1' },
+    async () => { await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, good.host); });
+    expect(evil.log, 'no request ever reached the hostile destinations').toEqual([]);
+    expect(sh(bare, 'rev-parse', `refs/heads/${BRANCH}`)).toBe(sh(src, 'rev-parse', 'HEAD'));
+    const creds = good.log.map((q) => q.cred).filter(Boolean);
+    expect(creds.length).toBeGreaterThan(0); expect(creds.every((c) => c === `x-access-token:${WRITE}`), creds.join(',')).toBe(true);
+  });
+
+  it('does not depend on the source repository configuration (uploadpack.hideRefs hides the run ref from a fetch)', async () => {
+    const bare = bareRepo(), src = sourceRepo(), r = await remote(bare);
+    sh(src, 'update-ref', REF, 'HEAD'); sh(src, 'config', 'uploadpack.hideRefs', 'refs/devflow'); sh(src, 'config', 'transfer.hideRefs', 'refs/devflow');
+    const probe = uniq('probe'); mkdirSync(probe); sh(probe, 'init', '-q', '--bare');
+    expect(() => sh(probe, 'fetch', '-q', src, `${REF}:${REF}`), 'a fetch from the source is blocked by that setting').toThrow();
+    await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host);
+    expect(sh(bare, 'rev-parse', `refs/heads/${BRANCH}`)).toBe(sh(src, 'rev-parse', 'HEAD'));
+  });
+
+  it('remoteHead asks the fixed destination with the write token, refuses bad input, and returns undefined for a missing branch', async () => {
+    const bare = bareRepo(), src = sourceRepo(), r = await remote(bare); sh(src, 'update-ref', REF, 'HEAD');
+    expect(await G.remoteHead(BRANCH, 'o/r', WRITE, r.host)).toBeUndefined();
+    await G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host);
+    expect(await G.remoteHead(BRANCH, 'o/r', WRITE, r.host)).toBe(sh(src, 'rev-parse', 'HEAD'));
+    expect(r.log.filter((q) => q.cred).every((q) => q.cred === `x-access-token:${WRITE}`)).toBe(true);
+    await expect(G.remoteHead('main', 'o/r', WRITE, r.host)).rejects.toThrow(/not a DevFlow run branch/);
+    await expect(G.remoteHead(BRANCH, 'o/r', undefined, r.host)).rejects.toThrow(/no GITHUB_WRITE_TOKEN/);
+    await expect(G.remoteHead(BRANCH, 'https://evil/o/r', WRITE, r.host)).rejects.toThrow(/owner\/name/);
+  });
+
+  it('removes the token from git errors before they are truncated, even across the cut', async () => {
+    const secret = 'zQ9xK2mPvL7wR4tY8nB3', pad = 'a'.repeat(452); // the secret straddles the 500-character cut
+    const msg = await G.git(sourceRepo(), ['checkout', pad + secret], G.cleanEnv(), undefined, [secret]).then(() => '', (e: Error) => e.message);
+    expect(msg.length).toBeGreaterThan(400); expect(msg).not.toContain('zQ9xK'); expect(msg).not.toContain(secret.slice(-6));
+    const rejected = await (async () => { const bare = bareRepo(), src = sourceRepo(), r = await remote(bare, 'other'); sh(src, 'update-ref', REF, 'HEAD'); return G.pushRef(src, REF, BRANCH, 'o/r', WRITE, r.host).catch((e: Error) => e.message); })();
+    expect(rejected).toMatch(/403/); expect(rejected).not.toContain(WRITE);
   });
 });
 

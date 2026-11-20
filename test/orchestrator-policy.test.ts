@@ -229,9 +229,9 @@ describe('Codex review findings (regressions)', () => {
     w = world({ scenario: 'correct-first', onSleep: () => {
       if (changed) return; changed = true;
       writeFileSync(w.configPath, `${readFileSync(w.configPath, 'utf8')} `, { mode: 0o600 }); // owner edits policy while the controller backs off
-      execFileSync('git', ['config', '--unset', 'remote.origin.pushurl'], { cwd: w.repo }); // ...and the transient push problem clears
+      rmSync(join(w.origin, 'hooks', 'pre-receive')); // ...and the transient push problem clears
     } });
-    execFileSync('git', ['config', 'remote.origin.pushurl', join(w.root, 'does-not-exist.git')], { cwd: w.repo }); // first push attempt fails
+    writeFileSync(join(w.origin, 'hooks', 'pre-receive'), '#!/bin/sh\necho transient failure >&2\nexit 1\n', { mode: 0o755 }); // first push attempt is rejected by the remote
     const m = await w.orch.run('ATL-22');
     expect(m.reasonClass).toBe('policy-violation');
     expect(m.infra.some((i) => i.step === 'push')).toBe(true); // the failure was real and was being retried
@@ -342,7 +342,7 @@ describe('Codex review round 2 (regressions)', () => {
   });
   it('host paths in controller diagnostics reach the local evidence but never the Linear comments', async () => {
     const w = world({ scenario: 'correct-first' });
-    execFileSync('git', ['config', 'remote.origin.pushurl', '/home/alice/private/customer.git'], { cwd: w.repo });
+    writeFileSync(join(w.origin, 'hooks', 'pre-receive'), '#!/bin/sh\necho "cannot write /home/alice/private/customer.git" >&2\nexit 1\n', { mode: 0o755 }); // the remote's rejection quotes a host path
     const m = await w.orch.run('ATL-22');
     expect(m.reasonClass).toBe('infrastructure');
     expect(JSON.stringify(m.infra)).toContain('customer.git'); // raw detail retained locally

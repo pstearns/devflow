@@ -1,7 +1,9 @@
 // Hermetic world for the orchestrator: a local bare repo as "origin", a clone as repoPath, the synthetic fake Linear, a CI that really
 // runs `node --test` on the pushed SHA, and scripted Claude/Codex stand-ins started through the REAL subprocess runner.
 // Nothing here touches GitHub, Linear, or a real model.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -20,6 +22,32 @@ const FIX = resolve(import.meta.dirname, 'fixtures');
 const sh = (cwd: string, ...a: string[]) => execFileSync('git', a, { cwd, stdio: 'pipe', encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t.invalid', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t.invalid' } }).trim();
 
 export const TICKET = 'ATL-22';
+export const WRITE = 'harness-write-token';
+export interface GitHttpRemote { log: { url: string; cred?: string }[]; host: string; close: () => void }
+/**
+ * A smart-HTTP git server (git http-backend) over `bare`, standing in for GitHub: it records every request and decoded Basic credential, answers
+ * 401/403 unless the credential is `x-access-token:<accept>`, and serves any /<owner>/<name>.git path from `bare`. Pass no `bare` for a destination that must never be reached.
+ */
+export async function gitHttpRemote(bare: string | undefined, accept: string): Promise<GitHttpRemote> {
+  if (bare) execFileSync('git', ['config', 'http.receivepack', 'true'], { cwd: bare });
+  const log: GitHttpRemote['log'] = [];
+  const srv = createServer((req, res) => {
+    const auth = req.headers.authorization, cred = auth ? Buffer.from(auth.replace(/^Basic /, ''), 'base64').toString('utf8') : undefined;
+    log.push({ url: req.url ?? '', cred });
+    if (cred !== `x-access-token:${accept}` || !bare) { res.writeHead(cred ? 403 : 401, { 'www-authenticate': 'Basic realm="t"' }).end('denied'); return; }
+    const [path, query = ''] = (req.url ?? '').split('?');
+    const cgi = spawn('git', ['http-backend'], { env: { PATH: process.env.PATH, GIT_PROJECT_ROOT: bare, GIT_HTTP_EXPORT_ALL: '1', REQUEST_METHOD: req.method, PATH_INFO: path!.replace(/^\/[^/]+\/[^/]+\.git/, ''), QUERY_STRING: query, CONTENT_TYPE: req.headers['content-type'] ?? '', REMOTE_USER: 'x', GIT_CONFIG_NOSYSTEM: '1' } });
+    req.pipe(cgi.stdin); const out: Buffer[] = []; cgi.stdout.on('data', (d: Buffer) => out.push(d));
+    cgi.on('close', () => {
+      const buf = Buffer.concat(out), i = buf.indexOf('\r\n\r\n'), headers: Record<string, string> = {}; let status = 200;
+      for (const l of buf.subarray(0, i).toString().split('\r\n')) { const [k, ...v] = l.split(': '); if (k!.toLowerCase() === 'status') status = parseInt(v.join(': ')); else headers[k!] = v.join(': '); }
+      res.writeHead(status, headers).end(buf.subarray(i + 4));
+    });
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  return { log, host: `http://127.0.0.1:${(srv.address() as AddressInfo).port}`, close: () => { srv.closeAllConnections(); srv.close(); } };
+}
+
 export const DESCRIPTION = 'Add `slugify(text)` in src/slugify.mjs. It lowercases, collapses every run of non-alphanumerics into one "-", and trims leading and trailing "-". Examples: "Hello World" -> "hello-world"; "Hello, World!" -> "hello-world"; "  --A  b--" -> "a-b". Add a test.';
 
 /** Local stand-in for GitHub CI: clone the remote, check out EXACTLY the sha, run the repo's tests. */
@@ -104,6 +132,7 @@ export function makeWorld(o: WorldOpts = {}) {
   const cfg = parseConfig(cfgObj);
   const f = demoFetch(Date.parse('2026-06-01T12:00:00Z'), o.linearOpts);
   f.store.issues.ATL!.push({ n: 22, title: 'Add slugify helper', state: o.state ?? 'Todo', project: o.project === undefined ? (o.second ? 'lp-ATL2' : undefined) : o.project, ageH: 1, labels: o.labels ?? ['Ready', 'Feature'], blockedBy: o.blockedBy, desc: o.live ? o.live.description : `${DESCRIPTION}\n\nSCENARIO: ${o.scenario ?? 'defect-then-fix'}` });
+  let served: Promise<GitHttpRemote> | undefined; // the approved GitHub repository, served from the local bare origin
   const ci = new LocalCi(origin, root, o.ci);
   const hostHome = o.live ? homedir() : join(root, 'fake-home'); // the sandbox stages credentials from here: dummy files, so tests never touch the real ~/.claude
   if (o.live) { /* real home: nothing to create */ } else if (!o.noLogin) { mkdirSync(join(hostHome, '.claude'), { recursive: true }); mkdirSync(join(hostHome, '.codex'), { recursive: true }); writeFileSync(join(hostHome, '.claude', '.credentials.json'), '{"fake":true}'); writeFileSync(join(hostHome, '.codex', 'auth.json'), '{"fake":true}'); } else mkdirSync(hostHome)
@@ -120,7 +149,7 @@ export function makeWorld(o: WorldOpts = {}) {
   let reads = 0;
   const factoryCalls: { kind: string; projectId: string; tools: string[] }[] = [];
   const ocOf = (id: string) => cfg.projects.find((p) => p.id === id)!.orchestration!;
-  const mk = () => new Orchestrator({ cfg, policy: (oc, pid) => { factoryCalls.push({ kind: 'policy', projectId: pid, tools: oc.claude.allowedTools }); return new PolicyGuard(() => ocOf(pid), configPath); }, read: new LinearClient(DEMO_READ_KEY, ((u: string, i?: RequestInit) => { if (/query ActionIssue/.test(String(i?.body))) o.onLinearRead?.(++reads); return f(u, i); }) as typeof fetch), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, agents: (oc, pid) => { factoryCalls.push({ kind: 'agents', projectId: pid, tools: oc.claude.allowedTools }); return agents; }, sleep: async () => { o.onSleep?.(); }, log: (l) => logs.push(l) });
+  const mk = () => new Orchestrator({ cfg, policy: (oc, pid) => { factoryCalls.push({ kind: 'policy', projectId: pid, tools: oc.claude.allowedTools }); return new PolicyGuard(() => ocOf(pid), configPath); }, read: new LinearClient(DEMO_READ_KEY, ((u: string, i?: RequestInit) => { if (/query ActionIssue/.test(String(i?.body))) o.onLinearRead?.(++reads); return f(u, i); }) as typeof fetch), write: new LinearWriteClient(DEMO_WRITE_KEY, f), ci, prs, pushToken: WRITE, gitHost: async () => (served ??= gitHttpRemote(origin, WRITE)).then((x) => x.host), agents: (oc, pid) => { factoryCalls.push({ kind: 'agents', projectId: pid, tools: oc.claude.allowedTools }); return agents; }, sleep: async () => { o.onSleep?.(); }, log: (l) => logs.push(l) });
   const issue = () => f.store.issues.ATL!.find((x) => x.n === 22)!;
   return {
     root, origin, repo, runsDir, cfg, configPath, factoryCalls, f, ci, prs, hostHome, calls, logs, mk, orch: mk(), issue, store: () => new RunStore(runsDir),
@@ -131,7 +160,8 @@ export function makeWorld(o: WorldOpts = {}) {
       const d = mkdtempSync(join(root, 'other-')); sh(d, 'clone', '-q', origin, 'w'); const w = join(d, 'w');
       sh(w, 'checkout', '-q', branch); writeFileSync(join(w, 'extra.txt'), 'x'); sh(w, 'add', '-A'); sh(w, 'commit', '-q', '-m', 'sneaky'); sh(w, 'push', '-q', 'origin', branch);
     },
-    dispose: () => { try { chmodRec(root); rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ } },
+    gitHttp: () => (served ??= gitHttpRemote(origin, WRITE)),
+    dispose: () => { void served?.then((x) => x.close()); try { chmodRec(root); rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ } },
     exists: existsSync,
   };
 }
