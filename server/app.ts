@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
+import { PassThrough } from 'node:stream';
 import type { SnapshotService } from './service.ts';
 import { SourceError } from './util.ts';
 import { ActionError, type LinearActions } from './actions.ts';
@@ -194,6 +195,45 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
       const snap = await service.getIssue(id);
       return snap ?? reply.code(404).send({ error: 'unknown issue' });
     } catch (e) { return fail(reply, e); }
+  });
+
+  const activityStreams = new Set<PassThrough>();
+  app.addHook('preClose', async () => { for (const stream of activityStreams) stream.end(); });
+  app.get('/api/issue/:identifier/run-activity', { exposeHeadRoute: false }, async (req, reply) => {
+    const { identifier } = req.params as { identifier: string };
+    if (!/^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/.test(identifier)) return reply.code(400).send({ error: 'invalid identifier' });
+    reply.header('cache-control', 'no-store');
+    if (activityStreams.size >= 8) return reply.code(503).send({ error: 'too many activity streams' });
+    const { token } = sessions.get(req)!;
+    const stream = new PassThrough();
+    activityStreams.add(stream);
+    let previous = '';
+    let heartbeatAt = Date.now();
+    const update = () => {
+      if (stream.destroyed || stream.writableEnded) return;
+      try {
+        if (!auth.validate(token, false).ok) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
+        const activity = service.activity(identifier);
+        if (!activity) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
+        const next = JSON.stringify(activity);
+        if (next !== previous) {
+          previous = next;
+          heartbeatAt = Date.now();
+          if (!stream.write(`event: activity\ndata: ${next}\n\n`)) stream.destroy();
+        } else if (Date.now() - heartbeatAt >= 15_000) {
+          heartbeatAt = Date.now();
+          if (!stream.write(': heartbeat\n\n')) stream.destroy();
+        }
+      } catch { stream.end('event: unavailable\ndata: {}\n\n'); }
+    };
+    const timer = setInterval(update, 2_000);
+    timer.unref();
+    const cleanup = () => { clearInterval(timer); activityStreams.delete(stream); };
+    stream.once('close', cleanup);
+    reply.raw.once('close', () => { cleanup(); stream.destroy(); });
+    reply.type('text/event-stream; charset=utf-8').header('x-accel-buffering', 'no');
+    setImmediate(update);
+    return reply.send(stream);
   });
 
   // ---- controlled Linear actions: authenticated session + same-origin JSON + session-bound CSRF token ----------------

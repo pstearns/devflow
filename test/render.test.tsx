@@ -38,6 +38,18 @@ describe('UI renders without throwing (SSR smoke test; not a layout check)', () 
     expect(html).toContain('rel="noopener noreferrer"');
     expect(html).not.toMatch(/href="(?!https:|obsidian:|#)/); // no non-https hrefs
   });
+  it('shows the accessible Run Activity card in a live ticket detail', async () => {
+    const snap = await snapP;
+    const issue = snap.issues[0]!;
+    const live = renderToString(<TicketDetail issue={issue} snap={{ ...snap, mode: 'live' }} onOpen={noop} onResult={noop} />);
+    const demo = renderToString(<TicketDetail issue={issue} snap={snap} onOpen={noop} onResult={noop} />);
+    expect(live).toContain('Run Activity');
+    expect(live).toContain('role="group" aria-label="Agents"');
+    expect(live).toContain('>Claude<');
+    expect(live).toContain('>Codex<');
+    expect(live).toContain('Connecting…');
+    expect(demo).not.toContain('Run Activity');
+  });
   it('fills prompt placeholders with project and ticket', async () => {
     const snap = await snapP;
     const p = snap.prompts.find((x) => x.id === 'resume')!;
