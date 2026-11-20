@@ -10,4 +10,13 @@ describe('normalizeReviewLoopLabel (PS-8 pilot)', () => {
     expect(normalizeReviewLoopLabel('     ')).toBe('');
     expect(normalizeReviewLoopLabel('')).toBe('');
   });
+
+  it('lowercases ASCII A-Z while preserving interior spaces', () => {
+    expect(normalizeReviewLoopLabel('  ReAdY  NOW  ')).toBe('ready  now');
+    expect(normalizeReviewLoopLabel('AZ az 09')).toBe('az az 09');
+  });
+
+  it('leaves non-ASCII letters unchanged', () => {
+    expect(normalizeReviewLoopLabel(' ÄÉ ')).toBe('ÄÉ');
+  });
 });
