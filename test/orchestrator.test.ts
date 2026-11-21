@@ -31,7 +31,7 @@ describe('Triage authorization', () => {
     expect(w.f.store.mutations).toEqual([]);
   });
   it('stops a prior run after a transient Triage hold even if the live status was restored', async () => {
-    const history: unknown[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
+    const history: { createdAt: string; [field: string]: unknown }[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
     const w = world({
       scenario: 'correct-first', linearOpts: { authorizerHistory: history },
       wrapAgents: (inner) => ({
@@ -48,7 +48,7 @@ describe('Triage authorization', () => {
     expect(w.prs.created).toHaveLength(0);
   });
   it('does not advance a reviewed run if the ticket briefly entered Triage during review', async () => {
-    const history: unknown[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
+    const history: { createdAt: string; [field: string]: unknown }[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
     const w = world({
       scenario: 'correct-first', linearOpts: { authorizerHistory: history },
       wrapAgents: (inner) => ({

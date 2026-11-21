@@ -90,7 +90,7 @@ const MILESTONES: Record<string, { id: string; name: string; description: string
 const MILESTONE_PROJECT: Record<string, string> = { m1: 'lp-ATL', m2: 'lp-ATL', b1: 'lp-BCN', z1: 'lp-ZED' };
 
 export interface FakeLinearOpts {
-  authorizerHistory?: unknown[];
+  authorizerHistory?: { createdAt: string; [field: string]: unknown }[];
   /** Make a named operation fail with a GraphQL error (used to test failure handling). */
   fail?: (op: string, vars: Record<string, any>) => boolean;
   /** Apply the mutation, then lose the response (a timeout after commit). Used to test ambiguous-outcome handling. */
@@ -206,7 +206,7 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
     }
     if (name === 'Authorizer') {
       const { spec } = find(String(v.id));
-      return ok({ issue: spec ? { history: { nodes: opts.authorizerHistory ?? ((spec.labels ?? []).includes('Ready') ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }] : []), pageInfo: { hasNextPage: false, endCursor: null } } } : null });
+      return ok({ issue: spec ? { history: { nodes: opts.authorizerHistory?.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt)) ?? ((spec.labels ?? []).includes('Ready') ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }] : []), pageInfo: { hasNextPage: false, endCursor: null } } } : null });
     }
     if (name === 'IssueDetail') {
       const { team, spec } = find(String(v.id));

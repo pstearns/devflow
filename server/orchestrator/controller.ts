@@ -74,7 +74,7 @@ export const isProtectedPath = (f: string) => {
 type Auth = ReturnType<Orchestrator['authorize']>;
 
 export class Orchestrator {
-  private runs = new Map<string, { agents: AgentRunner; pinned: Pinned; lastTriage: number }>();
+  private runs = new Map<string, { agents: AgentRunner; pinned: Pinned; approvalAt?: string }>();
   constructor(private d: Deps) {}
   private ag(m: Manifest) { return this.runs.get(m.runId)!.agents; }
   /** Re-verifies the trusted policy NOW. Called inside every privileged closure, including each retry, so a long backoff cannot outlive the owner's authorization. */
@@ -135,7 +135,7 @@ export class Orchestrator {
       const auth = this.authorize(ctx);
       if (auth.projectId !== preAuth.projectId) throw new Rejected('the ticket moved to a different project while the run was being accepted');
       const oc = auth.oc;
-      const { approval: who, lastTriage } = await this.authorizer(ticket, auth.readyLabel);
+      const { approval: who } = await this.authorizer(ticket, auth.readyLabel);
       // Fail closed: if the owner's policy cannot be verified (wrong owner/mode, inside an agent-reachable tree, binary swapped...), nothing starts.
       const agents = this.d.agents(oc, auth.projectId);
       try { pinned = this.d.policy(oc, auth.projectId).pin(); } catch (e) { throw new Rejected(`Trusted policy could not be verified (fail closed): ${e instanceof Error ? e.message : 'unknown'}`); }
@@ -152,13 +152,13 @@ export class Orchestrator {
         originalStateId: ctx.state.id, createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
       };
       m.clone = join(store.runDir(m), 'clone');
-      this.runs.set(runId, { agents, pinned, lastTriage });
+      this.runs.set(runId, { agents, pinned, approvalAt: who.at });
       const protectedBase = await this.d.prs.baseProtected?.(oc.repo, oc.baseBranch).catch(() => undefined);
       this.save(store, m, 'accepted', { baseSha, preflight: pf.detail, baseBranchProtected: protectedBase ?? 'unknown', policyDigest: pinned.digest, authorizedBy: who.who ?? 'unknown' });
       // Leaving the unstarted state is what makes a second dispatch (by any controller) fail acceptance.
       await this.infra(store, m, 'linear-start', async () => {
         const freshHistory = await this.authorizer(ticket, auth.readyLabel);
-        if (freshHistory.lastTriage !== lastTriage || freshHistory.approval.at !== who.at || freshHistory.approval.who !== who.who) throw new Rejected('Ready approval changed before the run started');
+        if (freshHistory.approval.at !== who.at || freshHistory.approval.who !== who.who) throw new Rejected('Ready approval changed before the run started');
         const fresh = this.authorize(await this.load(ticket));
         if (fresh.projectId !== auth.projectId) throw new Rejected('the ticket moved to a different project before the run started');
         this.verifyPin(m!);
@@ -202,9 +202,9 @@ export class Orchestrator {
     const project = this.d.cfg.projects.find((item) => item.id === m.project);
     const baseline = this.runs.get(m.runId);
     if (!project || !baseline) throw new TicketChanged(`${m.ticket}: Triage approval baseline is unavailable`);
-    const { lastTriage } = await readReadyHistory(this.d.read, m.ticket, project.workflow.readyLabel);
+    const history = await readReadyHistory(this.d.read, m.ticket, project.workflow.readyLabel);
     const live = await this.load(m.ticket);
-    if (lastTriage !== baseline.lastTriage || isTriageState(live.state)) {
+    if (history.stale || history.approval.at !== baseline.approvalAt || isTriageState(live.state)) {
       throw new TicketChanged(`${m.ticket} changed Triage history during the run`);
     }
     return live;
@@ -475,11 +475,19 @@ export class Orchestrator {
     this.state(store, m, 'escalated', { reason, class: cls });
     let leftAlone: string | undefined;
     try {
-      const live = await this.load(m.ticket);
-      const changed = cls === 'ticket-changed' ? 'the ticket changed during the run' : isResolvedType(live.state.type) ? 'the ticket was already closed' : this.liveProblem(live, m);
+      const live = cls === 'ticket-changed' ? undefined : await this.checkTriage(m);
+      const changed = !live ? 'the ticket changed during the run' : isResolvedType(live.state.type) ? 'the ticket was already closed' : this.liveProblem(live, m);
       if (changed) { m.blockedConfirmed = undefined; leftAlone = changed; store.event(m, this.at(), 'escalation-state-skipped', { why: changed }); } // the owner's change stands: DevFlow writes no state
       else { await this.d.write.setState(m.issueId, m.linearStates.blockedId); m.blockedConfirmed = (await this.load(m.ticket)).state.id === m.linearStates.blockedId; }
-    } catch (e) { m.blockedConfirmed = false; store.event(m, this.at(), 'blocked-transition-failed', { error: e instanceof Error ? e.message : 'unknown' }); }
+    } catch (e) {
+      if (e instanceof TicketChanged) {
+        leftAlone = e.message;
+        store.event(m, this.at(), 'escalation-state-skipped', { why: leftAlone });
+      } else {
+        m.blockedConfirmed = false;
+        store.event(m, this.at(), 'blocked-transition-failed', { error: e instanceof Error ? e.message : 'unknown' });
+      }
+    }
     try {
       await this.comment(store, m, m.attempts[m.attempts.length - 1], A.final(m, this.at(), { kind: 'escalated', summary: reason, reason: publicReason ?? reason, cls, evidenceRef: m.escalationEvidence, blockedConfirmed: m.blockedConfirmed, leftAlone }), true);
     } catch (e) { store.event(m, this.at(), 'escalation-comment-failed', { error: e instanceof Error ? e.message : 'unknown' }); }

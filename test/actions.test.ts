@@ -225,6 +225,13 @@ describe('workflow status changes', () => {
     await actions.approve('ATL-7', 'ATL-7');
     expect(f.store.mutations.map(({ op }) => op)).toEqual(['IssueRemoveLabel', 'IssueUpdate', 'IssueAddLabel']);
   });
+  it('confirms fresh Ready when its mutation succeeds before the response is lost', async () => {
+    const { actions, spec } = await setup({ lostResponse: (op) => op === 'IssueAddLabel' });
+    await actions.status('ATL-7', 'st-ATL-triage');
+    expect((await actions.approve('ATL-7', 'ATL-7')).ok).toBe(true);
+    expect(spec('ATL-7').labels).toContain('Ready');
+    expect(spec('ATL-7').state).toBe('Todo');
+  });
   it('Done works with or without a merged PR (non-code tickets have none)', async () => {
     const { actions, spec } = await setup();
     expect((await actions.status('ATL-16', 'st-ATL-done')).ok).toBe(true); // a documentation ticket: no PR at all
