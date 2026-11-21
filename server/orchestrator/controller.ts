@@ -74,7 +74,7 @@ export const isProtectedPath = (f: string) => {
 type Auth = ReturnType<Orchestrator['authorize']>;
 
 export class Orchestrator {
-  private runs = new Map<string, { agents: AgentRunner; pinned: Pinned }>();
+  private runs = new Map<string, { agents: AgentRunner; pinned: Pinned; lastTriage: number }>();
   constructor(private d: Deps) {}
   private ag(m: Manifest) { return this.runs.get(m.runId)!.agents; }
   /** Re-verifies the trusted policy NOW. Called inside every privileged closure, including each retry, so a long backoff cannot outlive the owner's authorization. */
@@ -110,12 +110,12 @@ export class Orchestrator {
     return { oc, started, approval, blocked, projectId: sc.configProject.id, scopeText: `team ${ctx.teamKey}${ctx.project ? ` / project "${ctx.project.name}"` : ''}, workflow readiness label "${sc.workflow.readyLabel}"`, readyLabel: sc.workflow.readyLabel };
   }
 
-  private async authorizer(ticket: string, readyLabel: string): Promise<{ who?: string; at?: string }> {
+  private async authorizer(ticket: string, readyLabel: string) {
     let history: Awaited<ReturnType<typeof readReadyHistory>>;
     try { history = await readReadyHistory(this.d.read, ticket, readyLabel); }
     catch { throw new Rejected(`${ticket}: Linear approval history could not be verified`); }
     if (history.stale) throw new Rejected(`${ticket}: fresh Ready approval is required after Triage`);
-    return history.approval;
+    return history;
   }
 
   async run(identifierRaw: string): Promise<Manifest> {
@@ -135,7 +135,7 @@ export class Orchestrator {
       const auth = this.authorize(ctx);
       if (auth.projectId !== preAuth.projectId) throw new Rejected('the ticket moved to a different project while the run was being accepted');
       const oc = auth.oc;
-      const who = await this.authorizer(ticket, auth.readyLabel);
+      const { approval: who, lastTriage } = await this.authorizer(ticket, auth.readyLabel);
       // Fail closed: if the owner's policy cannot be verified (wrong owner/mode, inside an agent-reachable tree, binary swapped...), nothing starts.
       const agents = this.d.agents(oc, auth.projectId);
       try { pinned = this.d.policy(oc, auth.projectId).pin(); } catch (e) { throw new Rejected(`Trusted policy could not be verified (fail closed): ${e instanceof Error ? e.message : 'unknown'}`); }
@@ -152,13 +152,13 @@ export class Orchestrator {
         originalStateId: ctx.state.id, createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
       };
       m.clone = join(store.runDir(m), 'clone');
-      this.runs.set(runId, { agents, pinned });
+      this.runs.set(runId, { agents, pinned, lastTriage });
       const protectedBase = await this.d.prs.baseProtected?.(oc.repo, oc.baseBranch).catch(() => undefined);
       this.save(store, m, 'accepted', { baseSha, preflight: pf.detail, baseBranchProtected: protectedBase ?? 'unknown', policyDigest: pinned.digest, authorizedBy: who.who ?? 'unknown' });
       // Leaving the unstarted state is what makes a second dispatch (by any controller) fail acceptance.
       await this.infra(store, m, 'linear-start', async () => {
-        const approval = await this.authorizer(ticket, auth.readyLabel);
-        if (approval.at !== who.at || approval.who !== who.who) throw new Rejected('Ready approval changed before the run started');
+        const freshHistory = await this.authorizer(ticket, auth.readyLabel);
+        if (freshHistory.lastTriage !== lastTriage || freshHistory.approval.at !== who.at || freshHistory.approval.who !== who.who) throw new Rejected('Ready approval changed before the run started');
         const fresh = this.authorize(await this.load(ticket));
         if (fresh.projectId !== auth.projectId) throw new Rejected('the ticket moved to a different project before the run started');
         this.verifyPin(m!);
@@ -198,13 +198,16 @@ export class Orchestrator {
     m.infra.push({ at: this.at(), step, detail }); this.save(store, m, 'infra-failure', { step, detail });
   }
 
-  private async checkTriage(m: Manifest): Promise<void> {
+  private async checkTriage(m: Manifest): Promise<Ctx> {
     const project = this.d.cfg.projects.find((item) => item.id === m.project);
-    if (!project) throw new TicketChanged(`${m.ticket}: authorized project is no longer configured`);
+    const baseline = this.runs.get(m.runId);
+    if (!project || !baseline) throw new TicketChanged(`${m.ticket}: Triage approval baseline is unavailable`);
     const { lastTriage } = await readReadyHistory(this.d.read, m.ticket, project.workflow.readyLabel);
-    if (lastTriage >= Date.parse(m.createdAt) || isTriageState((await this.load(m.ticket)).state)) {
-      throw new TicketChanged(`${m.ticket} was moved to Triage during the run`);
+    const live = await this.load(m.ticket);
+    if (lastTriage !== baseline.lastTriage || isTriageState(live.state)) {
+      throw new TicketChanged(`${m.ticket} changed Triage history during the run`);
     }
+    return live;
   }
 
   // ---------------------------------------------------------------- the loop (n counts REPAIR attempts only)
@@ -276,6 +279,7 @@ export class Orchestrator {
       const outcome = await this.review(store, m, a, ctx, oc, sha);
       if ('fail' in outcome) return this.escalate(store, m, outcome.cls, outcome.fail);
       const review = outcome.review;
+      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
 
       // 6. The reviewer's verdict is a CLAIM. The controller's own gate decides whether it may be published or advance anything.
       this.state(store, m, 'publishing', { attempt: n, sha });
@@ -436,6 +440,8 @@ export class Orchestrator {
         if (prBad) throw new GateChanged(prBad);
         const ci = await this.d.ci.snapshot(m.repo, sha, { required: auth.oc.ciChecks, actionsWorkflow: auth.oc.ciActionsWorkflow, branch: m.branch }); // check results are not immutable: re-read them on every approval attempt
         if (ci.state !== 'success') throw new GateChanged(`CI is no longer green on ${sha.slice(0, 12)}: ${ci.detail}`);
+        const afterCi = this.liveProblem(await this.checkTriage(m), m);
+        if (afterCi) throw new TicketChanged(afterCi);
         this.verifyPin(m); // after ALL the awaited reads, immediately before the privileged write
         await this.d.write.setState(m.issueId, auth.approval.id);
       });

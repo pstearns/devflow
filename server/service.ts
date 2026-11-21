@@ -25,6 +25,7 @@ export class SnapshotService {
   private backoff = new Map<string, number>(); // credential ('linear' | 'github') -> epoch ms until which we make no calls
   private health: SourceHealth[] = [];
   private last?: { snap: Snapshot; at: number };
+  private activityFeedCache?: { snapshot: Snapshot; expiresAt: number; entries: RunActivityFeedEntry[] };
   private inflight?: Promise<Snapshot>;
   private inflightSince?: number;
   private issueInflight = new Map<string, Promise<Snapshot>>();
@@ -103,13 +104,18 @@ export class SnapshotService {
   activityFeed(): RunActivityFeedEntry[] {
     const snapshot = this.peek();
     if (this.mode !== 'live' || !snapshot) return [];
-    return runActivityFeed(this.cfg.projects.flatMap((project) => {
+    const now = this.clock();
+    const cached = this.activityFeedCache;
+    if (cached?.snapshot === snapshot && now < cached.expiresAt) return cached.entries;
+    const entries = runActivityFeed(this.cfg.projects.flatMap((project) => {
       const orchestration = project.orchestration;
       if (!orchestration) return [];
       const issues = new Map(snapshot.issues.filter((issue) => issue.configProjectId === project.id
         && issue.state.type !== 'completed' && issue.state.type !== 'canceled').map((issue) => [issue.identifier, issue.id]));
       return issues.size ? [{ runsDir: orchestration.runsDir, project: project.id, repo: orchestration.repo, issues }] : [];
     }));
+    this.activityFeedCache = { snapshot, expiresAt: now + 2_000, entries };
+    return entries;
   }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {

@@ -38,7 +38,7 @@ describe('Triage authorization', () => {
         preflight: () => inner.preflight(), review: (o) => inner.review(o),
         implement: async (o) => {
           const result = await inner.implement(o);
-          history.push({ createdAt: new Date(Date.now() + 1000).toISOString(), toState: { name: 'Triage', type: 'triage' } });
+          history.push({ createdAt: '2026-06-01T09:00:00Z', toState: { name: 'Triage', type: 'triage' } });
           return result;
         },
       }),
@@ -46,6 +46,24 @@ describe('Triage authorization', () => {
     const result = await w.orch.run('ATL-22');
     expect(result.reasonClass).toBe('ticket-changed');
     expect(w.prs.created).toHaveLength(0);
+  });
+  it('does not advance a reviewed run if the ticket briefly entered Triage during review', async () => {
+    const history: unknown[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
+    const w = world({
+      scenario: 'correct-first', linearOpts: { authorizerHistory: history },
+      wrapAgents: (inner) => ({
+        preflight: () => inner.preflight(), implement: (o) => inner.implement(o),
+        review: async (o) => {
+          const result = await inner.review(o);
+          history.push({ createdAt: '2026-06-01T09:00:00Z', toState: { name: 'Triage', type: 'triage' } });
+          return result;
+        },
+      }),
+    });
+    const result = await w.orch.run('ATL-22');
+    expect(result.reasonClass).toBe('ticket-changed');
+    expect(result.approvedSha).toBeUndefined();
+    expect(stateOf(w)).toBe('In Progress');
   });
   it('uses the approval recorded after Triage', async () => {
     const w = world({ scenario: 'correct-first', linearOpts: { authorizerHistory: [
