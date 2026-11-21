@@ -112,6 +112,7 @@ export interface FakeLinearStore { issues: Record<string, IssueSpec[]>; mutation
 
 export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
   const store: FakeLinearStore = { issues: structuredClone(SEED), mutations: [], comments: [], viewer: 'Demo Owner' };
+  const readyHistory = new Map<string, boolean>();
   const extras: LabelSpec[] = Array.from({ length: opts.extraLabels ?? 0 }, (_, k) => ({ id: `lbl-extra-${k + 1}`, name: `Extra label ${k + 1}`, color: '#8b97a7' }));
   const teamLabels = (team: string): LabelSpec[] => [...(TEAM_LABELS[team] ?? []), ...extras, ...WORKSPACE];
   const stateId = (team: string, name: string) => `st-${team}-${name.toLowerCase().replace(/\W+/g, '-')}`;
@@ -205,8 +206,15 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
       return ok({ project: { projectMilestones: { nodes: (MILESTONES[team] ?? []).filter((m) => MILESTONE_PROJECT[m.id] === pid).map((m) => ({ id: m.id, name: m.name, description: m.description, targetDate: day(m.off, nowMs) })), pageInfo: { hasNextPage: false, endCursor: null } } } });
     }
     if (name === 'Authorizer') {
-      const { team, spec } = find(String(v.id));
-      return ok({ issue: spec ? { history: { nodes: opts.authorizerHistory?.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt)) ?? ((SEED[team]?.find((seed) => seed.n === spec.n)?.labels ?? []).includes('Ready') ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }] : []), pageInfo: { hasNextPage: false, endCursor: null } } } : null });
+      const identifier = String(v.id);
+      const { spec } = find(identifier);
+      if (!spec) return ok({ issue: null });
+      if (!readyHistory.has(identifier)) readyHistory.set(identifier, (spec.labels ?? []).includes('Ready'));
+      const seededApproval = readyHistory.get(identifier)
+        ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }]
+        : [];
+      const history = opts.authorizerHistory?.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt)) ?? seededApproval;
+      return ok({ issue: { history: { nodes: history, pageInfo: { hasNextPage: false, endCursor: null } } } });
     }
     if (name === 'IssueDetail') {
       const { team, spec } = find(String(v.id));
