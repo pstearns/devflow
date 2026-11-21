@@ -120,11 +120,11 @@ export function RunActivityFeed({ onOpen }: { onOpen: (id: string) => void }) {
     };
   }, []);
   const connectionLabel = { connecting: 'Connecting…', live: 'Live', reconnecting: 'Reconnecting…', unavailable: 'Unavailable' }[connection];
-  const runs = activity?.toSorted((a, b) => Number(!!b.activeAgent) - Number(!!a.activeAgent));
+  const runs = [...(activity ?? [])].sort((a, b) => Number(!!b.activeAgent) - Number(!!a.activeAgent));
   return (
     <Card title="Run Activity" right={<span role="status"><Tag tone={connection === 'live' ? 'ok' : 'muted'}>{connectionLabel}</Tag></span>}>
       <div className="space-y-3 p-2">
-        {runs?.map((run) => (
+        {runs.map((run) => (
           <section key={run.identifier} className="rounded border border-line bg-raised p-2" aria-label={run.identifier}>
             <div className="flex flex-wrap items-center justify-between gap-1">
               <button type="button" onClick={() => onOpen(run.identifier)} className="mono font-semibold text-accent hover:underline">{run.identifier}</button>
@@ -132,13 +132,13 @@ export function RunActivityFeed({ onOpen }: { onOpen: (id: string) => void }) {
             </div>
             {connection === 'live' && run.activeAgent && <p className="text-[11px] text-accent">Last recorded agent: {ACTORS[run.activeAgent]}</p>}
             <ol aria-label={`${run.identifier} handoffs`} className="mt-1 space-y-1">
-              {run.events.toReversed().map((event) => (
+              {[...run.events].reverse().map((event) => (
                 <li key={event.id} className="border-t border-line pt-1"><EventLine event={event} /></li>
               ))}
             </ol>
           </section>
         ))}
-        {connection === 'live' && !runs?.length && <p className="text-muted">No unfinished runs.</p>}
+        {connection === 'live' && !runs.length && <p className="text-muted">No unfinished runs.</p>}
       </div>
     </Card>
   );

@@ -20,10 +20,11 @@ function describe(row: Record<string, unknown>, run: Manifest): Details | undefi
     ? run.attempts?.find((item) => item.n === row.attempt) : undefined;
   const commit = typeof row.sha === 'string' ? row.sha : attempt?.headSha;
   const sha = typeof commit === 'string' && SHA.test(commit) ? commit.slice(0, 12) : undefined;
-  const revision = [attempt && (attempt.n === 0 ? 'Initial attempt' : `Repair ${attempt.n}`), sha].filter(Boolean).join(' · ') || undefined;
+  const attemptLabel = attempt && (attempt.n === 0 ? 'Initial attempt' : `Repair ${attempt.n}`);
+  const revision = [attemptLabel, sha].filter(Boolean).join(' · ') || undefined;
   switch (row.what) {
     case 'start-confirmed': return { actor: 'devflow', title: 'Run started' };
-    case 'state:implementing': return { actor: 'claude', title: 'Preparing Claude implementation', detail: revision };
+    case 'state:implementing': return { actor: 'claude', title: 'Preparing Claude implementation', detail: attemptLabel };
     case 'state:verifying-commit': return { actor: 'claude', title: 'Claude returned its changes', detail: revision };
     case 'pr-created': return { actor: 'devflow', title: 'Draft pull request opened', detail: typeof row.number === 'number' && Number.isSafeInteger(row.number) && row.number > 0 ? `PR #${row.number}` : undefined };
     case 'state:ci': return { actor: 'ci', title: 'Commit submitted to CI', detail: revision };
@@ -40,7 +41,7 @@ function describe(row: Record<string, unknown>, run: Manifest): Details | undefi
         return { actor: 'codex', title: 'Codex sent findings to DevFlow', detail: [typeof count === 'number' && Number.isInteger(count) && count > 0 && count <= 100 ? `${count} finding${count === 1 ? '' : 's'}` : undefined, revision].filter(Boolean).join(' · ') || undefined };
       }
       return;
-    case 'state:repairing': return { actor: 'claude', title: 'Preparing Claude repair', detail: revision };
+    case 'state:repairing': return { actor: 'claude', title: 'Preparing Claude repair', detail: attemptLabel };
     case 'state:awaiting-owner': return { actor: 'devflow', title: 'Awaiting owner approval', detail: sha };
     case 'state:escalated': return { actor: 'devflow', title: 'Run escalated to the owner' };
     default: return;

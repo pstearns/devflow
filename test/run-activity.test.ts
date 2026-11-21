@@ -21,13 +21,13 @@ describe('run activity', () => {
       mkdirSync(dir);
       writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
         ticket: 'PS-8', issueId: 'issue-8', project: 'pilot', repo: 'owner/repo', runId: 'abc123',
-        createdAt: at, state: 'repairing', attempts: [{ n: 0, review: { findings: 1 } }],
+        createdAt: at, state: 'repairing', attempts: [{ n: 0, review: { findings: 1 } }, { n: 1, headSha: 'b'.repeat(40) }],
       }));
       writeFileSync(join(dir, 'events.jsonl'), [
         { at, what: 'state:reviewing', sha: 'a'.repeat(40) },
         { at, what: 'review-validated', verdict: 'FAIL', attempt: 0, detail: 'private agent output' },
         { at, what: 'infra-failure', detail: 'private diagnostic' },
-        { at, what: 'state:repairing' },
+        { at, what: 'state:repairing', attempt: 1 },
       ].map((row) => JSON.stringify(row)).join('\n') + '\n' + JSON.stringify({ at, what: 'state:awaiting-owner' }));
       const issue = { identifier: 'PS-8', id: 'issue-8' };
       const activity = runActivity(root, issue, 'pilot', 'owner/repo');
@@ -35,7 +35,7 @@ describe('run activity', () => {
       expect(activity.events.map((e) => [e.actor, e.title, e.detail])).toEqual([
         ['codex', 'Preparing Codex review', 'aaaaaaaaaaaa'],
         ['codex', 'Codex sent findings to DevFlow', '1 finding · Initial attempt'],
-        ['claude', 'Preparing Claude repair', undefined],
+        ['claude', 'Preparing Claude repair', 'Repair 1'],
       ]);
       expect(runActivity(root, issue, 'other', 'owner/repo').runId).toBeNull();
       expect(runActivity(root, { ...issue, id: 'other' }, 'pilot', 'owner/repo').runId).toBeNull();
