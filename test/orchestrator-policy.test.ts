@@ -599,8 +599,8 @@ describe('agent output cannot escalate, forge audit history, or redirect executi
     expect(await G.lineCount(w.repo, sha, 'README.md')).toBeGreaterThan(0);
     for (const f of ['../README.md', '/etc/passwd', '-README.md', ':(top)README.md', 'README.md\0x', '', 'nope.txt', '.git/config', 'test/..//README.md'])
       expect(await G.lineCount(w.repo, sha, f), JSON.stringify(f)).toBeUndefined();
-    const ctx = { sha, nonce: 'n', changedFiles: ['README.md'], lineCount: () => undefined };
-    expect(() => validateReview({ verdict: 'FAIL', commit: sha, nonce: 'n', summary: 's', reviewed_files: [], findings: [{ id: '1', severity: 'blocker', file: '../../etc/passwd', line: 1, title: 't', detail: 'd', evidence: 'e' }] }, ctx)).toThrow(ReviewInvalid);
+    const ctx = { sha, nonce: 'n', ticketContract: '', changedFiles: ['README.md'], lineCount: () => undefined };
+    expect(() => validateReview({ verdict: 'FAIL', commit: sha, nonce: 'n', summary: 's', reviewed_files: [], findings: [{ id: '1', classification: 'blocking-defect', requirement_source: 'existing', requirement: 'Reviewer isolation', impact: 'Path escapes the tree', correction: 'Keep paths in tree', severity: 'blocker', file: '../../etc/passwd', line: 1, title: 't', detail: 'd', evidence: 'e' }] }, ctx)).toThrow(ReviewInvalid);
   });
   it('a review claiming PASS cannot advance anything unless the controller’s own gate agrees (CI not green => no PASS accepted)', async () => {
     // Force the controller’s CI record to disagree with an honest, valid PASS: the gate must refuse and escalate, never transition.

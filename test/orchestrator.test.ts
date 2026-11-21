@@ -106,6 +106,27 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
     expect(events).toContain('state:awaiting-owner');
   });
 
+  it('retains a passing suggestion and proceeds to owner disposition without repair', async () => {
+    const w = world({ scenario: 'review-suggestions' });
+    const m = await w.orch.run('ATL-22');
+    expect(m).toMatchObject({ outcome: 'PASS', state: 'awaiting-owner' });
+    expect(m.attempts).toHaveLength(1);
+    expect(w.comments().join('\n')).toContain('PASS WITH SUGGESTIONS');
+    const evidence = JSON.parse(readFileSync(join(runDir(w, 'ATL-22'), 'attempt-0/review.json'), 'utf8'));
+    expect(evidence.findings).toMatchObject([{ classification: 'future-suggestion' }]);
+  });
+
+  it('passes blocking findings to repair and retains suggestions outside the coding prompt', async () => {
+    const w = world({ scenario: 'defect-with-suggestion' });
+    const m = await w.orch.run('ATL-22');
+    expect(m.outcome).toBe('PASS');
+    expect(m.attempts).toHaveLength(2);
+    const prompt = readFileSync(join(runDir(w, 'ATL-22'), 'attempt-1/claude-prompt.txt'), 'utf8');
+    expect(prompt).toContain('Trim separators from the output.');
+    expect(prompt).not.toContain('Optional transliteration');
+    expect(w.comments().join('\n')).toContain('Optional transliteration');
+  });
+
   it('a correct first attempt needs no repair', async () => {
     const w = world({ scenario: 'correct-first' });
     const m = await w.orch.run('ATL-22');
@@ -410,14 +431,33 @@ describe('hardening: draft PR, retries, infrastructure vs repair, Blocked state'
 
 describe('review validation (unit)', () => {
   const sha = 'a'.repeat(40), nonce = 'n0nce';
-  const ctx = { sha, nonce, changedFiles: ['a.ts', 'b.ts'], lineCount: (f: string) => (f === 'a.ts' || f === 'b.ts' ? 10 : undefined) };
+  const ctx = { sha, nonce, ticketContract: 'Unauthenticated requests receive 401.', changedFiles: ['a.ts', 'b.ts'], lineCount: (f: string) => (f === 'a.ts' || f === 'b.ts' ? 10 : undefined) };
   const ok = { verdict: 'PASS', commit: sha, nonce, summary: 's', reviewed_files: ['a.ts', 'b.ts'], findings: [] };
-  const fail = { verdict: 'FAIL', commit: sha, nonce, summary: 's', reviewed_files: ['a.ts'], findings: [{ id: '1', severity: 'major', file: 'a.ts', line: 3, title: 't', detail: 'd', evidence: 'e' }] };
+  const fail = { verdict: 'FAIL', commit: sha, nonce, summary: 's', reviewed_files: ['a.ts'], findings: [{ id: '1', classification: 'blocking-defect', severity: 'major', file: 'a.ts', line: 3,
+    title: 'Access check skipped', detail: 'The protected handler runs for an unauthenticated request.',
+    evidence: 'Fixture expects 401 but receives 200.', requirement_source: 'ticket',
+    requirement: ctx.ticketContract, impact: 'The approved 401 check fails.', correction: 'Restore the existing access check.' }] };
+  const suggestion = { ...fail.findings[0], classification: 'future-suggestion', title: 'Optional audit metric',
+    requirement_source: null, requirement: null, impact: null, correction: null };
+  it('accepts a passing review with future suggestions regardless of their severity label', () => {
+    expect(validateReview({ ...ok, findings: [suggestion] }, ctx)).toMatchObject({ verdict: 'PASS', findings: [{ classification: 'future-suggestion' }] });
+  });
+  it('accepts a material security bypass with concrete evidence even when the ticket omitted it', () => {
+    const finding = { ...fail.findings[0], classification: 'critical-unspecified-defect', requirement_source: null, requirement: null };
+    expect(validateReview({ ...fail, findings: [finding] }, ctx).verdict).toBe('FAIL');
+  });
+  it('accepts a cited established invariant', () => {
+    const finding = { ...fail.findings[0], requirement_source: 'existing', requirement: 'Existing access rules for protected handlers' };
+    expect(validateReview({ ...fail, findings: [finding] }, ctx).verdict).toBe('FAIL');
+  });
   it('accepts honest PASS and FAIL', () => { expect(validateReview(ok, ctx).verdict).toBe('PASS'); expect(validateReview(fail, ctx).findings).toHaveLength(1); });
   it.each([
     ['unknown field', { ...ok, extra: 1 }], ['lowercase verdict', { ...ok, verdict: 'pass' }], ['short sha', { ...ok, commit: 'abc123' }],
     ['other sha', { ...ok, commit: 'b'.repeat(40) }], ['bad nonce', { ...ok, nonce: 'x' }], ['PASS missing a file', { ...ok, reviewed_files: ['a.ts'] }],
-    ['PASS with major finding', { ...ok, findings: fail.findings }], ['FAIL without blocking finding', { ...fail, findings: [{ ...fail.findings[0], severity: 'minor' }] }],
+    ['PASS with major finding', { ...ok, findings: fail.findings }], ['FAIL without blocking finding', { ...fail, findings: [suggestion] }],
+    ['reviewer-added ticket requirement', { ...fail, findings: [{ ...fail.findings[0], requirement: 'Add a new audit metric.' }] }],
+    ['missing acceptance impact', { ...fail, findings: [{ ...fail.findings[0], impact: '' }] }],
+    ['missing minimum correction', { ...fail, findings: [{ ...fail.findings[0], correction: '' }] }],
     ['finding in file not in commit', { ...fail, findings: [{ ...fail.findings[0], file: 'ghost.ts' }] }], ['line outside file', { ...fail, findings: [{ ...fail.findings[0], line: 999 }] }],
     ['blocking finding without evidence', { ...fail, findings: [{ ...fail.findings[0], evidence: '' }] }], ['duplicate ids', { ...fail, findings: [fail.findings[0], fail.findings[0]] }],
   ])('rejects %s', (_n, raw) => { expect(() => validateReview(raw, ctx)).toThrow(ReviewInvalid); });

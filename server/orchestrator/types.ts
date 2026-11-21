@@ -10,7 +10,12 @@ export const MAX_REPAIRS = 3;
 export const repairLimit = (m: { maxRepairs?: number }) => m.maxRepairs ?? MAX_REPAIRS;
 
 export type Severity = 'blocker' | 'major' | 'minor' | 'note';
-export interface Finding { id: string; severity: Severity; file: string; line?: number; title: string; detail: string; evidence: string }
+export type FindingClassification = 'blocking-defect' | 'critical-unspecified-defect' | 'future-suggestion';
+export interface Finding {
+  id: string; classification: FindingClassification; severity: Severity; file: string; line?: number;
+  title: string; detail: string; evidence: string;
+  requirementSource?: 'ticket' | 'existing'; requirement?: string; impact?: string; correction?: string;
+}
 export interface Review { verdict: 'PASS' | 'FAIL'; commit: string; nonce: string; summary: string; reviewedFiles: string[]; findings: Finding[] }
 
 export interface AttemptRecord {

@@ -24,7 +24,7 @@ const test = (expect) => `import { test } from 'node:test'; import assert from '
 
 mkdirSync('src', { recursive: true }); mkdirSync('test', { recursive: true });
 if (!repair) {
-  writeFileSync('src/slugify.mjs', scenario === 'correct-first' || scenario === 'symlink-clone' || scenario === 'symlink-out' || scenario.startsWith('infra') || scenario.startsWith('invalid') || scenario.startsWith('pr-') ? FIXED : BUGGY);
+  writeFileSync('src/slugify.mjs', scenario === 'correct-first' || scenario === 'review-suggestions' || scenario === 'symlink-clone' || scenario === 'symlink-out' || scenario.startsWith('infra') || scenario.startsWith('invalid') || scenario.startsWith('pr-') ? FIXED : BUGGY);
   writeFileSync('test/slugify.test.mjs', test(scenario === 'red-ci' ? 'WRONG' : 'hello-world'));
   if (scenario === 'touch-ci' || scenario === 'touch-ci-always') { mkdirSync('.github/workflows', { recursive: true }); writeFileSync('.github/workflows/ci.yml', 'name: ci\non: push\njobs: {}\n'); }
 } else if (scenario === 'never-fixes' || scenario === 'touch-ci-always') {

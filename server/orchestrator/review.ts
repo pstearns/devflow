@@ -5,22 +5,29 @@ import { isObj } from '../util.ts';
 
 export class ReviewInvalid extends Error {}
 
+const CLASSIFICATIONS = ['blocking-defect', 'critical-unspecified-defect', 'future-suggestion'] as const;
+const REQUIREMENT_SOURCES = ['ticket', 'existing'] as const;
+const FINDING_KEYS = ['id', 'classification', 'severity', 'file', 'line', 'title', 'detail', 'evidence', 'requirement_source', 'requirement', 'impact', 'correction'];
+
 export const REVIEW_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['verdict', 'commit', 'nonce', 'summary', 'reviewed_files', 'findings'],
   properties: {
     verdict: { enum: ['PASS', 'FAIL'] }, commit: { type: 'string' }, nonce: { type: 'string' }, summary: { type: 'string' },
     reviewed_files: { type: 'array', items: { type: 'string' } },
-    findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['id', 'severity', 'file', 'line', 'title', 'detail', 'evidence'],
-      properties: { id: { type: 'string' }, severity: { enum: ['blocker', 'major', 'minor', 'note'] }, file: { type: 'string' }, line: { type: ['integer', 'null'] }, title: { type: 'string' }, detail: { type: 'string' }, evidence: { type: 'string' } } } },
+    findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: FINDING_KEYS,
+      properties: { id: { type: 'string' }, classification: { enum: CLASSIFICATIONS }, severity: { enum: ['blocker', 'major', 'minor', 'note'] }, file: { type: 'string' }, line: { type: ['integer', 'null'] }, title: { type: 'string' }, detail: { type: 'string' }, evidence: { type: 'string' },
+        requirement_source: { enum: [...REQUIREMENT_SOURCES, null] }, requirement: { type: ['string', 'null'] },
+        impact: { type: ['string', 'null'] }, correction: { type: ['string', 'null'] } } } },
   },
 };
 
 const SEVERITIES: Severity[] = ['blocker', 'major', 'minor', 'note'];
 const SHA_RE = /^[0-9a-f]{40}$/;
-const blocking = (f: Finding) => f.severity === 'blocker' || f.severity === 'major';
+export const isBlockingFinding = (f: Finding) => f.classification !== 'future-suggestion';
 
 export interface ReviewContext {
   sha: string; nonce: string;
+  ticketContract: string;
   changedFiles: string[]; // from the controller's own `git diff --name-only base..sha`
   /** Line count of a file in the reviewed tree, or undefined when the file is not in the commit. */
   lineCount: (file: string) => number | undefined;
@@ -59,7 +66,28 @@ export function validateReview(raw: unknown, ctx: ReviewContext): Review {
   const findings = raw.findings.map((f, n): Finding => {
     const at = `findings[${n}]`;
     if (!isObj(f)) throw new ReviewInvalid(`${at} must be an object`);
-    exact(f, ['id', 'severity', 'file', 'line', 'title', 'detail', 'evidence'], at);
+    exact(f, FINDING_KEYS, at);
+    const classification = CLASSIFICATIONS.find(value => value === f.classification);
+    if (!classification) throw new ReviewInvalid(`${at}.classification is invalid`);
+    const isBlocking = classification !== 'future-suggestion';
+    let requirementSource: Finding['requirementSource'];
+    let requirement: string | undefined;
+    if (classification === 'blocking-defect') {
+      requirementSource = REQUIREMENT_SOURCES.find(source => source === f.requirement_source);
+      if (!requirementSource) throw new ReviewInvalid(`${at} requires a controlling requirement source`);
+      requirement = text(f.requirement, `${at}.requirement`, 2000);
+      if (requirementSource === 'ticket' && !ctx.ticketContract.includes(requirement.trim())) {
+        throw new ReviewInvalid(`${at}.requirement must quote the frozen ticket contract`);
+      }
+    } else if (f.requirement_source !== null || f.requirement !== null) {
+      throw new ReviewInvalid(`${at} cannot assert a controlling requirement for this classification`);
+    }
+    if (!isBlocking && (f.impact !== null || f.correction !== null)) {
+      throw new ReviewInvalid(`${at} must leave blocking impact and correction empty for a future suggestion`);
+    }
+    if (classification === 'critical-unspecified-defect' && f.severity !== 'blocker' && f.severity !== 'major') {
+      throw new ReviewInvalid(`${at} must identify a material defect`);
+    }
     const id = text(f.id, `${at}.id`, 40);
     if (seen.has(id)) throw new ReviewInvalid(`${at}.id "${id}" is duplicated`);
     seen.add(id);
@@ -72,12 +100,15 @@ export function validateReview(raw: unknown, ctx: ReviewContext): Review {
       if (!Number.isInteger(f.line) || (f.line as number) < 1 || (f.line as number) > Math.max(1, lines)) throw new ReviewInvalid(`${at}.line is outside ${file}`);
       line = f.line as number;
     }
-    return { id, severity: f.severity as Severity, file, line, title: text(f.title, `${at}.title`, 300), detail: text(f.detail, `${at}.detail`, 3000), evidence: text(f.evidence, `${at}.evidence`, 3000, blocking({ severity: f.severity } as Finding)) };
+    return { id, classification, requirementSource, requirement,
+      impact: isBlocking ? text(f.impact, `${at}.impact`, 3000) : undefined,
+      correction: isBlocking ? text(f.correction, `${at}.correction`, 3000) : undefined,
+      severity: f.severity as Severity, file, line, title: text(f.title, `${at}.title`, 300), detail: text(f.detail, `${at}.detail`, 3000), evidence: text(f.evidence, `${at}.evidence`, 3000, isBlocking) };
   });
-  const hasBlocking = findings.some(blocking);
-  if (raw.verdict === 'FAIL' && !hasBlocking) throw new ReviewInvalid('FAIL requires at least one blocker or major finding with evidence');
+  const hasBlocking = findings.some(isBlockingFinding);
+  if (raw.verdict === 'FAIL' && !hasBlocking) throw new ReviewInvalid('FAIL requires at least one substantiated blocking finding');
   if (raw.verdict === 'PASS') {
-    if (hasBlocking) throw new ReviewInvalid('PASS cannot carry blocker or major findings');
+    if (hasBlocking) throw new ReviewInvalid('PASS cannot carry blocking findings');
     const reviewed = new Set(reviewedFiles);
     const missed = ctx.changedFiles.filter((f) => !reviewed.has(f));
     if (!ctx.changedFiles.length) throw new ReviewInvalid('the commit changes no files, so there is nothing a PASS could attest to');

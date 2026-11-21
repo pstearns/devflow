@@ -3,6 +3,7 @@
 // comments are the readable summary. Rules enforced here: only controller-derived facts are stated as fact; anything an agent wrote is
 // shown quoted and labelled as unverified; no filesystem paths of the host, environment, or credentials are ever included.
 import type { AttemptRecord, Finding, Manifest, Review } from './types.ts';
+import { isBlockingFinding } from './review.ts';
 import { repairLimit } from './types.ts';
 
 const TOTAL = 6;
@@ -99,18 +100,25 @@ export function ciVerified(m: Manifest, a: AttemptRecord, at: string, ci: { stat
 export interface GateCheck { name: string; ok: boolean; detail: string }
 export function reviewed(m: Manifest, a: AttemptRecord, at: string, r: Review, gate: GateCheck[], versions: { codex?: string }) {
   const pass = r.verdict === 'PASS';
-  const findings = r.findings.length
-    ? r.findings.map((f: Finding) => `- **${f.severity}** \`${line(f.file, 200)}${f.line ? `:${f.line}` : ''}\`\n${quote(`${f.title}\n${f.detail}\nEvidence: ${f.evidence}`, 900)}`).join('\n')
-    : '_No findings._';
+  const blockers = r.findings.filter(isBlockingFinding);
+  const suggestions = r.findings.filter(f => !isBlockingFinding(f));
+  const verdict = pass && suggestions.length ? 'PASS WITH SUGGESTIONS' : r.verdict;
+  const renderFinding = (f: Finding) => `- **${f.classification} / ${f.severity}** \`${line(f.file, 200)}${f.line ? `:${f.line}` : ''}\`\n${quote([f.title, f.detail,
+    f.evidence && `Evidence: ${f.evidence}`, f.requirement && `Requirement: ${f.requirement}`,
+    f.impact && `Impact: ${f.impact}`, f.correction && `Minimum correction: ${f.correction}`].filter(Boolean).join('\n'), 900)}`;
+  const findings = [
+    blockers.length && `**Blocking findings**\n${blockers.map(renderFinding).join('\n')}`,
+    suggestions.length && `**Nonblocking future suggestions**\n${suggestions.map(renderFinding).join('\n')}`,
+  ].filter(Boolean).join('\n\n') || '_No findings._';
   return frame(m, 4, undefined, at, {
-    what: `Independent review of ${commit(m, r.commit)}: **${r.verdict}** (${r.findings.length} finding${r.findings.length === 1 ? '' : 's'}; reviewer Codex ${line(versions.codex ?? '', 40)}; retries of malformed output: ${a.reviewRetries ?? 0}).`,
+    what: `Independent review of ${commit(m, r.commit)}: **${verdict}** (${r.findings.length} finding${r.findings.length === 1 ? '' : 's'}; reviewer Codex ${line(versions.codex ?? '', 40)}; retries of malformed output: ${a.reviewRetries ?? 0}).`,
     why: pass ? 'The reviewer attested every changed file, and the controller independently verified the result before accepting it (table below). The reviewer’s word alone advances nothing.' : 'The reviewer reported blocking findings with evidence; the controller validated the format, SHA and file references before relaying them.',
     evidence: [
       `Controller verification: ${gate.map((g) => `${g.ok ? '✅' : '❌'} ${line(g.name, 80)}`).join(' · ')}`,
       ...gate.filter((g) => !g.ok).map((g) => `Failed: ${line(g.name, 80)} — ${line(redact(g.detail), 200)}`),
       a.review ? `Retained: ${ev(m, a.review.parsed.split('#')[0]!)}, raw output ${ev(m, a.review.raw.split('#')[0]!)}` : '',
     ].filter(Boolean),
-    extra: `**Reviewer summary and findings (agent-authored, quoted, unverified prose):**\n${quote(r.summary, 900)}\n\n${findings}${pass ? '' : `\n\n${repairRequested(m, a.n, `${r.findings.length} review finding(s)`)}`}`,
+    extra: `**Reviewer summary and findings (agent-authored, quoted, unverified prose):**\n${quote(r.summary, 900)}\n\n${findings}${pass ? '' : `\n\n${repairRequested(m, a.n, `${blockers.length} blocking review finding(s)`)}`}`,
   });
 }
 
