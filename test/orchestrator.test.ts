@@ -65,6 +65,20 @@ describe('Triage authorization', () => {
     expect(result.approvedSha).toBeUndefined();
     expect(stateOf(w)).toBe('In Progress');
   });
+  it('leaves a live Triage hold in place if it arrives during the final CI read', async () => {
+    const w = world({ scenario: 'correct-first' });
+    const snapshot = w.ci.snapshot.bind(w.ci);
+    let reads = 0;
+    w.ci.snapshot = async (...args) => {
+      const result = await snapshot(...args);
+      if (++reads === 2) w.issue().state = 'Triage';
+      return result;
+    };
+    const result = await w.orch.run('ATL-22');
+    expect(result.reasonClass).toBe('ticket-changed');
+    expect(result.approvedSha).toBeUndefined();
+    expect(stateOf(w)).toBe('Triage');
+  });
   it('uses the approval recorded after Triage', async () => {
     const w = world({ scenario: 'correct-first', linearOpts: { authorizerHistory: [
       triage, { createdAt: '2026-06-01T10:00:00Z', actor: { name: 'Fresh Owner' }, addedLabels: [{ name: 'Ready' }] },

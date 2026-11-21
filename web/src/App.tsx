@@ -167,7 +167,7 @@ export function App() {
       <div className="flex min-h-0 flex-1 max-md:flex-col">
         {snap?.mode === 'live' && (route.view === 'overview' || route.view === 'pipeline') && (
           <aside className={`w-64 shrink-0 overflow-auto border-b border-line bg-bg p-2 max-md:max-h-64 max-md:w-full md:border-r ${panelOpen ? 'md:max-xl:hidden' : ''}`} aria-label="Live runs">
-            <RunActivityFeed onOpen={openTicket} />
+            <RunActivityFeed onOpen={openTicket} pauseOnTablet={panelOpen} />
           </aside>
         )}
         <main className="min-w-0 flex-1 overflow-auto p-4">

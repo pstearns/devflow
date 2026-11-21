@@ -77,13 +77,15 @@ function EventLine({ event }: { event: RunActivityEvent }) {
   );
 }
 
-export function RunActivityFeed({ onOpen }: { onOpen: (id: string) => void }) {
+export function RunActivityFeed({ onOpen, pauseOnTablet }: { onOpen: (id: string) => void; pauseOnTablet: boolean }) {
   const [activity, setActivity] = useState<RunActivityFeedEntry[]>();
   const [connection, setConnection] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
   useEffect(() => {
+    const tablet = window.matchMedia('(min-width: 48rem) and (max-width: 79.999rem)');
+    const visible = () => document.visibilityState === 'visible' && !(pauseOnTablet && tablet.matches);
     let pending: AbortController | undefined;
     const update = async () => {
-      if (document.visibilityState !== 'visible' || pending) return;
+      if (!visible() || pending) return;
       const request = new AbortController();
       pending = request;
       try {
@@ -107,18 +109,20 @@ export function RunActivityFeed({ onOpen }: { onOpen: (id: string) => void }) {
       }
     };
     const onVisibility = () => {
-      if (document.visibilityState === 'visible') void update();
+      if (visible()) void update();
       else { pending?.abort(); pending = undefined; }
     };
     const timer = setInterval(update, 2_000);
     document.addEventListener('visibilitychange', onVisibility);
+    tablet.addEventListener('change', onVisibility);
     void update();
     return () => {
       pending?.abort();
       clearInterval(timer);
+      tablet.removeEventListener('change', onVisibility);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, []);
+  }, [pauseOnTablet]);
   const connectionLabel = { connecting: 'Connecting…', live: 'Live', reconnecting: 'Reconnecting…', unavailable: 'Unavailable' }[connection];
   const runs = [...(activity ?? [])].sort((a, b) => Number(!!b.activeAgent) - Number(!!a.activeAgent));
   return (

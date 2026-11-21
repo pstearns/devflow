@@ -430,16 +430,18 @@ export class Orchestrator {
     try {
       // Revalidated inside EVERY approval attempt: a retry after backoff must not overwrite a state the owner changed in the meantime.
       await this.infra(store, m, 'linear-approval', async () => {
-        const live = await this.checkTriage(m);
-        const bad = this.liveProblem(live, m) ?? (live.state.id !== auth.started.id ? `the ticket is in "${live.state.name}", not the in-progress state DevFlow put it in` : undefined);
-        if (bad) throw new TicketChanged(bad);
         // the review gate is re-run on every attempt, immediately before the transition: a retry must not ride a stale gate
         const remote = await this.remoteHead(m);
         if (remote !== sha) throw new GateChanged(`the remote branch moved to ${remote?.slice(0, 12) ?? 'nothing'} before approval (reviewed ${sha.slice(0, 12)})`);
         const prBad = m.pr ? prProblem(m, await this.d.prs.inspect(m.repo, m.pr.number), sha) : 'no pull request recorded';
         if (prBad) throw new GateChanged(prBad);
+        const held = this.liveProblem(await this.checkTriage(m), m);
+        if (held) throw new TicketChanged(held);
         const ci = await this.d.ci.snapshot(m.repo, sha, { required: auth.oc.ciChecks, actionsWorkflow: auth.oc.ciActionsWorkflow, branch: m.branch }); // check results are not immutable: re-read them on every approval attempt
         if (ci.state !== 'success') throw new GateChanged(`CI is no longer green on ${sha.slice(0, 12)}: ${ci.detail}`);
+        const live = await this.load(m.ticket);
+        const bad = this.liveProblem(live, m);
+        if (bad) throw new TicketChanged(bad);
         this.verifyPin(m); // after ALL the awaited reads, immediately before the privileged write
         await this.d.write.setState(m.issueId, auth.approval.id);
       });
