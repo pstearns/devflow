@@ -309,8 +309,8 @@ export class LinearActions {
       const readyLabel = ctx.teamLabels.find((l) => low(l.name) === low(wf.readyLabel) && !l.isGroup)!;
       const ready = hasReady(ctx, wf);
       const fromTriage = isTriageState(ctx.state);
-      const history = ready || fromTriage ? await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel) : undefined;
-      const renew = ready && (fromTriage || history?.stale === true);
+      const history = await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel);
+      const renew = ready && (fromTriage || history.stale);
       let cleared = !renew;
       let failure: unknown;
       try {
@@ -325,9 +325,9 @@ export class LinearActions {
       } catch (e) { failure = e; }
       const after = await this.tryLoad(identifier);
       if (cleared && after && after.state.id === todo.id && hasReady(after, wf)) {
-        if (fromTriage || renew) {
+        if (fromTriage || history.stale) {
           const confirmed = await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel);
-          if (confirmed.stale || !confirmed.approval.at || confirmed.approval.at === history?.approval.at) {
+          if (confirmed.stale || !confirmed.approval.at || confirmed.approval.at === history.approval.at) {
             throw new ActionError(502, 'approval-history-unconfirmed', 'Linear shows Todo and Ready, but the new approval is not yet confirmed in its history.');
           }
         }

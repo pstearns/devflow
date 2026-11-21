@@ -239,6 +239,15 @@ describe('workflow status changes', () => {
     expect(spec('ATL-7').state).toBe('Todo');
     expect(spec('ATL-7').labels).toContain('Ready');
   });
+  it('confirms fresh approval history when retrying from Todo after a partial Triage release', async () => {
+    const { actions, spec } = await setup({
+      authorizerHistory: [{ createdAt: '2026-06-01T09:00:00Z', fromState: { name: 'Triage', type: 'triage' } }],
+    });
+    spec('ATL-7').state = 'Todo';
+    spec('ATL-7').labels = [];
+    expect((await actions.approve('ATL-7', 'ATL-7')).ok).toBe(true);
+    expect(spec('ATL-7').labels).toContain('Ready');
+  });
   it('Done works with or without a merged PR (non-code tickets have none)', async () => {
     const { actions, spec } = await setup();
     expect((await actions.status('ATL-16', 'st-ATL-done')).ok).toBe(true); // a documentation ticket: no PR at all
