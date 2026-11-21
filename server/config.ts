@@ -43,7 +43,8 @@ export interface OrchestrationCfg {
   blockedState: string; // Linear state for escalations; must exist so a failure can always be recorded
   maxRepairs: number; // repair attempts after the first implementation (0-3, default 3); `1` = one remediation cycle, a second FAIL escalates
   infraRetries: number; // retries of an infrastructure step; never consumes a repair attempt
-  ciChecks: string[]; // check/workflow names that must be green on the SHA (empty = at least one check, all green)
+  ciActionsWorkflow?: string; // opt-in trusted GitHub Actions workflow path
+  ciChecks: string[]; // check/job names that must be green on the SHA (empty = at least one check, all green)
   ciTimeoutMinutes: number;
   agentTimeoutMinutes: number;
   claude: { bin: string; allowedTools: string[] };
@@ -165,11 +166,25 @@ function parseOrchestration(raw: unknown, id: string, repos: string[]): Orchestr
   const claude = isObj(raw.claude) ? raw.claude : {};
   const codex = isObj(raw.codex) ? raw.codex : {};
   const bin = (v: unknown, what: string) => { const b = str(v, 500) ?? ''; if (!b.startsWith('/') || /\s/.test(b)) throw new Error(`${at}.${what}.bin must be an explicit absolute path to the executable (no PATH lookup, no arguments)`); return b; };
+  let ciChecks = strList(raw.ciChecks, []);
+  const ciActionsWorkflow = raw.ciActionsWorkflow;
+  if (ciActionsWorkflow !== undefined) {
+    if (typeof ciActionsWorkflow !== 'string' || !/^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(ciActionsWorkflow)) {
+      throw new Error(`${at}.ciActionsWorkflow must be a workflow file under .github/workflows/`);
+    }
+    const names: unknown = raw.ciChecks;
+    if (!Array.isArray(names) || !names.length || !names.every((name: unknown): name is string =>
+      typeof name === 'string' && name.length > 0 && name === name.trim() && !/[\x00-\x1f\x7f]/.test(name))
+      || new Set(names.map((name) => name.toLowerCase())).size !== names.length) {
+      throw new Error(`${at}.ciActionsWorkflow requires explicit, unique ciChecks job names`);
+    }
+    ciChecks = names;
+  }
   return {
     repo, repoPath: abs('repoPath'), baseBranch: str(raw.baseBranch, 100) ?? 'main', runsDir: abs('runsDir'),
     startedState: str(raw.startedState, 100) ?? 'In Progress', approvalState: str(raw.approvalState, 100) ?? 'In Review',
     blockedState: str(raw.blockedState, 100) ?? 'Blocked', maxRepairs, infraRetries: typeof raw.infraRetries === 'number' ? Math.min(5, Math.max(0, Math.floor(raw.infraRetries))) : 2,
-    ciChecks: strList(raw.ciChecks, []), ciTimeoutMinutes: mins('ciTimeoutMinutes', 20, 120), agentTimeoutMinutes: mins('agentTimeoutMinutes', 30, 240),
+    ciChecks, ciActionsWorkflow, ciTimeoutMinutes: mins('ciTimeoutMinutes', 20, 120), agentTimeoutMinutes: mins('agentTimeoutMinutes', 30, 240),
     claude: { bin: bin(claude.bin, 'claude'), allowedTools: tools(claude.allowedTools) },
     codex: { bin: bin(codex.bin, 'codex') },
     retention: retention(raw.retention),
