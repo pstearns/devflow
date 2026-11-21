@@ -17,27 +17,29 @@ type Details = Pick<RunActivityEvent, 'actor' | 'title' | 'detail'>;
 function describe(row: Record<string, unknown>, run: Manifest): Details | undefined {
   const attempt = typeof row.attempt === 'number' && Number.isInteger(row.attempt) && row.attempt >= 0 && row.attempt <= 3
     ? run.attempts?.find((item) => item.n === row.attempt) : undefined;
-  const sha = typeof row.sha === 'string' && SHA.test(row.sha) ? row.sha.slice(0, 12) : undefined;
+  const commit = typeof row.sha === 'string' ? row.sha : attempt?.headSha;
+  const sha = typeof commit === 'string' && SHA.test(commit) ? commit.slice(0, 12) : undefined;
+  const revision = [attempt && (attempt.n === 0 ? 'Initial attempt' : `Repair ${attempt.n}`), sha].filter(Boolean).join(' · ') || undefined;
   switch (row.what) {
     case 'start-confirmed': return { actor: 'devflow', title: 'Run started' };
-    case 'state:implementing': return { actor: 'claude', title: 'Claude received the ticket' };
-    case 'state:verifying-commit': return { actor: 'claude', title: 'Claude returned its changes' };
+    case 'state:implementing': return { actor: 'claude', title: 'Claude received the ticket', detail: revision };
+    case 'state:verifying-commit': return { actor: 'claude', title: 'Claude returned its changes', detail: revision };
     case 'pr-created': return { actor: 'devflow', title: 'Draft pull request opened', detail: typeof row.number === 'number' && Number.isSafeInteger(row.number) && row.number > 0 ? `PR #${row.number}` : undefined };
-    case 'state:ci': return { actor: 'ci', title: 'Commit submitted to CI', detail: sha };
+    case 'state:ci': return { actor: 'ci', title: 'Commit submitted to CI', detail: revision };
     case 'ci-result':
-      if (row.state === 'success') return { actor: 'ci', title: 'CI passed' };
-      if (row.state === 'failure') return { actor: 'ci', title: 'CI failed' };
-      if (row.state === 'timeout') return { actor: 'ci', title: 'CI timed out' };
+      if (row.state === 'success') return { actor: 'ci', title: 'CI passed', detail: revision };
+      if (row.state === 'failure') return { actor: 'ci', title: 'CI failed', detail: revision };
+      if (row.state === 'timeout') return { actor: 'ci', title: 'CI timed out', detail: revision };
       return;
-    case 'state:reviewing': return { actor: 'codex', title: 'Codex received the verified commit', detail: sha };
+    case 'state:reviewing': return { actor: 'codex', title: 'Codex received the verified commit', detail: revision };
     case 'review-validated':
-      if (row.verdict === 'PASS') return { actor: 'codex', title: 'Codex passed the review' };
+      if (row.verdict === 'PASS') return { actor: 'codex', title: 'Codex passed the review', detail: revision };
       if (row.verdict === 'FAIL') {
         const count = attempt?.review?.findings;
-        return { actor: 'codex', title: 'Codex sent findings to DevFlow', detail: typeof count === 'number' && Number.isInteger(count) && count > 0 && count <= 100 ? `${count} finding${count === 1 ? '' : 's'}` : undefined };
+        return { actor: 'codex', title: 'Codex sent findings to DevFlow', detail: [typeof count === 'number' && Number.isInteger(count) && count > 0 && count <= 100 ? `${count} finding${count === 1 ? '' : 's'}` : undefined, revision].filter(Boolean).join(' · ') || undefined };
       }
       return;
-    case 'state:repairing': return { actor: 'claude', title: 'Claude received a repair request' };
+    case 'state:repairing': return { actor: 'claude', title: 'Claude received a repair request', detail: revision };
     case 'state:awaiting-owner': return { actor: 'devflow', title: 'Awaiting owner approval', detail: sha };
     case 'state:escalated': return { actor: 'devflow', title: 'Run escalated to the owner' };
     default: return;

@@ -155,6 +155,6 @@ describe('config', () => {
     expect(() => parseConfig({ projects: [{ id: 'a', name: 'A' }, { id: 'a', name: 'B' }] })).toThrow(/Duplicate/);
     const c = parseConfig({ projects: [], prompts: { discover: 'custom {{ticket}}' } });
     expect(c.prompts.find((p) => p.id === 'discover')!.template).toBe('custom {{ticket}}');
-    expect(c.prompts).toHaveLength(6);
+    expect(c.prompts.find((p) => p.id === 'triage')?.label).toBe('Triage ticket');
   });
 });

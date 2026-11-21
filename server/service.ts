@@ -1,4 +1,5 @@
-import type { Snapshot, SourceHealth } from '../shared/types.ts';
+import { readdirSync } from 'node:fs';
+import type { RunActivityFeedEntry, Snapshot, SourceHealth } from '../shared/types.ts';
 import type { Config } from './config.ts';
 import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, isFreshPrFor, normalizePr, type Denied, type RepoData } from './github.ts';
 import { LinearClient, discoverTeams, fetchLinearIssue, fetchTeamData, type TeamData, type TeamRef } from './linear.ts';
@@ -97,6 +98,33 @@ export class SnapshotService {
     const orchestration = project?.orchestration;
     if (!project || !orchestration) return undefined;
     return runActivity(orchestration.runsDir, issue, project.id, orchestration.repo);
+  }
+
+  /** Unfinished tickets with local orchestration evidence, scoped to issues the dashboard can see. */
+  activityFeed(): RunActivityFeedEntry[] {
+    const snapshot = this.peek();
+    if (this.mode !== 'live' || !snapshot) return [];
+    const candidates = new Map<string, string>();
+    for (const project of this.cfg.projects) {
+      if (!project.orchestration) continue;
+      const issues = new Set(snapshot.issues.filter((issue) => issue.configProjectId === project.id && issue.state.type !== 'completed' && issue.state.type !== 'canceled').map((issue) => issue.identifier));
+      if (!issues.size) continue;
+      try {
+        for (const entry of readdirSync(project.orchestration.runsDir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const match = /^([A-Z][A-Z0-9]{0,9}-\d{1,7})-([a-z0-9]{6,24})$/.exec(entry.name);
+          if (!match) continue;
+          const identifier = match[1]!, runId = match[2]!;
+          if (issues.has(identifier) && runId > (candidates.get(identifier) ?? '')) candidates.set(identifier, runId);
+        }
+      } catch { /* This project's local evidence is currently unavailable. */ }
+    }
+    return [...candidates].sort((a, b) => b[1].localeCompare(a[1])).slice(0, 12).flatMap(([identifier]) => {
+      try {
+        const run = this.activity(identifier);
+        return run?.runId ? [{ identifier, ...run, events: run.events.slice(-4) }] : [];
+      } catch { return []; }
+    });
   }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {

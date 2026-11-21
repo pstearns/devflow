@@ -3,7 +3,7 @@ import type {
   ActivityEvent, AttentionItem, Evidence, Issue, KnowledgeLink, LabelDef, PrScope, PullRequest, SourceHealth, Snapshot, Stage, TeamInfo, TeamProjectInfo, Tri,
 } from '../shared/types.ts';
 import { DEFAULT_WORKFLOW, type Config, type KnowledgeCfg, type WorkflowCfg } from './config.ts';
-import { buildTeamMilestones, type TeamData, type TeamRef } from './linear.ts';
+import { buildTeamMilestones, isTriageState, type TeamData, type TeamRef } from './linear.ts';
 import { repoOwners, resolveScope, type LinearProjectRef } from './scope.ts';
 import type { RepoData } from './github.ts';
 import { matchPrs } from './match.ts';
@@ -70,7 +70,8 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, c
   issue.openBlockers = issue.blockedBy.filter((b) => !b.resolved);
   const t = issue.state.type;
   const resolved = t === 'completed' || t === 'canceled';
-  const marker = !resolved && issue.openBlockers.length === 0
+  const triage = isTriageState(issue.state);
+  const marker = triage ? `Linear state "${issue.state.name}"` : !resolved && issue.openBlockers.length === 0
     ? (/blocked/i.test(issue.state.name) ? `Linear state "${issue.state.name}"` : issue.labels.find((l) => /^blocked$/i.test(l.name)) ? 'Linear label "blocked"' : undefined)
     : undefined;
   issue.blockedMarker = marker;
@@ -94,7 +95,11 @@ export function deriveIssue(issue: Issue, prs: PullRequest[], wf: WorkflowCfg, c
 
   if (t === 'canceled') stage = undefined, issue.stageEvidence.push(lv(`State: ${issue.state.name} (canceled)`));
   else if (t === 'completed') stage = 'done', issue.stageEvidence.push(lv(`State: ${issue.state.name}`));
-  else if (primary && primary.state === 'merged') {
+  else if (triage) {
+    stage = 'discovery';
+    issue.stageEvidence.push(lv(`State: ${issue.state.name}`));
+    issue.awaitingHuman.push('Triage diagnosis and execution approval');
+  } else if (primary && primary.state === 'merged') {
     stage = 'closeout';
     issue.stageEvidence.push(prEv(primary, `PR #${primary.number} merged`), lv(`Linear state is still "${issue.state.name}"`));
   } else if (approved && primary) {
@@ -346,7 +351,7 @@ export function buildAttention(
       out.push({ ...common, id: `chg:${pr.key}`, kind: 'changes_requested', severity: 'high', actionable: true, title: `${name}: changes requested`, cause: pr.humanReview.detail, evidence: pr.humanReview.evidence, nextAction: 'Address the review comments on the PR.' });
     if (pr.independentReview.value === 'failed')
       out.push({ ...common, id: `rv:${pr.key}`, kind: 'review_findings', severity: 'high', actionable: true, title: `${name}: independent review findings`, cause: pr.independentReview.detail, evidence: pr.independentReview.evidence, nextAction: 'Resolve the recorded findings (prompt: Resolve review findings).' });
-    if (!pr.draft && pr.ci.value === 'passed' && pr.humanReview.value !== 'failed' && pr.independentReview.value !== 'failed') {
+    if (!(issue && isTriageState(issue.state)) && !pr.draft && pr.ci.value === 'passed' && pr.humanReview.value !== 'failed' && pr.independentReview.value !== 'failed') {
       const rv = pr.independentReview.value;
       out.push({
         ...common, id: `merge:${pr.key}`, kind: 'awaiting_merge', severity: 'medium', actionable: true, title: `${name}: ready for your merge decision`,
@@ -366,7 +371,9 @@ export function buildAttention(
     if (i.state.type === 'completed' || i.state.type === 'canceled') continue;
     const common = { teamKey: i.teamKey, linearProjectId: i.linearProjectId, ticket: i.identifier };
     const lev = (l: string): Evidence => ({ source: 'Linear', label: l, url: i.url });
-    if (i.openBlockers.length && (i.state.type === 'started' || i.state.type === 'unstarted'))
+    if (isTriageState(i.state))
+      out.push({ ...common, id: `triage:${i.identifier}`, kind: 'triage', severity: 'medium', actionable: true, title: `${i.identifier}: needs triage`, cause: `Linear status is "${i.state.name}"`, evidence: [lev(`State: ${i.state.name}`)], nextAction: 'Use the Triage ticket prompt to diagnose the blocker and prepare the ticket for approval.' });
+    else if (i.openBlockers.length && (i.state.type === 'started' || i.state.type === 'unstarted'))
       out.push({ ...common, id: `blk:${i.identifier}`, kind: 'blocked', severity: i.state.type === 'started' ? 'high' : 'medium', actionable: true, title: `${i.identifier}: blocked by ${i.openBlockers.map((b) => b.identifier).join(', ')}`, cause: `Unresolved blocking relation(s): ${i.openBlockers.map((b) => `${b.identifier} (${b.stateName})`).join(', ')}`, evidence: i.openBlockers.map((b) => ({ source: 'Linear relation', label: `${b.identifier} blocks ${i.identifier}`, url: b.url })), nextAction: 'Resolve or re-plan the blocker in Linear.' });
     else if (i.blockedMarker)
       out.push({ ...common, id: `blk:${i.identifier}`, kind: 'blocked', severity: 'medium', actionable: true, title: `${i.identifier}: marked blocked`, cause: `${i.blockedMarker}; no blocking relation recorded`, evidence: [lev(i.blockedMarker)], nextAction: 'Record the blocker in Linear or unblock the issue.' });

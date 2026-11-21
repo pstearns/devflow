@@ -76,6 +76,9 @@ export function stateType(v: unknown): StateType {
   if (t === 'duplicate') return 'canceled'; // Linear's duplicate state is resolved, not open work
   return t === 'triage' || t === 'backlog' || t === 'unstarted' || t === 'started' || t === 'completed' || t === 'canceled' ? t : 'unknown';
 }
+export const isTriageState = (state: { type: StateType; name: string }) =>
+  state.type === 'triage' || (!['completed', 'canceled'].includes(state.type) && /^triage$/i.test(state.name));
+
 export const isResolved = (t: StateType) => t === 'completed' || t === 'canceled';
 
 export function normalizeRef(raw: unknown): IssueRef | undefined {

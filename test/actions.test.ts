@@ -201,6 +201,18 @@ describe('workflow status changes', () => {
     expect((await actions.status('ATL-15', id('Todo'))).ok).toBe(true); // Todo alone does not authorize execution
     expect(spec('ATL-15').labels).not.toContain('Ready');
   });
+  it('holds an approved ticket in Triage until explicitly approved again', async () => {
+    const { actions, spec } = await setup();
+    await actions.status('ATL-7', 'st-ATL-triage');
+    const options = await actions.options('ATL-7');
+    expect(options.approve.already).toBe(false);
+    expect(options.states.find((state) => state.name === 'Todo')?.allowed).toBe(false);
+    expect((await fail(actions.status('ATL-7', 'st-ATL-todo'))).code).toBe('transition-refused');
+    expect(spec('ATL-7').state).toBe('Triage');
+    await actions.approve('ATL-7', 'ATL-7');
+    expect(spec('ATL-7').state).toBe('Todo');
+    expect(spec('ATL-7').labels).toContain('Ready');
+  });
   it('Done works with or without a merged PR (non-code tickets have none)', async () => {
     const { actions, spec } = await setup();
     expect((await actions.status('ATL-16', 'st-ATL-done')).ok).toBe(true); // a documentation ticket: no PR at all
@@ -211,7 +223,7 @@ describe('workflow status changes', () => {
     const o = await actions.options('ATL-15');
     expect(o.states.filter((x) => !x.allowed).map((x) => [x.name, x.reason])).toEqual([['Backlog', 'Current state']]);
     expect(o.states.map((x) => x.name)).toEqual(expect.arrayContaining(['In Progress', 'Done', 'Canceled']));
-    expect(statusOptions({ ...parseCtx({ issue: { id: 'i', identifier: 'ABC-1', state: { id: 'a', type: 'started', name: 'S' }, team: { key: 'ABC', states: { nodes: [] } } } }, [])!, states: [] }, true)).toEqual([]);
+    expect(statusOptions({ ...parseCtx({ issue: { id: 'i', identifier: 'ABC-1', state: { id: 'a', type: 'started', name: 'S' }, team: { key: 'ABC', states: { nodes: [] } } } }, [])!, states: [] }, true, DEFAULT_WORKFLOW)).toEqual([]);
   });
 });
 

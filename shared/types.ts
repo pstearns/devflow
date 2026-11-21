@@ -330,3 +330,7 @@ export interface RunActivitySnapshot {
   activeAgent: 'claude' | 'codex' | null;
   events: RunActivityEvent[];
 }
+
+export interface RunActivityFeedEntry extends RunActivitySnapshot {
+  identifier: string;
+}

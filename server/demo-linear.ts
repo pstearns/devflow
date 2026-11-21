@@ -8,8 +8,8 @@ const H = 3600_000;
 const ago = (hours: number, now: number) => new Date(now - hours * H).toISOString();
 const day = (offsetDays: number, now: number) => new Date(now + offsetDays * 86400_000).toISOString().slice(0, 10);
 
-type StateType = 'backlog' | 'unstarted' | 'started' | 'completed' | 'canceled';
-const STATE_DEFS: [name: string, type: StateType][] = [['Backlog', 'backlog'], ['Todo', 'unstarted'], ['In Progress', 'started'], ['In Review', 'started'], ['Blocked', 'started'], ['Done', 'completed'], ['Canceled', 'canceled']];
+type StateType = 'triage' | 'backlog' | 'unstarted' | 'started' | 'completed' | 'canceled';
+const STATE_DEFS: [name: string, type: StateType][] = [['Backlog', 'backlog'], ['Todo', 'unstarted'], ['In Progress', 'started'], ['In Review', 'started'], ['Blocked', 'started'], ['Triage', 'triage'], ['Done', 'completed'], ['Canceled', 'canceled']];
 
 interface LabelSpec { id: string; name: string; color: string; isGroup?: boolean; parent?: string }
 // Workspace labels are shared by every team (same ids); each team also has its own label set with its own ids/names.

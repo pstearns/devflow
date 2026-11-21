@@ -34,7 +34,7 @@ describe('run activity', () => {
       expect(activity.activeAgent).toBe('claude');
       expect(activity.events.map((e) => [e.actor, e.title, e.detail])).toEqual([
         ['codex', 'Codex received the verified commit', 'aaaaaaaaaaaa'],
-        ['codex', 'Codex sent findings to DevFlow', '1 finding'],
+        ['codex', 'Codex sent findings to DevFlow', '1 finding · Initial attempt'],
         ['claude', 'Claude received a repair request', undefined],
       ]);
       expect(runActivity(root, issue, 'other', 'owner/repo').runId).toBeNull();
@@ -47,6 +47,8 @@ describe('run activity', () => {
     const service = new SnapshotService(parseConfig({ projects: [] }), {});
     const activity = { runId: 'abc123', state: 'ci', activeAgent: null, events: [] };
     const projection = vi.spyOn(service, 'activity').mockReturnValue(activity);
+    const feed = [{ identifier: 'PS-8', ...activity }];
+    vi.spyOn(service, 'activityFeed').mockReturnValue(feed);
     const reviewing = { ...activity, state: 'reviewing', activeAgent: 'codex' as const };
     const app = await buildApp(service, { auth, distDir: '/none' });
     try {
@@ -55,8 +57,8 @@ describe('run activity', () => {
       expect((await app.inject({ url: path, headers: { ...signed.headers, 'sec-fetch-site': 'cross-site' } })).statusCode).toBe(403);
       await app.listen({ host: '127.0.0.1', port: 0 });
       const port = (app.server.address() as AddressInfo).port;
-      const read = (onFirst: () => void | Promise<unknown>, until: string) => new Promise<string>((resolve, reject) => {
-        const req = request({ port, host: '127.0.0.1', path, headers: { host: 'devflow.localhost:4317', cookie: signed.cookie } }, (res) => {
+      const read = (onFirst: () => void | Promise<unknown>, until: string, route = path) => new Promise<string>((resolve, reject) => {
+        const req = request({ port, host: '127.0.0.1', path: route, headers: { host: 'devflow.localhost:4317', cookie: signed.cookie } }, (res) => {
           let data = '';
           let first = true;
           res.setEncoding('utf8');
@@ -75,6 +77,8 @@ describe('run activity', () => {
         req.on('error', reject);
         req.end();
       });
+      expect((await app.inject({ url: '/api/run-activity', headers: { host: 'devflow.localhost:4317' } })).statusCode).toBe(401);
+      expect(await read(() => {}, JSON.stringify(feed), '/api/run-activity')).toContain(JSON.stringify(feed));
       const first = await read(() => {}, JSON.stringify(activity));
       const live = await read(() => { projection.mockReturnValue(reviewing); }, JSON.stringify(reviewing));
       const replay = await read(() => signed.post('/api/auth/logout', {}), 'event: unavailable');

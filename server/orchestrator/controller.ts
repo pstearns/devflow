@@ -10,7 +10,7 @@ import { basename, join, resolve, sep } from 'node:path';
 import type { Config, OrchestrationCfg } from '../config.ts';
 import { resolveScope } from '../scope.ts';
 import { Q_ACTION_ISSUE, hasReady, isResolvedType, parseCtx, type Ctx } from '../actions.ts';
-import type { LinearClient } from '../linear.ts';
+import { isTriageState, type LinearClient } from '../linear.ts';
 import { MAX_COMMENT, type LinearWriteClient } from '../linear-write.ts';
 import { isObj, nodes, str } from '../util.ts';
 import { infraProblem, type AgentRunner, type ProcResult } from './agents.ts';
@@ -97,6 +97,7 @@ export class Orchestrator {
     if (!sc.writeAllowed) throw new Rejected(`${ctx.identifier} is not authorized: ${sc.writeReason ?? 'its team/project is not enabled for writes'}`);
     const oc = sc.configProject?.orchestration;
     if (!sc.configProject || !oc) throw new Rejected(`${ctx.identifier}: its project has no "orchestration" configuration, so DevFlow will not execute it`);
+    if (isTriageState(ctx.state)) throw new Rejected(`${ctx.identifier} is on hold in Triage. Resolve the blocker and approve it for execution before dispatch.`);
     if (!hasReady(ctx, sc.workflow)) throw new Rejected(`${ctx.identifier} is not explicitly approved: it does not carry the "${sc.workflow.readyLabel}" label`);
     if (ctx.state.type !== 'unstarted') throw new Rejected(`${ctx.identifier} is in "${ctx.state.name}", not an unstarted state: it is already started, finished, or being executed`);
     if (!ctx.depsVerifiable) throw new Rejected(`${ctx.identifier}: blockers could not be fully read, so readiness cannot be confirmed`);
@@ -172,6 +173,7 @@ export class Orchestrator {
       return await this.loop(store, m, ctx, auth, pinned);
     } catch (e) {
       if (!m) { store.release(ticket, runId); throw e; } // rejected before any state existed
+      if (e instanceof TicketChanged) return this.escalate(store, m, 'ticket-changed', e.message);
       if (e instanceof Rejected) return this.escalate(store, m, 'ticket-changed', `Authorization changed before the run could start: ${e.message}`);
       if (e instanceof PolicyError) return this.escalate(store, m, 'policy-violation', `Trusted controller policy failed verification: ${e.message}. Nothing further was executed.`);
       if (e instanceof InfraError) return this.escalate(store, m, 'infrastructure', `Infrastructure failure at "${e.step}": ${e.message}. No repair attempt was consumed; the code was not judged.`, `Infrastructure failure at step "${e.step}" after ${m.infra.filter((i) => i.step === e.step).length} attempt(s). The diagnostic is in the retained evidence only. No repair attempt was consumed; the code was not judged.`);
@@ -195,6 +197,12 @@ export class Orchestrator {
   }
   private recordInfra(store: RunStore, m: Manifest, step: string, detail: string) {
     m.infra.push({ at: this.at(), step, detail }); this.save(store, m, 'infra-failure', { step, detail });
+  }
+
+  private async checkTriage(m: Manifest): Promise<void> {
+    if (isTriageState((await this.load(m.ticket)).state)) {
+      throw new TicketChanged(`${m.ticket} was moved to Triage during the run`);
+    }
   }
 
   // ---------------------------------------------------------------- the loop (n counts REPAIR attempts only)
@@ -229,12 +237,15 @@ export class Orchestrator {
 
       // 3. push, confirm the REMOTE has exactly this SHA, ensure a DRAFT PR, confirm GitHub's PR head is this SHA
       await this.infra(store, m, 'push', async () => {
+        await this.checkTriage(m);
+        this.verifyPin(m);
         await G.pushRef(oc.repoPath, this.ref(m, n), m.branch, m.repo, this.d.pushToken, await this.d.gitHost?.());
         const remote = await this.remoteHead(m);
         if (remote !== sha) throw new Error(`remote branch is at ${remote?.slice(0, 12) ?? 'nothing'} after push, expected ${sha.slice(0, 12)}`);
       });
       await this.infra(store, m, 'pull-request', async () => {
         if (!m.pr) {
+          await this.checkTriage(m);
           this.verifyPin(m);
           const pr = await this.d.prs.ensureDraft(m.repo, { branch: m.branch, base: m.baseBranch, title: `${m.ticket}: ${m.title}`.slice(0, 250), body: prBody(m) });
           m.pr = { ...pr, draft: true }; this.save(store, m, 'pr-created', { number: pr.number });
@@ -305,6 +316,7 @@ export class Orchestrator {
 
   private async runClaude(store: RunStore, m: Manifest, a: AttemptRecord, oc: OrchestrationCfg, prompt: string, dir: string): Promise<ProcResult> {
     for (let i = 0; ; i++) {
+      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
       this.verifyPin(m);
       const res = await this.ag(m).implement({ clone: m.clone, prompt, timeoutMs: oc.agentTimeoutMinutes * 60_000, bundle: { branch: m.branch, exclude: a.startSha } });
       const log = store.evidence(m, `${dir}/claude-output${i ? `-retry${i}` : ''}.txt`, logOf(res));
@@ -350,6 +362,7 @@ export class Orchestrator {
     store.evidence(m, `attempt-${a.n}/review-schema.json`, JSON.stringify(REVIEW_SCHEMA));
     let invalid = 0, infra = 0;
     for (let t = 0; ; t++) {
+      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
       const suffix = t ? `-try${t}` : '';
       const rdir = join(base, `review${suffix}`), out = join(base, `out${suffix}`);
       const nonce = randomBytes(16).toString('hex'); // fresh per invocation: a retry can never replay an earlier answer

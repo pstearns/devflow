@@ -5,7 +5,7 @@
 import type { ActionCheck, ActionOptions, Issue, StateType } from '../shared/types.ts';
 import type { Config, WorkflowCfg } from './config.ts';
 import { resolveScope, type Scope } from './scope.ts';
-import { Q_LABELS, normalizeLabel, paginate, stateType, type LinearClient, type RawLabel } from './linear.ts';
+import { Q_LABELS, normalizeLabel, paginate, stateType, isTriageState, type LinearClient, type RawLabel } from './linear.ts';
 import type { LinearWriteClient } from './linear-write.ts';
 import type { SnapshotService } from './service.ts';
 import { SourceError, arr, isObj, nodes, str } from './util.ts';
@@ -73,7 +73,7 @@ const protectedHint = (name: string, wf: WorkflowCfg, applied: boolean) =>
   low(name) === low(wf.readyLabel) ? `use ${applied ? 'Revoke readiness' : 'Approve for execution'}` : 'edit it in Linear';
 
 export function findTodo(ctx: Ctx, wf: WorkflowCfg): StateDef | undefined {
-  const unstarted = ctx.states.filter((s) => s.type === 'unstarted').sort((a, b) => a.position - b.position);
+  const unstarted = ctx.states.filter((s) => s.type === 'unstarted' && !isTriageState(s)).sort((a, b) => a.position - b.position);
   return unstarted.find((s) => low(s.name) === low(wf.todoState)) ?? unstarted[0];
 }
 export function findBacklog(ctx: Ctx, wf: WorkflowCfg): StateDef | undefined {
@@ -95,14 +95,16 @@ export function evaluateApproval(ctx: Ctx, wf: WorkflowCfg, writeEnabled: boolea
   add('scope', `DevFlow may write to this ${ctx.project ? 'project' : 'team'}`, scope.writeAllowed, scope.writeAllowed ? `Authorized by configuration (${ctx.teamKey}${ctx.project ? ` / ${ctx.project.name}` : ''})` : (scope.writeReason ?? 'Not authorized'));
   add('ready-label', `"${wf.readyLabel}" label exists in Linear`, !!readyDef, readyDef ? 'Found in the team/workspace labels' : `No label named "${wf.readyLabel}" was found; DevFlow does not create labels`);
   add('todo-state', `"${wf.todoState}" state exists`, !!todo, todo ? `Will move to ${todo.name}` : 'The team has no unstarted workflow state');
-  return { checks: c, eligible: c.every((x) => x.ok), already: hasReady(ctx, wf) && ctx.state.type === 'unstarted' }; // `already` is informational only
+  return { checks: c, eligible: c.every((x) => x.ok), already: hasReady(ctx, wf) && ctx.state.type === 'unstarted' && !isTriageState(ctx.state) }; // `already` is informational only
 }
 
 /** The status menu lists the team's workflow states. Linear decides which changes it accepts; DevFlow only skips the current one. */
-export function statusOptions(ctx: Ctx, writeEnabled: boolean): ActionOptions['states'] {
+export function statusOptions(ctx: Ctx, writeEnabled: boolean, wf: WorkflowCfg): ActionOptions['states'] {
   return ctx.states.sort((a, b) => a.position - b.position).map((s) => {
     const current = s.id === ctx.state.id;
-    const reason = !writeEnabled ? 'Linear write access is not configured' : current ? 'Current state' : undefined;
+    const reason = !writeEnabled ? 'Linear write access is not configured' : current ? 'Current state'
+      : isTriageState(ctx.state) && s.type === 'unstarted' && !isTriageState(s) && hasReady(ctx, wf)
+        ? 'Use Approve for execution to release this ticket from Triage' : undefined;
     return { id: s.id, name: s.name, type: s.type, current, allowed: reason === undefined, reason };
   });
 }
@@ -170,7 +172,7 @@ export class LinearActions {
       writeEnabled: w, reason: w ? undefined : whyNot,
       scope: { teamKey: ctx.teamKey, projectName: ctx.project?.name, policy: sc.policy, explicitPolicy: sc.explicitPolicy },
       identifier: ctx.identifier, title: ctx.title, state: ctx.state, names: { ready: wf.readyLabel, backlog: findBacklog(ctx, wf)?.name }, labels,
-      states: statusOptions(ctx, w),
+      states: statusOptions(ctx, w, wf),
       milestones: { current: ctx.milestone?.id, options: ctx.milestones, canChange: w && !!ctx.project, reason: !w ? whyNot : !ctx.project ? 'The issue is not in a Linear project' : undefined },
       approve: { eligible: ap.eligible, already: ap.already, checks: ap.checks, todoState: findTodo(ctx, wf)?.name },
       revoke: { possible: w && ready && !!backlog, reason: !w ? whyNot : !ready ? `Not marked ${wf.readyLabel}` : !backlog ? 'The team has no backlog state to return the issue to' : undefined },
@@ -262,8 +264,8 @@ export class LinearActions {
       const w = this.writer();
       if (typeof stateId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(stateId)) throw new ActionError(400, 'bad-input', 'Invalid state id');
       const ctx = await this.load(identifier, false);
-      this.authorized(ctx);
-      const opt = statusOptions(ctx, true).find((s) => s.id === stateId);
+      const { workflow } = this.authorized(ctx);
+      const opt = statusOptions(ctx, true, workflow).find((s) => s.id === stateId);
       if (!opt) throw new ActionError(422, 'unknown-state', 'That state does not exist for this team');
       if (!opt.allowed) throw new ActionError(403, 'transition-refused', opt.reason ?? 'Transition not allowed');
       let failure: unknown;
