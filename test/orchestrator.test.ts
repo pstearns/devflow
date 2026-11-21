@@ -30,6 +30,13 @@ describe('Triage authorization', () => {
     await expect(w.orch.run('ATL-22')).rejects.toThrow('fresh Ready approval');
     expect(w.f.store.mutations).toEqual([]);
   });
+  it('refuses a grouped Triage exit and Ready addition as proof of fresh approval', async () => {
+    const w = world({ linearOpts: { authorizerHistory: [
+      { ...triage, addedLabels: [{ name: 'Ready' }], actor: { name: 'Grouped approval' } },
+    ] } });
+    await expect(w.orch.run('ATL-22')).rejects.toThrow('Linear grouped the Triage exit and Ready addition');
+    expect(w.f.store.mutations).toEqual([]);
+  });
   it('stops a prior run after a transient Triage hold even if the live status was restored', async () => {
     const history: { createdAt: string; [field: string]: unknown }[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
     const w = world({
@@ -79,9 +86,34 @@ describe('Triage authorization', () => {
     expect(result.approvedSha).toBeUndefined();
     expect(stateOf(w)).toBe('Triage');
   });
+  it('detects a transient hold that starts and ends during the final CI read', async () => {
+    const history: { createdAt: string; [field: string]: unknown }[] = [
+      { createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] },
+    ];
+    const w = world({ scenario: 'correct-first', linearOpts: { authorizerHistory: history } });
+    const snapshot = w.ci.snapshot.bind(w.ci);
+    let injected = false;
+    let reads = 0;
+    w.ci.snapshot = async (...args) => {
+      if (++reads !== 2) return snapshot(...args);
+      w.issue().state = 'Triage';
+      history.push({ createdAt: '2026-06-01T09:00:00Z', toState: { name: 'Triage', type: 'triage' } });
+      const result = await snapshot(...args);
+      w.issue().state = 'In Progress';
+      history.push({ ...triage, createdAt: '2026-06-01T09:01:00Z', toState: { name: 'In Progress', type: 'started' } });
+      injected = true;
+      return result;
+    };
+    const result = await w.orch.run('ATL-22');
+    expect(injected).toBe(true);
+    expect(result.reasonClass).toBe('ticket-changed');
+    expect(result.approvedSha).toBeUndefined();
+    expect(stateOf(w)).toBe('In Progress');
+    expect(w.f.store.mutations.filter(({ op }) => op === 'IssueUpdate')).toHaveLength(1);
+  });
   it('uses the approval recorded after Triage', async () => {
     const w = world({ scenario: 'correct-first', linearOpts: { authorizerHistory: [
-      triage, { createdAt: '2026-06-01T10:00:00Z', actor: { name: 'Fresh Owner' }, addedLabels: [{ name: 'Ready' }] },
+      { ...triage, addedLabels: [{ name: 'Ready' }] }, { createdAt: '2026-06-01T10:00:00Z', actor: { name: 'Fresh Owner' }, addedLabels: [{ name: 'Ready' }] },
     ] } });
     expect((await w.orch.run('ATL-22')).authorizedBy).toBe('Fresh Owner');
   });
