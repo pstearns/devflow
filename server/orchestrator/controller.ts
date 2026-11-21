@@ -10,7 +10,7 @@ import { basename, join, resolve, sep } from 'node:path';
 import type { Config, OrchestrationCfg } from '../config.ts';
 import { resolveScope } from '../scope.ts';
 import { Q_ACTION_ISSUE, hasReady, isResolvedType, parseCtx, type Ctx } from '../actions.ts';
-import { isTriageState, type LinearClient } from '../linear.ts';
+import { isTriageState, paginate, stateType, type LinearClient } from '../linear.ts';
 import { MAX_COMMENT, type LinearWriteClient } from '../linear-write.ts';
 import { isObj, nodes, str } from '../util.ts';
 import { infraProblem, type AgentRunner, type ProcResult } from './agents.ts';
@@ -55,7 +55,7 @@ export interface Deps {
 const low = (s: string) => s.toLowerCase();
 const clip = A.clip;
 const IDENT = /^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/;
-export const Q_AUTHORIZER = 'query Authorizer($id: String!) { issue(id: $id) { history(first: 50) { nodes { createdAt actor { name } addedLabels { name } } } } }';
+export const Q_AUTHORIZER = 'query Authorizer($id: String!, $after: String) { issue(id: $id) { history(first: 50, after: $after) { nodes { createdAt actor { name } addedLabels { name } fromState { name type } toState { name type } } pageInfo { hasNextPage endCursor } } } }';
 
 /**
  * Files the implementer may not touch: CI definitions and every file an agent or tool would treat as configuration/instructions. A commit
@@ -111,14 +111,38 @@ export class Orchestrator {
     return { oc, started, approval, blocked, projectId: sc.configProject.id, scopeText: `team ${ctx.teamKey}${ctx.project ? ` / project "${ctx.project.name}"` : ''}, workflow readiness label "${sc.workflow.readyLabel}"`, readyLabel: sc.workflow.readyLabel };
   }
 
-  /** Who added the approval label, from Linear's own history. Best effort: unknown is reported as unknown, never guessed. */
+  /** A Triage hold invalidates earlier Ready evidence, including when the issue was moved directly in Linear. */
   private async authorizer(ticket: string, readyLabel: string): Promise<{ who?: string; at?: string }> {
+    const warnings: string[] = [];
+    let history: unknown[];
     try {
-      const data = await this.d.read.query(Q_AUTHORIZER, { id: ticket });
-      const hist = isObj(data.issue) ? nodes(data.issue.history, 50) : [];
-      const hit = hist.filter(isObj).filter((h) => nodes({ nodes: h.addedLabels }, 20).some((l) => isObj(l) && low(str(l.name, 100) ?? '') === low(readyLabel))).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
-      return hit ? { who: isObj(hit.actor) ? str(hit.actor.name, 100) : undefined, at: str(hit.createdAt, 40) } : {};
-    } catch { return {}; }
+      history = await paginate(this.d.read, Q_AUTHORIZER, { id: ticket }, (data) => isObj(data.issue) ? data.issue.history : undefined, warnings, 'approval history');
+    } catch {
+      throw new Rejected(`${ticket}: Linear approval history could not be verified`);
+    }
+    if (warnings.length) throw new Rejected(`${ticket}: Linear approval history is incomplete`);
+    const triage = (state: unknown) => isObj(state) && isTriageState({ name: str(state.name, 100) ?? '', type: stateType(state.type) });
+    let lastTriage = -Infinity;
+    let approvedAt = -Infinity;
+    let approval: { who?: string; at?: string } = {};
+    for (const entry of history) {
+      if (!isObj(entry)) throw new Rejected(`${ticket}: Linear approval history contains an invalid entry`);
+      const enteredOrLeftTriage = triage(entry.fromState) || triage(entry.toState);
+      const addedReady = nodes({ nodes: entry.addedLabels }, 100).some((label) => isObj(label) && low(str(label.name, 100) ?? '') === low(readyLabel));
+      if (!enteredOrLeftTriage && !addedReady) continue;
+      const at = str(entry.createdAt, 40);
+      const time = at ? Date.parse(at) : NaN;
+      if (!Number.isFinite(time)) throw new Rejected(`${ticket}: Linear approval history contains an invalid timestamp`);
+      if (enteredOrLeftTriage) lastTriage = Math.max(lastTriage, time);
+      if (addedReady && time > approvedAt) {
+        approvedAt = time;
+        approval = { who: isObj(entry.actor) ? str(entry.actor.name, 100) : undefined, at };
+      }
+    }
+    if (Number.isFinite(lastTriage) && approvedAt <= lastTriage) {
+      throw new Rejected(`${ticket}: fresh Ready approval is required after Triage`);
+    }
+    return approval;
   }
 
   async run(identifierRaw: string): Promise<Manifest> {
@@ -138,6 +162,7 @@ export class Orchestrator {
       const auth = this.authorize(ctx);
       if (auth.projectId !== preAuth.projectId) throw new Rejected('the ticket moved to a different project while the run was being accepted');
       const oc = auth.oc;
+      const who = await this.authorizer(ticket, auth.readyLabel);
       // Fail closed: if the owner's policy cannot be verified (wrong owner/mode, inside an agent-reachable tree, binary swapped...), nothing starts.
       const agents = this.d.agents(oc, auth.projectId);
       try { pinned = this.d.policy(oc, auth.projectId).pin(); } catch (e) { throw new Rejected(`Trusted policy could not be verified (fail closed): ${e instanceof Error ? e.message : 'unknown'}`); }
@@ -146,7 +171,6 @@ export class Orchestrator {
       if (!pf.ok) throw new Rejected(`Preflight failed (infrastructure; the ticket was not touched): ${pf.problems.join('; ')}`);
       await G.git(oc.repoPath, ['fetch', 'origin', oc.baseBranch], G.ambientEnv());
       const baseSha = await G.resolveRef(oc.repoPath, `origin/${oc.baseBranch}`);
-      const who = await this.authorizer(ticket, auth.readyLabel);
       m = {
         version: 1, runId, ticket, issueId: ctx.id, title: ctx.title, project: auth.projectId, repo: oc.repo, baseBranch: oc.baseBranch, baseSha,
         branch: `devflow/${ticket.toLowerCase()}-${runId}`, clone: '', state: 'accepted', attempts: [], linearCommentIds: [], infra: [],
@@ -162,6 +186,8 @@ export class Orchestrator {
       await this.infra(store, m, 'linear-start', async () => {
         const fresh = this.authorize(await this.load(ticket)); // the owner may have revoked or moved the ticket while preflight and git were running
         if (fresh.projectId !== auth.projectId) throw new Rejected('the ticket moved to a different project before the run started');
+        const approval = await this.authorizer(ticket, auth.readyLabel);
+        if (approval.at !== who.at || approval.who !== who.who) throw new Rejected('Ready approval changed before the run started');
         this.verifyPin(m!);
         await this.d.write.setState(ctx.id, auth.started.id);
       });
@@ -362,7 +388,6 @@ export class Orchestrator {
     store.evidence(m, `attempt-${a.n}/review-schema.json`, JSON.stringify(REVIEW_SCHEMA));
     let invalid = 0, infra = 0;
     for (let t = 0; ; t++) {
-      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
       const suffix = t ? `-try${t}` : '';
       const rdir = join(base, `review${suffix}`), out = join(base, `out${suffix}`);
       const nonce = randomBytes(16).toString('hex'); // fresh per invocation: a retry can never replay an earlier answer
@@ -375,6 +400,7 @@ export class Orchestrator {
       const before = G.hashDir(rdir);
       const prompt = reviewPrompt(ctx, sha, nonce);
       store.evidence(m, `attempt-${a.n}/codex-prompt${suffix}.txt`, prompt);
+      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
       this.verifyPin(m);
       const res = await this.ag(m).review({ snapshot: rdir, outDir: out, prompt, schemaPath, timeoutMs: oc.agentTimeoutMinutes * 60_000 });
       const rawRef = store.evidence(m, `attempt-${a.n}/codex-output${suffix}.txt`, logOf(res));

@@ -10,10 +10,10 @@ const B = { project: 'Beta Team › Beacon', milestone: 'M2 Launch', ticket: 'BC
 const decode = (h: string) => h.replaceAll('&quot;', '"').replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&#x27;', "'").replaceAll('&amp;', '&');
 
 describe('default prompt templates (PS-3)', () => {
-  it('keeps the six IDs, button labels and order', () => {
+  it('keeps the prompt IDs, button labels and order', () => {
     expect(DEFAULT_PROMPTS.map((p) => [p.id, p.label])).toEqual([
       ['discover', 'Discover ticket'], ['execute', 'Execute approved ticket'], ['review', 'Independent review'],
-      ['resolve', 'Resolve review findings'], ['resume', 'Resume ticket'], ['milestone', 'Review milestone'],
+      ['resolve', 'Resolve review findings'], ['triage', 'Triage ticket'], ['resume', 'Resume ticket'], ['milestone', 'Review milestone'],
     ]);
   });
   it('states each workflow contract and stays short', () => {
@@ -22,6 +22,7 @@ describe('default prompt templates (PS-3)', () => {
       execute: [/Claude Code only/, /explicitly approved Ready/, /branch\/PR state/, /dedicated branch/, /tests and scans/, /PR with acceptance evidence/, /Do not merge or change protected settings/, /three failed approaches/],
       review: [/Codex only/, /Read-only/, /full diff/, /raw CI\/security outputs/, /exact latest head SHA/, /severity, location, evidence and remedy/, /PASS, FAIL or INCOMPLETE for the reviewed SHA/],
       resolve: [/with Claude/, /each finding as fixed or disputed/, /current head SHA/, /rerun checks/i, /re-review on the new SHA/, /Do not bypass checks or merge/, /three failed approaches/],
+      triage: [/run evidence/, /smallest in-scope fix/, /fresh approval before dispatch/],
       resume: [/with Claude/, /issue, branch, PR, CI and review state/, /last verified action without duplicating/, /verify Ready approval before editing/, /owner decision/, /three failed approaches/],
       milestone: [/Read-only/, /Done, Ready, Waiting on prerequisite, Blocked and unapproved Backlog/, /critical path and next executable task/],
     };

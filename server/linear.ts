@@ -168,7 +168,7 @@ export interface ProjectRef { id: string; name: string; slugId?: string; url?: s
 export interface TeamRef { id: string; key: string; name: string; projects: ProjectRef[] }
 
 export async function paginate(
-  client: LinearClient, query: string, vars: Record<string, unknown>, pick: (d: Record<string, unknown>) => unknown, warnings: string[], what: string,
+  client: Pick<LinearClient, 'query'>, query: string, vars: Record<string, unknown>, pick: (d: Record<string, unknown>) => unknown, warnings: string[], what: string,
 ): Promise<unknown[]> {
   const out: unknown[] = [];
   let after: string | undefined;

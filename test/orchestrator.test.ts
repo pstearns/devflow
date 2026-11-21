@@ -21,6 +21,23 @@ const PASS_POSTED = (w: ReturnType<typeof makeWorld>) => w.comments().some((b) =
 const stateOf = (w: ReturnType<typeof makeWorld>) => w.issue().state;
 const runDir = (w: ReturnType<typeof makeWorld>, id: string) => join(w.runsDir, `${id}-${w.store().runsFor(id)[0]!.runId}`);
 
+describe('Triage authorization', () => {
+  const triage = { createdAt: '2026-06-01T09:00:00Z', fromState: { name: 'Triage', type: 'started' }, toState: { name: 'Todo', type: 'unstarted' } };
+  it('refuses stale Ready approval after the ticket leaves Triage in Linear', async () => {
+    const w = world({ linearOpts: { authorizerHistory: [
+      triage, { createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] },
+    ] } });
+    await expect(w.orch.run('ATL-22')).rejects.toThrow('fresh Ready approval');
+    expect(w.f.store.mutations).toEqual([]);
+  });
+  it('uses the approval recorded after Triage', async () => {
+    const w = world({ scenario: 'correct-first', linearOpts: { authorizerHistory: [
+      triage, { createdAt: '2026-06-01T10:00:00Z', actor: { name: 'Fresh Owner' }, addedLabels: [{ name: 'Ready' }] },
+    ] } });
+    expect((await w.orch.run('ATL-22')).authorizedBy).toBe('Fresh Owner');
+  });
+});
+
 describe('M1 acceptance: defect -> findings -> repair -> verified -> owner approval', () => {
   it('Claude implements, Codex finds the planted defect, Claude repairs, CI + Codex verify the new SHA, Linear records it, run stops at approval', async () => {
     const w = world();

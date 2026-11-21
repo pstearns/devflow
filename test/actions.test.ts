@@ -202,7 +202,7 @@ describe('workflow status changes', () => {
     expect(spec('ATL-15').labels).not.toContain('Ready');
   });
   it('holds an approved ticket in Triage until explicitly approved again', async () => {
-    const { actions, spec } = await setup();
+    const { actions, spec, f } = await setup();
     await actions.status('ATL-7', 'st-ATL-triage');
     const options = await actions.options('ATL-7');
     expect(options.approve.already).toBe(false);
@@ -212,6 +212,7 @@ describe('workflow status changes', () => {
     await actions.approve('ATL-7', 'ATL-7');
     expect(spec('ATL-7').state).toBe('Todo');
     expect(spec('ATL-7').labels).toContain('Ready');
+    expect(f.store.mutations.slice(-3).map(({ op }) => op)).toEqual(['IssueRemoveLabel', 'IssueUpdate', 'IssueAddLabel']);
   });
   it('Done works with or without a merged PR (non-code tickets have none)', async () => {
     const { actions, spec } = await setup();

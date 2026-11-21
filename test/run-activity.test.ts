@@ -42,6 +42,30 @@ describe('run activity', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('keeps older active runs ahead of newer terminal history in the capped feed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'devflow-feed-'));
+    try {
+      const config = parseConfig({ projects: [{
+        id: 'pilot', name: 'Pilot', linear: { teamKey: 'PS' }, github: { repos: ['owner/repo'] },
+        orchestration: { repo: 'owner/repo', repoPath: '/fixture/repo', runsDir: root, claude: { bin: '/fixture/claude' }, codex: { bin: '/fixture/codex' } },
+      }] });
+      const service = new SnapshotService(config, {});
+      const issues = Array.from({ length: 13 }, (_, i) => {
+        const identifier = `PS-${i + 1}`, id = `issue-${i}`, runId = `aaa${String(i).padStart(3, '0')}`;
+        const dir = join(root, `${identifier}-${runId}`);
+        mkdirSync(dir);
+        writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+          ticket: identifier, issueId: id, project: 'pilot', repo: 'owner/repo', runId, createdAt: at, state: i === 0 ? 'ci' : 'escalated',
+        }));
+        return { identifier, id, configProjectId: 'pilot', state: { type: 'started' } };
+      });
+      vi.spyOn(service, 'peek').mockReturnValue({ issues } as NonNullable<ReturnType<typeof service.peek>>);
+      const feed = service.activityFeed();
+      expect(feed).toHaveLength(12);
+      expect(feed[0]).toMatchObject({ identifier: 'PS-1', state: 'ci' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('authenticates SSE, replays activity to new connections, and stops after logout', async () => {
     const { auth, password } = await makeAuth();
     const service = new SnapshotService(parseConfig({ projects: [] }), {});

@@ -28,7 +28,7 @@ export function Prompts({ prompts, project, ticket, milestone, only }: {
           );
         })}
       </div>
-      <p className="mt-1 text-[11px] text-muted">Copies a prompt for your chat. Hover a button to preview.</p>
+      <p className="mt-1 text-[11px] text-muted">Copies text to your clipboard only. Hover a button to preview.</p>
     </div>
   );
 }

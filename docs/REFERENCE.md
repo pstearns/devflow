@@ -220,7 +220,7 @@ For a project whose required CI is a GitHub Actions job, set `ciActionsWorkflow`
 1. Enable Triage for the Linear team or add a workflow status named **Triage**. DevFlow reads the team's status options from Linear.
 2. Move the issue to **Triage** in Linear or through **Change status** in DevFlow. It appears in Attention and is held from dispatch. An active run checks for Triage before further agent calls and branch or PR writes. Work already in progress can finish before the next check.
 3. Copy **Triage ticket** from the issue and paste it into the orchestrator chat. Use the Linear issue, blocking relations, retained run evidence, and linked draft PR to diagnose the stop. Record the smallest in-scope change and verification steps. Keep credentials and raw private logs out of shared updates.
-4. Once the blocker is resolved or the revised ticket is ready, use **Approve for execution**. Dispatch it with `npm run orchestrate -- run <ISSUE>` after the earlier run exits. This starts a fresh run and creates its own draft PR if it reaches publication. Check the previous draft during triage so the owner knows which PR to review.
+4. Once the blocker is resolved or the revised ticket is ready, use **Approve for execution**. Dispatch it with `npm run orchestrate -- run <ISSUE>` after the earlier run exits. The controller requires Ready to have been added after the most recent Triage transition. If you moved the issue directly in Linear, remove the old Ready label and add it again after leaving Triage. The run creates its own draft PR if it reaches publication. Check the previous draft during triage so the owner knows which PR to review.
 
 ### Evidence retention and cleanup (`npm run orchestrate -- prune [--apply]` / `verify`)
 

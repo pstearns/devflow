@@ -6,6 +6,7 @@ import { LinearClient, discoverTeams, fetchLinearIssue, fetchTeamData, type Team
 import { configuredTeamKeys, repoOwners } from './scope.ts';
 import { buildSnapshot } from './snapshot.ts';
 import { runActivity } from './orchestrator/activity.ts';
+import { TERMINAL } from './orchestrator/types.ts';
 import { SourceError, clampResume, requestScope } from './util.ts';
 
 const REFRESH_DEADLINE_MS = 90_000;
@@ -104,7 +105,7 @@ export class SnapshotService {
   activityFeed(): RunActivityFeedEntry[] {
     const snapshot = this.peek();
     if (this.mode !== 'live' || !snapshot) return [];
-    const candidates = new Map<string, string>();
+    const candidates = new Set<string>();
     for (const project of this.cfg.projects) {
       if (!project.orchestration) continue;
       const issues = new Set(snapshot.issues.filter((issue) => issue.configProjectId === project.id && issue.state.type !== 'completed' && issue.state.type !== 'canceled').map((issue) => issue.identifier));
@@ -114,17 +115,18 @@ export class SnapshotService {
           if (!entry.isDirectory()) continue;
           const match = /^([A-Z][A-Z0-9]{0,9}-\d{1,7})-([a-z0-9]{6,24})$/.exec(entry.name);
           if (!match) continue;
-          const identifier = match[1]!, runId = match[2]!;
-          if (issues.has(identifier) && runId > (candidates.get(identifier) ?? '')) candidates.set(identifier, runId);
+          const identifier = match[1]!;
+          if (issues.has(identifier)) candidates.add(identifier);
         }
       } catch { /* This project's local evidence is currently unavailable. */ }
     }
-    return [...candidates].sort((a, b) => b[1].localeCompare(a[1])).slice(0, 12).flatMap(([identifier]) => {
+    const runs = [...candidates].flatMap((identifier) => {
       try {
         const run = this.activity(identifier);
-        return run?.runId ? [{ identifier, ...run, events: run.events.slice(-4) }] : [];
+        return run?.runId && run.state ? [{ identifier, ...run, runId: run.runId, state: run.state, events: run.events.slice(-4) }] : [];
       } catch { return []; }
     });
+    return runs.sort((a, b) => Number(TERMINAL.some((state) => state === a.state)) - Number(TERMINAL.some((state) => state === b.state)) || b.runId.localeCompare(a.runId)).slice(0, 12);
   }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {
