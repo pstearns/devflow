@@ -232,6 +232,13 @@ describe('workflow status changes', () => {
     expect(spec('ATL-7').labels).toContain('Ready');
     expect(spec('ATL-7').state).toBe('Todo');
   });
+  it('continues reapproval when the old Ready removal succeeded before the response was lost', async () => {
+    const { actions, spec } = await setup({ lostResponse: (op) => op === 'IssueRemoveLabel' });
+    await actions.status('ATL-7', 'st-ATL-triage');
+    expect((await actions.approve('ATL-7', 'ATL-7')).ok).toBe(true);
+    expect(spec('ATL-7').state).toBe('Todo');
+    expect(spec('ATL-7').labels).toContain('Ready');
+  });
   it('Done works with or without a merged PR (non-code tickets have none)', async () => {
     const { actions, spec } = await setup();
     expect((await actions.status('ATL-16', 'st-ATL-done')).ok).toBe(true); // a documentation ticket: no PR at all

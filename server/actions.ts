@@ -308,20 +308,31 @@ export class LinearActions {
       const todo = findTodo(ctx, wf)!;
       const readyLabel = ctx.teamLabels.find((l) => low(l.name) === low(wf.readyLabel) && !l.isGroup)!;
       const ready = hasReady(ctx, wf);
-      const renew = ready && (isTriageState(ctx.state) || (await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel)).stale);
+      const fromTriage = isTriageState(ctx.state);
+      const history = ready || fromTriage ? await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel) : undefined;
+      const renew = ready && (fromTriage || history?.stale === true);
       let cleared = !renew;
       let failure: unknown;
       try {
         if (renew) {
-          await w.removeLabel(ctx.id, readyLabel.id);
-          if (hasReady(await this.load(identifier, false), wf)) throw new Error('Linear did not clear the previous Ready label');
+          let removeFailure: unknown;
+          try { await w.removeLabel(ctx.id, readyLabel.id); } catch (error) { removeFailure = error; }
+          if (hasReady(await this.load(identifier, false), wf)) throw removeFailure ?? new Error('Linear did not clear the previous Ready label');
           cleared = true;
         }
         if (ctx.state.id !== todo.id) await w.setState(ctx.id, todo.id);
         if (renew || !ready) await w.addLabel(ctx.id, readyLabel.id);
       } catch (e) { failure = e; }
       const after = await this.tryLoad(identifier);
-      if (cleared && after && after.state.id === todo.id && hasReady(after, wf)) return this.finish(identifier, `${ctx.identifier} approved for execution: ${todo.name} + ${readyLabel.name}, verified in Linear`);
+      if (cleared && after && after.state.id === todo.id && hasReady(after, wf)) {
+        if (fromTriage || renew) {
+          const confirmed = await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel);
+          if (confirmed.stale || !confirmed.approval.at || confirmed.approval.at === history?.approval.at) {
+            throw new ActionError(502, 'approval-history-unconfirmed', 'Linear shows Todo and Ready, but the new approval is not yet confirmed in its history.');
+          }
+        }
+        return this.finish(identifier, `${ctx.identifier} approved for execution: ${todo.name} + ${readyLabel.name}, verified in Linear`);
+      }
       throw this.notConfirmed('Approval', failure, after);
     });
   }

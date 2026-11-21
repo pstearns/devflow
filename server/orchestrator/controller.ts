@@ -105,7 +105,7 @@ export class Orchestrator {
     const state = (name: string) => ctx.states.find((s) => low(s.name) === low(name));
     const started = state(oc.startedState), approval = state(oc.approvalState), blocked = state(oc.blockedState);
     if (!started || started.type !== 'started' || isTriageState(started)) throw new Rejected(`State "${oc.startedState}" must be a started-type execution state outside Triage in team ${ctx.teamKey}`);
-    if (!approval || isResolvedType(approval.type)) throw new Rejected(`State "${oc.approvalState}" must exist and must not be a completed/canceled state: DevFlow never completes work itself`);
+    if (!approval || isResolvedType(approval.type) || isTriageState(approval)) throw new Rejected(`State "${oc.approvalState}" must exist outside Triage and must not be a completed/canceled state`);
     if (!blocked || isResolvedType(blocked.type)) throw new Rejected(`State "${oc.blockedState}" must exist (and not be completed/canceled) so an escalation can always be recorded; create it in Linear or set orchestration.blockedState`);
     return { oc, started, approval, blocked, projectId: sc.configProject.id, scopeText: `team ${ctx.teamKey}${ctx.project ? ` / project "${ctx.project.name}"` : ''}, workflow readiness label "${sc.workflow.readyLabel}"`, readyLabel: sc.workflow.readyLabel };
   }
