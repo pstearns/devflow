@@ -1,10 +1,10 @@
-import type { Snapshot, SourceHealth } from '../shared/types.ts';
+import type { RunActivityFeedEntry, Snapshot, SourceHealth } from '../shared/types.ts';
 import type { Config } from './config.ts';
 import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, isFreshPrFor, normalizePr, type Denied, type RepoData } from './github.ts';
 import { LinearClient, discoverTeams, fetchLinearIssue, fetchTeamData, type TeamData, type TeamRef } from './linear.ts';
 import { configuredTeamKeys, repoOwners } from './scope.ts';
 import { buildSnapshot } from './snapshot.ts';
-import { runActivity } from './orchestrator/activity.ts';
+import { runActivity, runActivityFeed } from './orchestrator/activity.ts';
 import { SourceError, clampResume, requestScope } from './util.ts';
 
 const REFRESH_DEADLINE_MS = 90_000;
@@ -25,6 +25,7 @@ export class SnapshotService {
   private backoff = new Map<string, number>(); // credential ('linear' | 'github') -> epoch ms until which we make no calls
   private health: SourceHealth[] = [];
   private last?: { snap: Snapshot; at: number };
+  private activityFeedCache?: { snapshot: Snapshot; expiresAt: number; entries: Promise<RunActivityFeedEntry[]> };
   private inflight?: Promise<Snapshot>;
   private inflightSince?: number;
   private issueInflight = new Map<string, Promise<Snapshot>>();
@@ -97,6 +98,30 @@ export class SnapshotService {
     const orchestration = project?.orchestration;
     if (!project || !orchestration) return undefined;
     return runActivity(orchestration.runsDir, issue, project.id, orchestration.repo);
+  }
+
+  /** Unfinished tickets with local orchestration evidence, scoped to issues the dashboard can see. */
+  async activityFeed(): Promise<RunActivityFeedEntry[]> {
+    const snapshot = this.peek();
+    if (this.mode !== 'live' || !snapshot) return [];
+    const now = this.clock();
+    const cached = this.activityFeedCache;
+    if (cached?.snapshot === snapshot && now < cached.expiresAt) return cached.entries;
+    const entries = runActivityFeed(this.cfg.projects.flatMap((project) => {
+      const orchestration = project.orchestration;
+      if (!orchestration) return [];
+      const issues = new Map(snapshot.issues.filter((issue) => issue.configProjectId === project.id
+        && issue.state.type !== 'completed' && issue.state.type !== 'canceled').map((issue) => [issue.identifier, issue.id]));
+      return issues.size ? [{ runsDir: orchestration.runsDir, project: project.id, repo: orchestration.repo, issues }] : [];
+    }));
+    const next = { snapshot, expiresAt: Infinity, entries };
+    this.activityFeedCache = next;
+    try { return await entries; }
+    catch (error) {
+      if (this.activityFeedCache === next) this.activityFeedCache = undefined;
+      throw error;
+    }
+    finally { next.expiresAt = this.clock() + 2_000; }
   }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {

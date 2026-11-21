@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Lifecycle } from './components/Lifecycle.tsx';
+import { RunActivityFeed } from './components/RunActivity.tsx';
 import { ScopeDetail, TicketDetail } from './components/Detail.tsx';
 import { Time, btn, select } from './components/ui.tsx';
 import type { Snapshot } from '../../shared/types.ts';
@@ -163,7 +164,12 @@ export function App() {
 
       {snap && <div className="border-b border-line px-4 py-2"><Lifecycle issues={issues} /></div>}
 
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 max-md:flex-col">
+        {snap?.mode === 'live' && (route.view === 'overview' || route.view === 'pipeline') && (
+          <aside className={`w-64 shrink-0 overflow-auto border-b border-line bg-bg p-2 max-md:max-h-64 max-md:w-full md:border-r ${panelOpen ? 'md:max-xl:hidden' : ''}`} aria-label="Live runs">
+            <RunActivityFeed onOpen={openTicket} pauseOnTablet={panelOpen} />
+          </aside>
+        )}
         <main className="min-w-0 flex-1 overflow-auto p-4">
           {!snap ? (
             <p className="text-muted">{live.error ? 'No data yet.' : 'Loading…'}</p>

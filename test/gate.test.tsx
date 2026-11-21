@@ -33,7 +33,7 @@ describe('demo configuration carries a synthetic critical path', () => {
 
 describe('Next milestone blocker card renders', () => {
   const STATES: [MilestoneGate['state'], string, string | undefined][] = [
-    ['blocked', 'Blocked', 'BCN-2'], ['needs-authorization', 'Needs authorization', 'ATL-17'], ['executable', 'Executable', 'ATL-7'],
+    ['blocked', 'Blocked', 'BCN-2'], ['needs-authorization', 'Needs authorization', 'ATL-17'], ['executable', 'Ready in Linear', 'ATL-7'],
     ['in-flight', 'In flight', 'ATL-3'], ['unknown', 'Unknown', undefined], ['clear', 'Clear', undefined],
   ];
   it.each(STATES)('%s: label, labelled region, and a ticket link only when one can advance the milestone', async (state, label, ticket) => {

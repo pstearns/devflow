@@ -45,7 +45,7 @@ export function Pipeline({ snap, issues: all, onOpen, now, route, go, sel, onRes
       <div className="flex flex-wrap items-center gap-2">
         <LabelFilter labels={labelDefs} selected={selected} onChange={(n) => go({ params: { labels: n.join(',') } })} />
         {selected.length > 0 && <span className="text-[12px] text-muted">Showing {issues.length} of {all.length} tickets with any of: {selected.join(', ')}</span>}
-        <span className="ml-auto text-[11px] text-muted">Stages come from Linear state/labels and verified GitHub evidence. Classification labels (Bug, Idea…) are separate from stages.</span>
+        <span className="ml-auto text-[11px] text-muted">Stages come from Linear state/labels and verified GitHub evidence. DevFlow verifies fresh approval and Triage history at dispatch.</span>
       </div>
       <div className="flex gap-2 overflow-x-auto pb-2">
         {STAGES.map((s) => {

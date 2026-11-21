@@ -21,24 +21,48 @@ describe('run activity', () => {
       mkdirSync(dir);
       writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
         ticket: 'PS-8', issueId: 'issue-8', project: 'pilot', repo: 'owner/repo', runId: 'abc123',
-        createdAt: at, state: 'repairing', attempts: [{ n: 0, review: { findings: 1 } }],
+        createdAt: at, state: 'repairing', attempts: [{ n: 0, review: { findings: 1 } }, { n: 1, headSha: 'b'.repeat(40) }],
       }));
       writeFileSync(join(dir, 'events.jsonl'), [
         { at, what: 'state:reviewing', sha: 'a'.repeat(40) },
         { at, what: 'review-validated', verdict: 'FAIL', attempt: 0, detail: 'private agent output' },
         { at, what: 'infra-failure', detail: 'private diagnostic' },
-        { at, what: 'state:repairing' },
+        { at, what: 'state:repairing', attempt: 1 },
       ].map((row) => JSON.stringify(row)).join('\n') + '\n' + JSON.stringify({ at, what: 'state:awaiting-owner' }));
       const issue = { identifier: 'PS-8', id: 'issue-8' };
       const activity = runActivity(root, issue, 'pilot', 'owner/repo');
       expect(activity.activeAgent).toBe('claude');
       expect(activity.events.map((e) => [e.actor, e.title, e.detail])).toEqual([
-        ['codex', 'Codex received the verified commit', 'aaaaaaaaaaaa'],
-        ['codex', 'Codex sent findings to DevFlow', '1 finding'],
-        ['claude', 'Claude received a repair request', undefined],
+        ['codex', 'Preparing Codex review', 'aaaaaaaaaaaa'],
+        ['codex', 'Codex sent findings to DevFlow', '1 finding · Initial attempt'],
+        ['claude', 'Preparing Claude repair', 'Repair 1'],
       ]);
       expect(runActivity(root, issue, 'other', 'owner/repo').runId).toBeNull();
       expect(runActivity(root, { ...issue, id: 'other' }, 'pilot', 'owner/repo').runId).toBeNull();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('keeps older active runs ahead of newer terminal history in the capped feed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'devflow-feed-'));
+    try {
+      const config = parseConfig({ projects: [{
+        id: 'pilot', name: 'Pilot', linear: { teamKey: 'PS' }, github: { repos: ['owner/repo'] },
+        orchestration: { repo: 'owner/repo', repoPath: '/fixture/repo', runsDir: root, claude: { bin: '/fixture/claude' }, codex: { bin: '/fixture/codex' } },
+      }] });
+      const service = new SnapshotService(config, {});
+      const issues = Array.from({ length: 13 }, (_, i) => {
+        const identifier = `PS-${i + 1}`, id = `issue-${i}`, runId = `aaa${String(i).padStart(3, '0')}`;
+        const dir = join(root, `${identifier}-${runId}`);
+        mkdirSync(dir);
+        writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+          ticket: identifier, issueId: id, project: 'pilot', repo: 'owner/repo', runId, createdAt: at, state: i === 0 ? 'ci' : 'escalated',
+        }));
+        return { identifier, id, configProjectId: 'pilot', state: { type: 'started' } };
+      });
+      vi.spyOn(service, 'peek').mockReturnValue({ issues } as NonNullable<ReturnType<typeof service.peek>>);
+      const feed = await service.activityFeed();
+      expect(feed).toHaveLength(12);
+      expect(feed[0]).toMatchObject({ identifier: 'PS-1', state: 'ci' });
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -47,6 +71,8 @@ describe('run activity', () => {
     const service = new SnapshotService(parseConfig({ projects: [] }), {});
     const activity = { runId: 'abc123', state: 'ci', activeAgent: null, events: [] };
     const projection = vi.spyOn(service, 'activity').mockReturnValue(activity);
+    const feed = [{ identifier: 'PS-8', ...activity }];
+    vi.spyOn(service, 'activityFeed').mockResolvedValue(feed);
     const reviewing = { ...activity, state: 'reviewing', activeAgent: 'codex' as const };
     const app = await buildApp(service, { auth, distDir: '/none' });
     try {
@@ -55,8 +81,8 @@ describe('run activity', () => {
       expect((await app.inject({ url: path, headers: { ...signed.headers, 'sec-fetch-site': 'cross-site' } })).statusCode).toBe(403);
       await app.listen({ host: '127.0.0.1', port: 0 });
       const port = (app.server.address() as AddressInfo).port;
-      const read = (onFirst: () => void | Promise<unknown>, until: string) => new Promise<string>((resolve, reject) => {
-        const req = request({ port, host: '127.0.0.1', path, headers: { host: 'devflow.localhost:4317', cookie: signed.cookie } }, (res) => {
+      const read = (onFirst: () => void | Promise<unknown>, until: string, route = path) => new Promise<string>((resolve, reject) => {
+        const req = request({ port, host: '127.0.0.1', path: route, headers: { host: 'devflow.localhost:4317', cookie: signed.cookie } }, (res) => {
           let data = '';
           let first = true;
           res.setEncoding('utf8');
@@ -75,6 +101,10 @@ describe('run activity', () => {
         req.on('error', reject);
         req.end();
       });
+      expect((await app.inject({ url: '/api/run-activity', headers: { host: 'devflow.localhost:4317' } })).statusCode).toBe(401);
+      const feedResponse = await app.inject({ url: '/api/run-activity', headers: signed.headers });
+      expect(feedResponse.statusCode).toBe(200);
+      expect(feedResponse.json()).toEqual(feed);
       const first = await read(() => {}, JSON.stringify(activity));
       const live = await read(() => { projection.mockReturnValue(reviewing); }, JSON.stringify(reviewing));
       const replay = await read(() => signed.post('/api/auth/logout', {}), 'event: unavailable');

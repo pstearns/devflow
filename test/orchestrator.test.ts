@@ -21,6 +21,72 @@ const PASS_POSTED = (w: ReturnType<typeof makeWorld>) => w.comments().some((b) =
 const stateOf = (w: ReturnType<typeof makeWorld>) => w.issue().state;
 const runDir = (w: ReturnType<typeof makeWorld>, id: string) => join(w.runsDir, `${id}-${w.store().runsFor(id)[0]!.runId}`);
 
+describe('Triage authorization', () => {
+  const triage = { createdAt: '2026-06-01T09:00:00Z', fromState: { name: 'Triage', type: 'started' }, toState: { name: 'Todo', type: 'unstarted' } };
+  it('refuses stale Ready approval after the ticket leaves Triage in Linear', async () => {
+    const w = world({ linearOpts: { authorizerHistory: [
+      triage, { createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] },
+    ] } });
+    await expect(w.orch.run('ATL-22')).rejects.toThrow('fresh Ready approval');
+    expect(w.f.store.mutations).toEqual([]);
+  });
+  it('stops a prior run after a transient Triage hold even if the live status was restored', async () => {
+    const history: { createdAt: string; [field: string]: unknown }[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
+    const w = world({
+      scenario: 'correct-first', linearOpts: { authorizerHistory: history },
+      wrapAgents: (inner) => ({
+        preflight: () => inner.preflight(), review: (o) => inner.review(o),
+        implement: async (o) => {
+          const result = await inner.implement(o);
+          history.push({ createdAt: '2026-06-01T09:00:00Z', toState: { name: 'Triage', type: 'triage' } });
+          return result;
+        },
+      }),
+    });
+    const result = await w.orch.run('ATL-22');
+    expect(result.reasonClass).toBe('ticket-changed');
+    expect(w.prs.created).toHaveLength(0);
+  });
+  it('does not advance a reviewed run if the ticket briefly entered Triage during review', async () => {
+    const history: { createdAt: string; [field: string]: unknown }[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
+    const w = world({
+      scenario: 'correct-first', linearOpts: { authorizerHistory: history },
+      wrapAgents: (inner) => ({
+        preflight: () => inner.preflight(), implement: (o) => inner.implement(o),
+        review: async (o) => {
+          const result = await inner.review(o);
+          history.push({ createdAt: '2026-06-01T09:00:00Z', toState: { name: 'Triage', type: 'triage' } });
+          return result;
+        },
+      }),
+    });
+    const result = await w.orch.run('ATL-22');
+    expect(result.reasonClass).toBe('ticket-changed');
+    expect(result.approvedSha).toBeUndefined();
+    expect(stateOf(w)).toBe('In Progress');
+  });
+  it('leaves a live Triage hold in place if it arrives during the final CI read', async () => {
+    const w = world({ scenario: 'correct-first' });
+    const snapshot = w.ci.snapshot.bind(w.ci);
+    let reads = 0;
+    w.ci.snapshot = async (...args) => {
+      const result = await snapshot(...args);
+      if (++reads === 2) w.issue().state = 'Triage';
+      return result;
+    };
+    const result = await w.orch.run('ATL-22');
+    expect(result.reasonClass).toBe('ticket-changed');
+    expect(result.approvedSha).toBeUndefined();
+    expect(stateOf(w)).toBe('Triage');
+  });
+  it('uses the approval recorded after Triage', async () => {
+    const w = world({ scenario: 'correct-first', linearOpts: { authorizerHistory: [
+      triage, { createdAt: '2026-06-01T10:00:00Z', actor: { name: 'Fresh Owner' }, addedLabels: [{ name: 'Ready' }] },
+    ] } });
+    expect((await w.orch.run('ATL-22')).authorizedBy).toBe('Fresh Owner');
+  });
+});
+
 describe('M1 acceptance: defect -> findings -> repair -> verified -> owner approval', () => {
   it('Claude implements, Codex finds the planted defect, Claude repairs, CI + Codex verify the new SHA, Linear records it, run stops at approval', async () => {
     const w = world();

@@ -10,7 +10,7 @@ import { basename, join, resolve, sep } from 'node:path';
 import type { Config, OrchestrationCfg } from '../config.ts';
 import { resolveScope } from '../scope.ts';
 import { Q_ACTION_ISSUE, hasReady, isResolvedType, parseCtx, type Ctx } from '../actions.ts';
-import type { LinearClient } from '../linear.ts';
+import { isTriageState, readReadyHistory, type LinearClient } from '../linear.ts';
 import { MAX_COMMENT, type LinearWriteClient } from '../linear-write.ts';
 import { isObj, nodes, str } from '../util.ts';
 import { infraProblem, type AgentRunner, type ProcResult } from './agents.ts';
@@ -55,7 +55,6 @@ export interface Deps {
 const low = (s: string) => s.toLowerCase();
 const clip = A.clip;
 const IDENT = /^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/;
-export const Q_AUTHORIZER = 'query Authorizer($id: String!) { issue(id: $id) { history(first: 50) { nodes { createdAt actor { name } addedLabels { name } } } } }';
 
 /**
  * Files the implementer may not touch: CI definitions and every file an agent or tool would treat as configuration/instructions. A commit
@@ -75,7 +74,7 @@ export const isProtectedPath = (f: string) => {
 type Auth = ReturnType<Orchestrator['authorize']>;
 
 export class Orchestrator {
-  private runs = new Map<string, { agents: AgentRunner; pinned: Pinned }>();
+  private runs = new Map<string, { agents: AgentRunner; pinned: Pinned; approvalAt?: string }>();
   constructor(private d: Deps) {}
   private ag(m: Manifest) { return this.runs.get(m.runId)!.agents; }
   /** Re-verifies the trusted policy NOW. Called inside every privileged closure, including each retry, so a long backoff cannot outlive the owner's authorization. */
@@ -97,6 +96,7 @@ export class Orchestrator {
     if (!sc.writeAllowed) throw new Rejected(`${ctx.identifier} is not authorized: ${sc.writeReason ?? 'its team/project is not enabled for writes'}`);
     const oc = sc.configProject?.orchestration;
     if (!sc.configProject || !oc) throw new Rejected(`${ctx.identifier}: its project has no "orchestration" configuration, so DevFlow will not execute it`);
+    if (isTriageState(ctx.state)) throw new Rejected(`${ctx.identifier} is on hold in Triage. Resolve the blocker and approve it for execution before dispatch.`);
     if (!hasReady(ctx, sc.workflow)) throw new Rejected(`${ctx.identifier} is not explicitly approved: it does not carry the "${sc.workflow.readyLabel}" label`);
     if (ctx.state.type !== 'unstarted') throw new Rejected(`${ctx.identifier} is in "${ctx.state.name}", not an unstarted state: it is already started, finished, or being executed`);
     if (!ctx.depsVerifiable) throw new Rejected(`${ctx.identifier}: blockers could not be fully read, so readiness cannot be confirmed`);
@@ -104,20 +104,18 @@ export class Orchestrator {
     if (!ctx.description.trim()) throw new Rejected(`${ctx.identifier} has no description to implement`);
     const state = (name: string) => ctx.states.find((s) => low(s.name) === low(name));
     const started = state(oc.startedState), approval = state(oc.approvalState), blocked = state(oc.blockedState);
-    if (!started || started.type !== 'started') throw new Rejected(`State "${oc.startedState}" does not exist as a started-type state in team ${ctx.teamKey}`);
-    if (!approval || isResolvedType(approval.type)) throw new Rejected(`State "${oc.approvalState}" must exist and must not be a completed/canceled state: DevFlow never completes work itself`);
+    if (!started || started.type !== 'started' || isTriageState(started)) throw new Rejected(`State "${oc.startedState}" must be a started-type execution state outside Triage in team ${ctx.teamKey}`);
+    if (!approval || isResolvedType(approval.type) || isTriageState(approval)) throw new Rejected(`State "${oc.approvalState}" must exist outside Triage and must not be a completed/canceled state`);
     if (!blocked || isResolvedType(blocked.type)) throw new Rejected(`State "${oc.blockedState}" must exist (and not be completed/canceled) so an escalation can always be recorded; create it in Linear or set orchestration.blockedState`);
     return { oc, started, approval, blocked, projectId: sc.configProject.id, scopeText: `team ${ctx.teamKey}${ctx.project ? ` / project "${ctx.project.name}"` : ''}, workflow readiness label "${sc.workflow.readyLabel}"`, readyLabel: sc.workflow.readyLabel };
   }
 
-  /** Who added the approval label, from Linear's own history. Best effort: unknown is reported as unknown, never guessed. */
-  private async authorizer(ticket: string, readyLabel: string): Promise<{ who?: string; at?: string }> {
-    try {
-      const data = await this.d.read.query(Q_AUTHORIZER, { id: ticket });
-      const hist = isObj(data.issue) ? nodes(data.issue.history, 50) : [];
-      const hit = hist.filter(isObj).filter((h) => nodes({ nodes: h.addedLabels }, 20).some((l) => isObj(l) && low(str(l.name, 100) ?? '') === low(readyLabel))).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
-      return hit ? { who: isObj(hit.actor) ? str(hit.actor.name, 100) : undefined, at: str(hit.createdAt, 40) } : {};
-    } catch { return {}; }
+  private async authorizer(ticket: string, readyLabel: string) {
+    let history: Awaited<ReturnType<typeof readReadyHistory>>;
+    try { history = await readReadyHistory(this.d.read, ticket, readyLabel); }
+    catch { throw new Rejected(`${ticket}: Linear approval history could not be verified`); }
+    if (history.stale) throw new Rejected(`${ticket}: fresh Ready approval is required after Triage`);
+    return history;
   }
 
   async run(identifierRaw: string): Promise<Manifest> {
@@ -137,6 +135,7 @@ export class Orchestrator {
       const auth = this.authorize(ctx);
       if (auth.projectId !== preAuth.projectId) throw new Rejected('the ticket moved to a different project while the run was being accepted');
       const oc = auth.oc;
+      const { approval: who } = await this.authorizer(ticket, auth.readyLabel);
       // Fail closed: if the owner's policy cannot be verified (wrong owner/mode, inside an agent-reachable tree, binary swapped...), nothing starts.
       const agents = this.d.agents(oc, auth.projectId);
       try { pinned = this.d.policy(oc, auth.projectId).pin(); } catch (e) { throw new Rejected(`Trusted policy could not be verified (fail closed): ${e instanceof Error ? e.message : 'unknown'}`); }
@@ -145,7 +144,6 @@ export class Orchestrator {
       if (!pf.ok) throw new Rejected(`Preflight failed (infrastructure; the ticket was not touched): ${pf.problems.join('; ')}`);
       await G.git(oc.repoPath, ['fetch', 'origin', oc.baseBranch], G.ambientEnv());
       const baseSha = await G.resolveRef(oc.repoPath, `origin/${oc.baseBranch}`);
-      const who = await this.authorizer(ticket, auth.readyLabel);
       m = {
         version: 1, runId, ticket, issueId: ctx.id, title: ctx.title, project: auth.projectId, repo: oc.repo, baseBranch: oc.baseBranch, baseSha,
         branch: `devflow/${ticket.toLowerCase()}-${runId}`, clone: '', state: 'accepted', attempts: [], linearCommentIds: [], infra: [],
@@ -154,12 +152,14 @@ export class Orchestrator {
         originalStateId: ctx.state.id, createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
       };
       m.clone = join(store.runDir(m), 'clone');
-      this.runs.set(runId, { agents, pinned });
+      this.runs.set(runId, { agents, pinned, approvalAt: who.at });
       const protectedBase = await this.d.prs.baseProtected?.(oc.repo, oc.baseBranch).catch(() => undefined);
       this.save(store, m, 'accepted', { baseSha, preflight: pf.detail, baseBranchProtected: protectedBase ?? 'unknown', policyDigest: pinned.digest, authorizedBy: who.who ?? 'unknown' });
       // Leaving the unstarted state is what makes a second dispatch (by any controller) fail acceptance.
       await this.infra(store, m, 'linear-start', async () => {
-        const fresh = this.authorize(await this.load(ticket)); // the owner may have revoked or moved the ticket while preflight and git were running
+        const freshHistory = await this.authorizer(ticket, auth.readyLabel);
+        if (freshHistory.approval.at !== who.at || freshHistory.approval.who !== who.who) throw new Rejected('Ready approval changed before the run started');
+        const fresh = this.authorize(await this.load(ticket));
         if (fresh.projectId !== auth.projectId) throw new Rejected('the ticket moved to a different project before the run started');
         this.verifyPin(m!);
         await this.d.write.setState(ctx.id, auth.started.id);
@@ -172,6 +172,7 @@ export class Orchestrator {
       return await this.loop(store, m, ctx, auth, pinned);
     } catch (e) {
       if (!m) { store.release(ticket, runId); throw e; } // rejected before any state existed
+      if (e instanceof TicketChanged) return this.escalate(store, m, 'ticket-changed', e.message);
       if (e instanceof Rejected) return this.escalate(store, m, 'ticket-changed', `Authorization changed before the run could start: ${e.message}`);
       if (e instanceof PolicyError) return this.escalate(store, m, 'policy-violation', `Trusted controller policy failed verification: ${e.message}. Nothing further was executed.`);
       if (e instanceof InfraError) return this.escalate(store, m, 'infrastructure', `Infrastructure failure at "${e.step}": ${e.message}. No repair attempt was consumed; the code was not judged.`, `Infrastructure failure at step "${e.step}" after ${m.infra.filter((i) => i.step === e.step).length} attempt(s). The diagnostic is in the retained evidence only. No repair attempt was consumed; the code was not judged.`);
@@ -195,6 +196,18 @@ export class Orchestrator {
   }
   private recordInfra(store: RunStore, m: Manifest, step: string, detail: string) {
     m.infra.push({ at: this.at(), step, detail }); this.save(store, m, 'infra-failure', { step, detail });
+  }
+
+  private async checkTriage(m: Manifest): Promise<Ctx> {
+    const project = this.d.cfg.projects.find((item) => item.id === m.project);
+    const baseline = this.runs.get(m.runId);
+    if (!project || !baseline) throw new TicketChanged(`${m.ticket}: Triage approval baseline is unavailable`);
+    const history = await readReadyHistory(this.d.read, m.ticket, project.workflow.readyLabel);
+    const live = await this.load(m.ticket);
+    if (history.stale || history.approval.at !== baseline.approvalAt || isTriageState(live.state)) {
+      throw new TicketChanged(`${m.ticket} changed Triage history during the run`);
+    }
+    return live;
   }
 
   // ---------------------------------------------------------------- the loop (n counts REPAIR attempts only)
@@ -229,12 +242,15 @@ export class Orchestrator {
 
       // 3. push, confirm the REMOTE has exactly this SHA, ensure a DRAFT PR, confirm GitHub's PR head is this SHA
       await this.infra(store, m, 'push', async () => {
+        await this.checkTriage(m);
+        this.verifyPin(m);
         await G.pushRef(oc.repoPath, this.ref(m, n), m.branch, m.repo, this.d.pushToken, await this.d.gitHost?.());
         const remote = await this.remoteHead(m);
         if (remote !== sha) throw new Error(`remote branch is at ${remote?.slice(0, 12) ?? 'nothing'} after push, expected ${sha.slice(0, 12)}`);
       });
       await this.infra(store, m, 'pull-request', async () => {
         if (!m.pr) {
+          await this.checkTriage(m);
           this.verifyPin(m);
           const pr = await this.d.prs.ensureDraft(m.repo, { branch: m.branch, base: m.baseBranch, title: `${m.ticket}: ${m.title}`.slice(0, 250), body: prBody(m) });
           m.pr = { ...pr, draft: true }; this.save(store, m, 'pr-created', { number: pr.number });
@@ -263,6 +279,7 @@ export class Orchestrator {
       const outcome = await this.review(store, m, a, ctx, oc, sha);
       if ('fail' in outcome) return this.escalate(store, m, outcome.cls, outcome.fail);
       const review = outcome.review;
+      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
 
       // 6. The reviewer's verdict is a CLAIM. The controller's own gate decides whether it may be published or advance anything.
       this.state(store, m, 'publishing', { attempt: n, sha });
@@ -305,6 +322,7 @@ export class Orchestrator {
 
   private async runClaude(store: RunStore, m: Manifest, a: AttemptRecord, oc: OrchestrationCfg, prompt: string, dir: string): Promise<ProcResult> {
     for (let i = 0; ; i++) {
+      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
       this.verifyPin(m);
       const res = await this.ag(m).implement({ clone: m.clone, prompt, timeoutMs: oc.agentTimeoutMinutes * 60_000, bundle: { branch: m.branch, exclude: a.startSha } });
       const log = store.evidence(m, `${dir}/claude-output${i ? `-retry${i}` : ''}.txt`, logOf(res));
@@ -362,6 +380,7 @@ export class Orchestrator {
       const before = G.hashDir(rdir);
       const prompt = reviewPrompt(ctx, sha, nonce);
       store.evidence(m, `attempt-${a.n}/codex-prompt${suffix}.txt`, prompt);
+      await this.infra(store, m, 'triage-check', () => this.checkTriage(m));
       this.verifyPin(m);
       const res = await this.ag(m).review({ snapshot: rdir, outDir: out, prompt, schemaPath, timeoutMs: oc.agentTimeoutMinutes * 60_000 });
       const rawRef = store.evidence(m, `attempt-${a.n}/codex-output${suffix}.txt`, logOf(res));
@@ -411,16 +430,18 @@ export class Orchestrator {
     try {
       // Revalidated inside EVERY approval attempt: a retry after backoff must not overwrite a state the owner changed in the meantime.
       await this.infra(store, m, 'linear-approval', async () => {
-        const live = await this.load(m.ticket);
-        const bad = this.liveProblem(live, m) ?? (live.state.id !== auth.started.id ? `the ticket is in "${live.state.name}", not the in-progress state DevFlow put it in` : undefined);
-        if (bad) throw new TicketChanged(bad);
         // the review gate is re-run on every attempt, immediately before the transition: a retry must not ride a stale gate
         const remote = await this.remoteHead(m);
         if (remote !== sha) throw new GateChanged(`the remote branch moved to ${remote?.slice(0, 12) ?? 'nothing'} before approval (reviewed ${sha.slice(0, 12)})`);
         const prBad = m.pr ? prProblem(m, await this.d.prs.inspect(m.repo, m.pr.number), sha) : 'no pull request recorded';
         if (prBad) throw new GateChanged(prBad);
+        const held = this.liveProblem(await this.checkTriage(m), m);
+        if (held) throw new TicketChanged(held);
         const ci = await this.d.ci.snapshot(m.repo, sha, { required: auth.oc.ciChecks, actionsWorkflow: auth.oc.ciActionsWorkflow, branch: m.branch }); // check results are not immutable: re-read them on every approval attempt
         if (ci.state !== 'success') throw new GateChanged(`CI is no longer green on ${sha.slice(0, 12)}: ${ci.detail}`);
+        const live = await this.load(m.ticket);
+        const bad = this.liveProblem(live, m);
+        if (bad) throw new TicketChanged(bad);
         this.verifyPin(m); // after ALL the awaited reads, immediately before the privileged write
         await this.d.write.setState(m.issueId, auth.approval.id);
       });
@@ -454,11 +475,19 @@ export class Orchestrator {
     this.state(store, m, 'escalated', { reason, class: cls });
     let leftAlone: string | undefined;
     try {
-      const live = await this.load(m.ticket);
-      const changed = cls === 'ticket-changed' ? 'the ticket changed during the run' : isResolvedType(live.state.type) ? 'the ticket was already closed' : this.liveProblem(live, m);
+      const live = cls === 'ticket-changed' ? undefined : await this.checkTriage(m);
+      const changed = !live ? 'the ticket changed during the run' : isResolvedType(live.state.type) ? 'the ticket was already closed' : this.liveProblem(live, m);
       if (changed) { m.blockedConfirmed = undefined; leftAlone = changed; store.event(m, this.at(), 'escalation-state-skipped', { why: changed }); } // the owner's change stands: DevFlow writes no state
       else { await this.d.write.setState(m.issueId, m.linearStates.blockedId); m.blockedConfirmed = (await this.load(m.ticket)).state.id === m.linearStates.blockedId; }
-    } catch (e) { m.blockedConfirmed = false; store.event(m, this.at(), 'blocked-transition-failed', { error: e instanceof Error ? e.message : 'unknown' }); }
+    } catch (e) {
+      if (e instanceof TicketChanged) {
+        leftAlone = e.message;
+        store.event(m, this.at(), 'escalation-state-skipped', { why: leftAlone });
+      } else {
+        m.blockedConfirmed = false;
+        store.event(m, this.at(), 'blocked-transition-failed', { error: e instanceof Error ? e.message : 'unknown' });
+      }
+    }
     try {
       await this.comment(store, m, m.attempts[m.attempts.length - 1], A.final(m, this.at(), { kind: 'escalated', summary: reason, reason: publicReason ?? reason, cls, evidenceRef: m.escalationEvidence, blockedConfirmed: m.blockedConfirmed, leftAlone }), true);
     } catch (e) { store.event(m, this.at(), 'escalation-comment-failed', { error: e instanceof Error ? e.message : 'unknown' }); }

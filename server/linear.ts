@@ -76,6 +76,41 @@ export function stateType(v: unknown): StateType {
   if (t === 'duplicate') return 'canceled'; // Linear's duplicate state is resolved, not open work
   return t === 'triage' || t === 'backlog' || t === 'unstarted' || t === 'started' || t === 'completed' || t === 'canceled' ? t : 'unknown';
 }
+export const isTriageState = (state: { type: StateType; name: string }) =>
+  state.type === 'triage' || (!['completed', 'canceled'].includes(state.type) && /^triage$/i.test(state.name));
+
+export const Q_AUTHORIZER = 'query Authorizer($id: String!, $after: String) { issue(id: $id) { history(first: 50, after: $after, orderBy: createdAt) { nodes { createdAt actor { name } addedLabels { name } fromState { name type } toState { name type } } pageInfo { hasNextPage endCursor } } } }';
+
+export async function readReadyHistory(client: Pick<LinearClient, 'query'>, ticket: string, readyLabel: string) {
+  const warnings: string[] = [];
+  const triage = (state: unknown) => isObj(state) && isTriageState({ name: str(state.name, 100) ?? '', type: stateType(state.type) });
+  let newestRelevant: number | undefined;
+  let previous = Infinity;
+  let stale = false;
+  let approval: { who?: string; at?: string } = {};
+  await paginate(client, Q_AUTHORIZER, { id: ticket }, (data) => isObj(data.issue) ? data.issue.history : undefined, warnings, 'approval history', (page) => {
+    for (const entry of page) {
+      if (!isObj(entry)) throw new SourceError('invalid', 'Linear approval history contains an invalid entry');
+      const at = str(entry.createdAt, 40);
+      const time = at ? Date.parse(at) : NaN;
+      if (!Number.isFinite(time) || time > previous) throw new SourceError('invalid', 'Linear approval history has invalid timestamps or ordering');
+      previous = time;
+      // Account for events at the same timestamp before deciding which happened last.
+      if (newestRelevant !== undefined && time < newestRelevant) return true;
+      const triageTransition = triage(entry.fromState) || triage(entry.toState);
+      const addedReady = nodes({ nodes: entry.addedLabels }, 100).some((label) =>
+        isObj(label) && str(label.name, 100)?.toLowerCase() === readyLabel.toLowerCase());
+      if (!triageTransition && !addedReady) continue;
+      newestRelevant = time;
+      if (triageTransition) stale = true;
+      if (addedReady) approval = { who: isObj(entry.actor) ? str(entry.actor.name, 100) : undefined, at };
+    }
+    return false;
+  });
+  if (warnings.length) throw new SourceError('invalid', 'Linear approval history is incomplete');
+  return { approval, stale };
+}
+
 export const isResolved = (t: StateType) => t === 'completed' || t === 'canceled';
 
 export function normalizeRef(raw: unknown): IssueRef | undefined {
@@ -165,7 +200,7 @@ export interface ProjectRef { id: string; name: string; slugId?: string; url?: s
 export interface TeamRef { id: string; key: string; name: string; projects: ProjectRef[] }
 
 export async function paginate(
-  client: LinearClient, query: string, vars: Record<string, unknown>, pick: (d: Record<string, unknown>) => unknown, warnings: string[], what: string,
+  client: Pick<LinearClient, 'query'>, query: string, vars: Record<string, unknown>, pick: (d: Record<string, unknown>) => unknown, warnings: string[], what: string, stopAfterPage?: (page: unknown[]) => boolean,
 ): Promise<unknown[]> {
   const out: unknown[] = [];
   let after: string | undefined;
@@ -187,7 +222,7 @@ export async function paginate(
       if (seen.has(pi.endCursor)) return partial('pagination cursor did not progress');
       seen.add(pi.endCursor);
     }
-    if (!pi.hasNextPage) return out;
+    if (stopAfterPage?.(conn.nodes) || !pi.hasNextPage) return out;
     if (pi.endCursor === null || conn.nodes.length === 0) return partial('pagination did not progress');
     after = pi.endCursor;
   }

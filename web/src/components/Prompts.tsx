@@ -8,7 +8,7 @@ export function Prompts({ prompts, project, ticket, milestone, only }: {
 }) {
   const [done, setDone] = useState<string>();
   const [failed, setFailed] = useState<string>();
-  const list = only ? prompts.filter((p) => only.includes(p.id)) : prompts;
+  const list = prompts.filter((p) => (!only || only.includes(p.id)) && (p.id !== 'triage' || ticket));
   return (
     <div>
       <div className="flex flex-wrap gap-1.5">
@@ -28,7 +28,7 @@ export function Prompts({ prompts, project, ticket, milestone, only }: {
           );
         })}
       </div>
-      <p className="mt-1 text-[11px] text-muted">Copies text to your clipboard only. DevFlow never runs agents. Hover a button to preview.</p>
+      <p className="mt-1 text-[11px] text-muted">Copies text to your clipboard only. Hover a button to preview.</p>
     </div>
   );
 }

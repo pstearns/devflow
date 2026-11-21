@@ -8,8 +8,8 @@ const H = 3600_000;
 const ago = (hours: number, now: number) => new Date(now - hours * H).toISOString();
 const day = (offsetDays: number, now: number) => new Date(now + offsetDays * 86400_000).toISOString().slice(0, 10);
 
-type StateType = 'backlog' | 'unstarted' | 'started' | 'completed' | 'canceled';
-const STATE_DEFS: [name: string, type: StateType][] = [['Backlog', 'backlog'], ['Todo', 'unstarted'], ['In Progress', 'started'], ['In Review', 'started'], ['Blocked', 'started'], ['Done', 'completed'], ['Canceled', 'canceled']];
+type StateType = 'triage' | 'backlog' | 'unstarted' | 'started' | 'completed' | 'canceled';
+const STATE_DEFS: [name: string, type: StateType][] = [['Backlog', 'backlog'], ['Todo', 'unstarted'], ['In Progress', 'started'], ['In Review', 'started'], ['Blocked', 'started'], ['Triage', 'triage'], ['Done', 'completed'], ['Canceled', 'canceled']];
 
 interface LabelSpec { id: string; name: string; color: string; isGroup?: boolean; parent?: string }
 // Workspace labels are shared by every team (same ids); each team also has its own label set with its own ids/names.
@@ -90,6 +90,7 @@ const MILESTONES: Record<string, { id: string; name: string; description: string
 const MILESTONE_PROJECT: Record<string, string> = { m1: 'lp-ATL', m2: 'lp-ATL', b1: 'lp-BCN', z1: 'lp-ZED' };
 
 export interface FakeLinearOpts {
+  authorizerHistory?: { createdAt: string; [field: string]: unknown }[];
   /** Make a named operation fail with a GraphQL error (used to test failure handling). */
   fail?: (op: string, vars: Record<string, any>) => boolean;
   /** Apply the mutation, then lose the response (a timeout after commit). Used to test ambiguous-outcome handling. */
@@ -111,6 +112,14 @@ export interface FakeLinearStore { issues: Record<string, IssueSpec[]>; mutation
 
 export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
   const store: FakeLinearStore = { issues: structuredClone(SEED), mutations: [], comments: [], viewer: 'Demo Owner' };
+  const readyHistory = new Map<string, boolean>();
+  const writtenHistory = new Map<string, { createdAt: string; [field: string]: unknown }[]>();
+  const recordHistory = (id: string, entry: Record<string, unknown>) => {
+    const key = id.replace(/^uuid-/, '');
+    const history = writtenHistory.get(key) ?? [];
+    history.push({ ...entry, createdAt: new Date(nowMs + store.mutations.length).toISOString() });
+    writtenHistory.set(key, history);
+  };
   const extras: LabelSpec[] = Array.from({ length: opts.extraLabels ?? 0 }, (_, k) => ({ id: `lbl-extra-${k + 1}`, name: `Extra label ${k + 1}`, color: '#8b97a7' }));
   const teamLabels = (team: string): LabelSpec[] => [...(TEAM_LABELS[team] ?? []), ...extras, ...WORKSPACE];
   const stateId = (team: string, name: string) => `st-${team}-${name.toLowerCase().replace(/\W+/g, '-')}`;
@@ -159,14 +168,22 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
       if (name === 'IssueAddLabel' || name === 'IssueRemoveLabel') {
         const { team, spec } = byUuid(String(v.id)); const l = teamLabels(team).find((x) => x.id === v.labelId); // labels of ANOTHER team are rejected, as Linear does
         if (!spec || !l) return err('Entity not found', 'INVALID_INPUT');
-        if (!noop) spec.labels = name === 'IssueAddLabel' ? [...new Set([...(spec.labels ?? []), l.name])] : (spec.labels ?? []).filter((x) => x !== l.name);
+        if (!noop) {
+          if (name === 'IssueAddLabel' && !spec.labels?.includes(l.name)) recordHistory(String(v.id), { actor: { name: store.viewer }, addedLabels: [{ name: l.name }] });
+          spec.labels = name === 'IssueAddLabel' ? [...new Set([...(spec.labels ?? []), l.name])] : (spec.labels ?? []).filter((x) => x !== l.name);
+        }
         return ok({ [name === 'IssueAddLabel' ? 'issueAddLabel' : 'issueRemoveLabel']: { success: true } });
       }
       if (name === 'IssueUpdate') {
         const { team, spec } = byUuid(String(v.id)); const input = v.input ?? {};
         if (!spec) return err('Entity not found', 'INVALID_INPUT');
         if (!noop) {
-          if ('stateId' in input) { const s = teamStates(team).find((x) => x.id === input.stateId); if (!s) return err('Invalid state', 'INVALID_INPUT'); spec.state = s.name; }
+          if ('stateId' in input) {
+            const s = teamStates(team).find((x) => x.id === input.stateId);
+            if (!s) return err('Invalid state', 'INVALID_INPUT');
+            if (s.name !== spec.state) recordHistory(String(v.id), { fromState: stateOf(team, spec.state), toState: s });
+            spec.state = s.name;
+          }
           if ('projectMilestoneId' in input) {
             if (input.projectMilestoneId !== null && MILESTONE_PROJECT[input.projectMilestoneId] !== projectOf(team, spec)) return err('Invalid milestone', 'INVALID_INPUT');
             spec.ms = input.projectMilestoneId ?? undefined;
@@ -204,8 +221,15 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
       return ok({ project: { projectMilestones: { nodes: (MILESTONES[team] ?? []).filter((m) => MILESTONE_PROJECT[m.id] === pid).map((m) => ({ id: m.id, name: m.name, description: m.description, targetDate: day(m.off, nowMs) })), pageInfo: { hasNextPage: false, endCursor: null } } } });
     }
     if (name === 'Authorizer') {
-      const { spec } = find(String(v.id));
-      return ok({ issue: spec ? { history: { nodes: (spec.labels ?? []).includes('Ready') ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }] : [] } } : null });
+      const identifier = String(v.id);
+      const { spec } = find(identifier);
+      if (!spec) return ok({ issue: null });
+      if (!readyHistory.has(identifier)) readyHistory.set(identifier, (spec.labels ?? []).includes('Ready'));
+      const seededApproval = readyHistory.get(identifier)
+        ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }]
+        : [];
+      const history = [...(opts.authorizerHistory ?? seededApproval), ...(writtenHistory.get(identifier) ?? [])].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      return ok({ issue: { history: { nodes: history, pageInfo: { hasNextPage: false, endCursor: null } } } });
     }
     if (name === 'IssueDetail') {
       const { team, spec } = find(String(v.id));

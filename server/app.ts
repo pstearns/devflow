@@ -199,9 +199,7 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
 
   const activityStreams = new Set<PassThrough>();
   app.addHook('preClose', async () => { for (const stream of activityStreams) stream.end(); });
-  app.get('/api/issue/:identifier/run-activity', { exposeHeadRoute: false }, async (req, reply) => {
-    const { identifier } = req.params as { identifier: string };
-    if (!/^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/.test(identifier)) return reply.code(400).send({ error: 'invalid identifier' });
+  const sendActivity = (req: FastifyRequest, reply: FastifyReply, read: () => unknown) => {
     reply.header('cache-control', 'no-store');
     if (activityStreams.size >= 8) return reply.code(503).send({ error: 'too many activity streams' });
     const { token } = sessions.get(req)!;
@@ -213,7 +211,7 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
       if (stream.destroyed || stream.writableEnded) return;
       try {
         if (!auth.validate(token, false).ok) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
-        const activity = service.activity(identifier);
+        const activity = read();
         if (!activity) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
         const next = JSON.stringify(activity);
         if (next !== previous) {
@@ -234,6 +232,16 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
     reply.type('text/event-stream; charset=utf-8').header('x-accel-buffering', 'no');
     setImmediate(update);
     return reply.send(stream);
+  };
+  app.get('/api/run-activity', { exposeHeadRoute: false }, async (req, reply) => {
+    reply.header('cache-control', 'no-store');
+    const entries = await service.activityFeed();
+    return auth.validate(sessions.get(req)!.token, false).ok ? entries : reply.code(401).send({ error: 'session expired' });
+  });
+  app.get('/api/issue/:identifier/run-activity', { exposeHeadRoute: false }, (req, reply) => {
+    const { identifier } = req.params as { identifier: string };
+    if (!/^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/.test(identifier)) return reply.code(400).send({ error: 'invalid identifier' });
+    return sendActivity(req, reply, () => service.activity(identifier));
   });
 
   // ---- controlled Linear actions: authenticated session + same-origin JSON + session-bound CSRF token ----------------
