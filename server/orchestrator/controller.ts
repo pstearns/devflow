@@ -246,7 +246,7 @@ export class Orchestrator {
 
       // 4. CI must be green on that exact SHA before a reviewer is spent
       this.state(store, m, 'ci', { attempt: n, sha });
-      const ci = await this.infra(store, m, 'ci', () => this.d.ci.wait(m.repo, sha, { required: oc.ciChecks, timeoutMs: oc.ciTimeoutMinutes * 60_000 }));
+      const ci = await this.infra(store, m, 'ci', () => this.d.ci.wait(m.repo, sha, { required: oc.ciChecks, actionsWorkflow: oc.ciActionsWorkflow, branch: m.branch, timeoutMs: oc.ciTimeoutMinutes * 60_000 }));
       a.ci = { state: ci.state, detail: ci.detail, evidence: store.evidence(m, `${dir}/ci.json`, JSON.stringify({ sha, ...ci }, null, 2)) };
       this.save(store, m, 'ci-result', { attempt: n, state: ci.state });
       if (ci.state === 'timeout') return this.escalate(store, m, 'ci-timeout', ci.detail); // no verdict at all: not something Claude can repair
@@ -286,7 +286,7 @@ export class Orchestrator {
     add('review is for this SHA', review.commit === sha && a.headSha === sha, `review ${review.commit.slice(0, 12)} vs commit ${sha.slice(0, 12)}`);
     add('CI green on this SHA', a.ci?.state === 'success', a.ci ? a.ci.state : 'no CI result recorded');
     let now: { state: string; detail: string } = { state: 'unreadable', detail: 'CI could not be re-read' };
-    try { now = await this.d.ci.snapshot(m.repo, sha, { required: oc.ciChecks }); } catch { /* reported below */ }
+    try { now = await this.d.ci.snapshot(m.repo, sha, { required: oc.ciChecks, actionsWorkflow: oc.ciActionsWorkflow, branch: m.branch }); } catch { /* reported below */ }
     add('CI still green when re-read', now.state === 'success', now.state === 'success' ? 'current check results are green' : `${now.state}: ${now.detail}`);
     const remote = await this.remoteHead(m);
     add('remote branch at this SHA', remote === sha, `remote ${remote?.slice(0, 12) ?? 'none'}`);
@@ -419,7 +419,7 @@ export class Orchestrator {
         if (remote !== sha) throw new GateChanged(`the remote branch moved to ${remote?.slice(0, 12) ?? 'nothing'} before approval (reviewed ${sha.slice(0, 12)})`);
         const prBad = m.pr ? prProblem(m, await this.d.prs.inspect(m.repo, m.pr.number), sha) : 'no pull request recorded';
         if (prBad) throw new GateChanged(prBad);
-        const ci = await this.d.ci.snapshot(m.repo, sha, { required: auth.oc.ciChecks }); // check results are not immutable: re-read them on every approval attempt
+        const ci = await this.d.ci.snapshot(m.repo, sha, { required: auth.oc.ciChecks, actionsWorkflow: auth.oc.ciActionsWorkflow, branch: m.branch }); // check results are not immutable: re-read them on every approval attempt
         if (ci.state !== 'success') throw new GateChanged(`CI is no longer green on ${sha.slice(0, 12)}: ${ci.detail}`);
         this.verifyPin(m); // after ALL the awaited reads, immediately before the privileged write
         await this.d.write.setState(m.issueId, auth.approval.id);
