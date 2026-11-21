@@ -22,13 +22,13 @@ const UNREADABLE_STATUSES: CheckItem = { name: 'commit-statuses', state: 'unknow
 export function evaluateChecks(items: CheckItem[], required: string[]): { state: 'success' | 'failure' | 'pending'; detail: string } {
   // Unreadable evidence is a completeness failure no matter which checks are named: a required name could be supplied by the part we cannot see.
   if (items.some((c) => c.rawStatus === 'unreadable')) return { state: 'failure', detail: 'CI evidence is incomplete: commit statuses are not readable by this token (grant "Commit statuses: read"); refusing to treat the rest as green' };
-  if (items.some((c) => c.source === 'workflow_run' && c.state === 'pending')) {
-    return { state: 'pending', detail: 'Actions workflow attempt was cancelled; rerun the workflow for this SHA' };
-  }
+  const cancelled = items.some((c) => c.source === 'workflow_run' && c.state === 'pending');
   const considered = required.length ? items.filter((c) => required.some((r) => low(r) === low(c.name))) : items;
   const missing = required.filter((r) => !considered.some((c) => low(c.name) === low(r)));
-  const bad = considered.filter((c) => c.state === 'failed' || c.state === 'unknown'); // cancelled/unrecognised is not a pass
+  // A cancelled Actions attempt still leaves independent commit statuses authoritative.
+  const bad = considered.filter((c) => (!cancelled || c.source === 'commit_status') && (c.state === 'failed' || c.state === 'unknown'));
   if (bad.length) return { state: 'failure', detail: `Failed or inconclusive: ${bad.map((c) => `${c.name} (${c.rawConclusion ?? c.rawStatus ?? c.state})`).join(', ')}` };
+  if (cancelled) return { state: 'pending', detail: 'Actions workflow attempt was cancelled; rerun the workflow for this SHA' };
   if (missing.length) return { state: 'pending', detail: `Waiting for required check(s): ${missing.join(', ')}` };
   if (!considered.length) return { state: 'pending', detail: 'No CI checks reported for this commit yet' };
   const pending = considered.filter((c) => c.state === 'pending');
@@ -43,11 +43,7 @@ export class GithubCi implements CiProvider {
     if (o.actionsWorkflow !== undefined) {
       return this.actionsEvidence(repo, sha, o.actionsWorkflow, o.branch, o.required);
     }
-    const checks = await this.runs(repo, sha).catch((error: unknown) => {
-      if (!(error instanceof SourceError) || error.kind !== 'auth') throw error;
-      throw new SourceError('auth', 'GitHub Checks are unreadable. Grant Checks: read or configure ciActionsWorkflow and required ciChecks job names.');
-    });
-    return [...checks, ...await this.statuses(repo, sha)];
+    return [...await this.runs(repo, sha), ...await this.statuses(repo, sha)];
   }
 
   private async runs(repo: string, sha: string): Promise<CheckItem[]> {

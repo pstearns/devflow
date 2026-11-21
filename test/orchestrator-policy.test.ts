@@ -476,7 +476,7 @@ describe('Codex review round 5 (regressions)', () => {
     const pages = { [`${base}/check-runs`]: { total_count: 1, check_runs: [{ name: 'build', status: 'completed', conclusion: 'success' }] }, [`${base}/status`]: denied };
     const result = await new GithubCi(gh(pages)).snapshot('o/r', sha, { required: ['build'] });
     expect(result.state).toBe('failure'); expect(result.detail).toMatch(/incomplete/);
-    await expect(new GithubCi(gh({ ...pages, [`${base}/check-runs`]: denied })).snapshot('o/r', sha, { required: ['build'] })).rejects.toThrow('Grant Checks: read');
+    await expect(new GithubCi(gh({ ...pages, [`${base}/check-runs`]: denied })).snapshot('o/r', sha, { required: ['build'] })).rejects.toThrow('denied');
   });
   it('a protected file touched and then REVERTED inside the new history is still rejected (every commit is inspected)', async () => {
     const w = world({ seed: { 'README.md': 'x\n' } });

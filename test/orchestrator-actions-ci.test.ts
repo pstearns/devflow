@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { parseConfig } from '../server/config.ts';
+import { GithubClient } from '../server/github.ts';
 import { GithubCi } from '../server/orchestrator/ci.ts';
 import { SourceError } from '../server/util.ts';
 
@@ -126,6 +127,17 @@ describe('exact-SHA GitHub Actions job evidence', () => {
     expect((await fixture({ runs: [{ ...run, status: 'in_progress', conclusion: null }] }).ci.snapshot(repo, sha, options)).state).toBe('timeout');
   });
 
+  it('reports a failed required commit status even when Actions was cancelled', async () => {
+    const { ci } = fixture({
+      runs: [{ ...run, conclusion: 'cancelled' }],
+      statuses: [{ context: 'ci/external', state: 'failure' }],
+    });
+    const required = [...options.required, 'ci/external'];
+    const result = await ci.wait(repo, sha, { ...options, required, timeoutMs: 0 });
+    expect(result.state).toBe('failure');
+    expect(result.detail).toBe('Failed or inconclusive: ci/external (failure)');
+  });
+
   it('reports the failed gate job and its URL when the workflow failed', async () => {
     const url = 'https://github.com/owner/repo/actions/runs/101/job/1';
     const { ci } = fixture({ runs: [{ ...run, conclusion: 'failure' }], jobs: [{ ...gate, conclusion: 'failure', html_url: url }] });
@@ -167,4 +179,16 @@ it('validates the raw Actions job list without silently normalizing the names', 
   const longName = 'gate-' + 'x'.repeat(110);
   project.orchestration.ciChecks = [longName];
   expect(parseConfig(raw).projects.find((p) => p.id === project.id)?.orchestration?.ciChecks).toEqual([longName]);
+});
+
+it.each([
+  { status: 401, diagnostic: 'GitHub rejected the token (check GITHUB_TOKEN)' },
+  { status: 403, diagnostic: 'GitHub denied access (token needs: checks=read)' },
+])('preserves the GitHub Check Runs diagnostic for HTTP $status', async ({ status, diagnostic }) => {
+  const fetchImpl = vi.fn<typeof fetch>(async () => Response.json({}, {
+    status, headers: status === 403 ? { 'x-accepted-github-permissions': 'checks=read' } : undefined,
+  }));
+  const ci = new GithubCi(new GithubClient('test-token', fetchImpl));
+  await expect(ci.snapshot(repo, sha, { required: ['gate'] })).rejects.toMatchObject({ kind: 'auth', message: diagnostic });
+  expect(fetchImpl).toHaveBeenCalledTimes(1);
 });
