@@ -78,7 +78,48 @@ function EventLine({ event }: { event: RunActivityEvent }) {
 }
 
 export function RunActivityFeed({ onOpen }: { onOpen: (id: string) => void }) {
-  const { activity, connection, connectionLabel } = useActivityStream<RunActivityFeedEntry[]>('/api/run-activity', Array.isArray);
+  const [activity, setActivity] = useState<RunActivityFeedEntry[]>();
+  const [connection, setConnection] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
+  useEffect(() => {
+    let pending: AbortController | undefined;
+    const update = async () => {
+      if (document.visibilityState !== 'visible' || pending) return;
+      const request = new AbortController();
+      pending = request;
+      try {
+        const response = await fetch('/api/run-activity', { cache: 'no-store', signal: request.signal, credentials: 'same-origin' });
+        if (request.signal.aborted) return;
+        if (response.status === 401 || response.status === 403) {
+          setActivity(undefined);
+          setConnection('unavailable');
+          return;
+        }
+        if (!response.ok) throw new Error('Run activity unavailable');
+        const entries: unknown = await response.json();
+        if (request.signal.aborted) return;
+        if (!Array.isArray(entries)) throw new Error('Invalid run activity');
+        setActivity(entries);
+        setConnection('live');
+      } catch {
+        if (!request.signal.aborted) setConnection('reconnecting');
+      } finally {
+        if (pending === request) pending = undefined;
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') void update();
+      else { pending?.abort(); pending = undefined; }
+    };
+    const timer = setInterval(update, 2_000);
+    document.addEventListener('visibilitychange', onVisibility);
+    void update();
+    return () => {
+      pending?.abort();
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
+  const connectionLabel = { connecting: 'Connecting…', live: 'Live', reconnecting: 'Reconnecting…', unavailable: 'Unavailable' }[connection];
   const runs = activity?.toSorted((a, b) => Number(!!b.activeAgent) - Number(!!a.activeAgent));
   return (
     <Card title="Run Activity" right={<span role="status"><Tag tone={connection === 'live' ? 'ok' : 'muted'}>{connectionLabel}</Tag></span>}>

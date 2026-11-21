@@ -207,15 +207,11 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
     activityStreams.add(stream);
     let previous = '';
     let heartbeatAt = Date.now();
-    let reading = false;
-    const update = async () => {
-      if (reading || stream.destroyed || stream.writableEnded) return;
-      reading = true;
+    const update = () => {
+      if (stream.destroyed || stream.writableEnded) return;
       try {
         if (!auth.validate(token, false).ok) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
-        const activity = await read();
-        if (stream.destroyed || stream.writableEnded) return;
-        if (!auth.validate(token, false).ok) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
+        const activity = read();
         if (!activity) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
         const next = JSON.stringify(activity);
         if (next !== previous) {
@@ -227,7 +223,6 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
           if (!stream.write(': heartbeat\n\n')) stream.destroy();
         }
       } catch { stream.end('event: unavailable\ndata: {}\n\n'); }
-      finally { reading = false; }
     };
     const timer = setInterval(update, 2_000);
     timer.unref();
@@ -238,7 +233,11 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
     setImmediate(update);
     return reply.send(stream);
   };
-  app.get('/api/run-activity', { exposeHeadRoute: false }, (req, reply) => sendActivity(req, reply, () => service.activityFeed()));
+  app.get('/api/run-activity', { exposeHeadRoute: false }, async (req, reply) => {
+    reply.header('cache-control', 'no-store');
+    const entries = await service.activityFeed();
+    return auth.validate(sessions.get(req)!.token, false).ok ? entries : reply.code(401).send({ error: 'session expired' });
+  });
   app.get('/api/issue/:identifier/run-activity', { exposeHeadRoute: false }, (req, reply) => {
     const { identifier } = req.params as { identifier: string };
     if (!/^[A-Za-z][A-Za-z0-9]{0,9}-\d{1,7}$/.test(identifier)) return reply.code(400).send({ error: 'invalid identifier' });

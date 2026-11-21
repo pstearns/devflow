@@ -33,9 +33,9 @@ describe('run activity', () => {
       const activity = runActivity(root, issue, 'pilot', 'owner/repo');
       expect(activity.activeAgent).toBe('claude');
       expect(activity.events.map((e) => [e.actor, e.title, e.detail])).toEqual([
-        ['codex', 'Codex received the verified commit', 'aaaaaaaaaaaa'],
+        ['codex', 'Preparing Codex review', 'aaaaaaaaaaaa'],
         ['codex', 'Codex sent findings to DevFlow', '1 finding · Initial attempt'],
-        ['claude', 'Claude received a repair request', undefined],
+        ['claude', 'Preparing Claude repair', undefined],
       ]);
       expect(runActivity(root, issue, 'other', 'owner/repo').runId).toBeNull();
       expect(runActivity(root, { ...issue, id: 'other' }, 'pilot', 'owner/repo').runId).toBeNull();
@@ -102,7 +102,9 @@ describe('run activity', () => {
         req.end();
       });
       expect((await app.inject({ url: '/api/run-activity', headers: { host: 'devflow.localhost:4317' } })).statusCode).toBe(401);
-      expect(await read(() => {}, JSON.stringify(feed), '/api/run-activity')).toContain(JSON.stringify(feed));
+      const feedResponse = await app.inject({ url: '/api/run-activity', headers: signed.headers });
+      expect(feedResponse.statusCode).toBe(200);
+      expect(feedResponse.json()).toEqual(feed);
       const first = await read(() => {}, JSON.stringify(activity));
       const live = await read(() => { projection.mockReturnValue(reviewing); }, JSON.stringify(reviewing));
       const replay = await read(() => signed.post('/api/auth/logout', {}), 'event: unavailable');
