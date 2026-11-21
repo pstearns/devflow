@@ -3,7 +3,7 @@ import { AttentionList } from '../components/Detail.tsx';
 import { Card, Empty, Ext, Pill, Tag, Time } from '../components/ui.tsx';
 import { READY_TILE_FILTER, gatesInSel, attentionInSel, eventInSel, matchesStatusFilter, prInSel, type Route, type Sel } from '../lib.ts';
 
-const GATE_LABEL = { blocked: 'Blocked', 'needs-authorization': 'Needs authorization', executable: 'Executable', 'in-flight': 'In flight', unknown: 'Unknown', clear: 'Clear' } as const;
+const GATE_LABEL = { blocked: 'Blocked', 'needs-authorization': 'Needs authorization', executable: 'Ready in Linear', 'in-flight': 'In flight', unknown: 'Unknown', clear: 'Clear' } as const;
 
 const GATE_TONE = { blocked: 'bad', 'needs-authorization': 'warn', executable: 'ok', 'in-flight': 'accent', unknown: 'muted', clear: 'ok' } as const;
 

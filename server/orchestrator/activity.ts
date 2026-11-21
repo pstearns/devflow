@@ -1,4 +1,5 @@
-import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { open, readdir, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { RunActivityEvent, RunActivityFeedEntry, RunActivitySnapshot } from '../../shared/types.ts';
 import { RunStore } from './manifest.ts';
@@ -92,28 +93,30 @@ export function runActivity(runsDir: string, issue: { identifier: string; id: st
 
 interface FeedScope { runsDir: string; project: string; repo: string; issues: ReadonlyMap<string, string> }
 
-function feedManifest(path: string): Manifest | undefined {
-  let fd: number | undefined;
+async function feedManifest(path: string): Promise<Manifest | undefined> {
+  let fd: FileHandle | undefined;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const file = fstatSync(fd);
+    fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const file = await fd.stat();
     if (!file.isFile() || file.size > 1024 * 1024) return undefined;
-    return JSON.parse(readFileSync(fd, 'utf8')) as Manifest;
+    const bytes = Buffer.alloc(file.size);
+    const { bytesRead } = await fd.read(bytes, 0, bytes.length, 0);
+    return JSON.parse(bytes.toString('utf8', 0, bytesRead)) as Manifest;
   } catch { return undefined; }
-  finally { if (fd !== undefined) closeSync(fd); }
+  finally { await fd?.close(); }
 }
 
-export function runActivityFeed(scopes: FeedScope[]): RunActivityFeedEntry[] {
+export async function runActivityFeed(scopes: FeedScope[]): Promise<RunActivityFeedEntry[]> {
   const latest = new Map<string, { runsDir: string; run: Manifest }>();
   for (const scope of scopes) {
     let entries;
-    try { entries = readdirSync(scope.runsDir, { withFileTypes: true }); }
+    try { entries = await readdir(scope.runsDir, { withFileTypes: true }); }
     catch { continue; }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const parts = /^([A-Z][A-Z0-9]{0,9}-\d{1,7})-([a-z0-9]{6,24})$/.exec(entry.name);
       if (!parts || !scope.issues.has(parts[1]!)) continue;
-      const run = feedManifest(join(scope.runsDir, entry.name, 'manifest.json'));
+      const run = await feedManifest(join(scope.runsDir, entry.name, 'manifest.json'));
       if (!run || run.ticket !== parts[1] || run.runId !== parts[2] || run.issueId !== scope.issues.get(run.ticket)
         || run.project !== scope.project || run.repo !== scope.repo || !PHASES.has(run.state)
         || typeof run.createdAt !== 'string' || !TIME.test(run.createdAt)) continue;

@@ -42,7 +42,7 @@ describe('run activity', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('keeps older active runs ahead of newer terminal history in the capped feed', () => {
+  it('keeps older active runs ahead of newer terminal history in the capped feed', async () => {
     const root = mkdtempSync(join(tmpdir(), 'devflow-feed-'));
     try {
       const config = parseConfig({ projects: [{
@@ -60,7 +60,7 @@ describe('run activity', () => {
         return { identifier, id, configProjectId: 'pilot', state: { type: 'started' } };
       });
       vi.spyOn(service, 'peek').mockReturnValue({ issues } as NonNullable<ReturnType<typeof service.peek>>);
-      const feed = service.activityFeed();
+      const feed = await service.activityFeed();
       expect(feed).toHaveLength(12);
       expect(feed[0]).toMatchObject({ identifier: 'PS-1', state: 'ci' });
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -72,7 +72,7 @@ describe('run activity', () => {
     const activity = { runId: 'abc123', state: 'ci', activeAgent: null, events: [] };
     const projection = vi.spyOn(service, 'activity').mockReturnValue(activity);
     const feed = [{ identifier: 'PS-8', ...activity }];
-    vi.spyOn(service, 'activityFeed').mockReturnValue(feed);
+    vi.spyOn(service, 'activityFeed').mockResolvedValue(feed);
     const reviewing = { ...activity, state: 'reviewing', activeAgent: 'codex' as const };
     const app = await buildApp(service, { auth, distDir: '/none' });
     try {

@@ -25,7 +25,7 @@ export class SnapshotService {
   private backoff = new Map<string, number>(); // credential ('linear' | 'github') -> epoch ms until which we make no calls
   private health: SourceHealth[] = [];
   private last?: { snap: Snapshot; at: number };
-  private activityFeedCache?: { snapshot: Snapshot; expiresAt: number; entries: RunActivityFeedEntry[] };
+  private activityFeedCache?: { snapshot: Snapshot; expiresAt: number; entries: Promise<RunActivityFeedEntry[]> };
   private inflight?: Promise<Snapshot>;
   private inflightSince?: number;
   private issueInflight = new Map<string, Promise<Snapshot>>();
@@ -101,7 +101,7 @@ export class SnapshotService {
   }
 
   /** Unfinished tickets with local orchestration evidence, scoped to issues the dashboard can see. */
-  activityFeed(): RunActivityFeedEntry[] {
+  async activityFeed(): Promise<RunActivityFeedEntry[]> {
     const snapshot = this.peek();
     if (this.mode !== 'live' || !snapshot) return [];
     const now = this.clock();
@@ -114,8 +114,14 @@ export class SnapshotService {
         && issue.state.type !== 'completed' && issue.state.type !== 'canceled').map((issue) => [issue.identifier, issue.id]));
       return issues.size ? [{ runsDir: orchestration.runsDir, project: project.id, repo: orchestration.repo, issues }] : [];
     }));
-    this.activityFeedCache = { snapshot, expiresAt: now + 2_000, entries };
-    return entries;
+    const next = { snapshot, expiresAt: Infinity, entries };
+    this.activityFeedCache = next;
+    try { return await entries; }
+    catch (error) {
+      if (this.activityFeedCache === next) this.activityFeedCache = undefined;
+      throw error;
+    }
+    finally { next.expiresAt = this.clock() + 2_000; }
   }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {

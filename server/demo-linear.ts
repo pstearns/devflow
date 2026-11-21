@@ -205,8 +205,8 @@ export function createFakeLinear(nowMs: number, opts: FakeLinearOpts = {}) {
       return ok({ project: { projectMilestones: { nodes: (MILESTONES[team] ?? []).filter((m) => MILESTONE_PROJECT[m.id] === pid).map((m) => ({ id: m.id, name: m.name, description: m.description, targetDate: day(m.off, nowMs) })), pageInfo: { hasNextPage: false, endCursor: null } } } });
     }
     if (name === 'Authorizer') {
-      const { spec } = find(String(v.id));
-      return ok({ issue: spec ? { history: { nodes: opts.authorizerHistory?.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt)) ?? ((spec.labels ?? []).includes('Ready') ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }] : []), pageInfo: { hasNextPage: false, endCursor: null } } } : null });
+      const { team, spec } = find(String(v.id));
+      return ok({ issue: spec ? { history: { nodes: opts.authorizerHistory?.toSorted((a, b) => b.createdAt.localeCompare(a.createdAt)) ?? ((SEED[team]?.find((seed) => seed.n === spec.n)?.labels ?? []).includes('Ready') ? [{ createdAt: ago(spec.ageH, nowMs), actor: { name: store.viewer }, addedLabels: [{ name: 'Ready' }] }] : []), pageInfo: { hasNextPage: false, endCursor: null } } } : null });
     }
     if (name === 'IssueDetail') {
       const { team, spec } = find(String(v.id));

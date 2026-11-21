@@ -80,10 +80,8 @@ function EventLine({ event }: { event: RunActivityEvent }) {
 export function RunActivityFeed({ onOpen }: { onOpen: (id: string) => void }) {
   const { activity, connection, connectionLabel } = useActivityStream<RunActivityFeedEntry[]>('/api/run-activity', Array.isArray);
   const runs = activity?.toSorted((a, b) => Number(!!b.activeAgent) - Number(!!a.activeAgent));
-  const working = runs?.some((run) => run.state && !['awaiting-owner', 'escalated', 'aborted'].includes(run.state));
-  const statusLabel = connection === 'live' ? (working ? 'Working' : 'Idle') : connectionLabel;
   return (
-    <Card title="Run Activity" right={<span role="status"><Tag tone={connection === 'live' && working ? 'ok' : 'muted'}>{statusLabel}</Tag></span>}>
+    <Card title="Run Activity" right={<span role="status"><Tag tone={connection === 'live' ? 'ok' : 'muted'}>{connectionLabel}</Tag></span>}>
       <div className="space-y-3 p-2">
         {runs?.map((run) => (
           <section key={run.identifier} className="rounded border border-line bg-raised p-2" aria-label={run.identifier}>
@@ -91,7 +89,7 @@ export function RunActivityFeed({ onOpen }: { onOpen: (id: string) => void }) {
               <button type="button" onClick={() => onOpen(run.identifier)} className="mono font-semibold text-accent hover:underline">{run.identifier}</button>
               {run.state && <Tag>{PHASES[run.state] ?? run.state}</Tag>}
             </div>
-            {connection === 'live' && run.activeAgent && <p className="text-[11px] text-accent">{ACTORS[run.activeAgent]} active</p>}
+            {connection === 'live' && run.activeAgent && <p className="text-[11px] text-accent">Last recorded agent: {ACTORS[run.activeAgent]}</p>}
             <ol aria-label={`${run.identifier} handoffs`} className="mt-1 space-y-1">
               {run.events.toReversed().map((event) => (
                 <li key={event.id} className="border-t border-line pt-1"><EventLine event={event} /></li>
@@ -114,17 +112,17 @@ export function RunActivity({ identifier }: { identifier: string }) {
       <div className="space-y-3 p-3">
         <div className="grid grid-cols-2 gap-2" role="group" aria-label="Agents">
           {AGENTS.map((agent) => {
-            const active = connection === 'live' && activity?.activeAgent === agent;
+            const latest = connection === 'live' && activity?.activeAgent === agent;
             return (
-              <div key={agent} className={`flex min-w-0 items-center gap-2 rounded border p-2 ${active ? 'border-accent bg-accent/10' : 'border-line bg-raised'}`}>
-                <span aria-hidden="true" className={`mono flex size-8 shrink-0 items-center justify-center rounded-full border font-semibold ${active ? 'border-accent text-accent' : 'border-line text-muted'}`}>
+              <div key={agent} className={`flex min-w-0 items-center gap-2 rounded border p-2 ${latest ? 'border-accent bg-accent/10' : 'border-line bg-raised'}`}>
+                <span aria-hidden="true" className={`mono flex size-8 shrink-0 items-center justify-center rounded-full border font-semibold ${latest ? 'border-accent text-accent' : 'border-line text-muted'}`}>
                   {agent === 'claude' ? 'C' : '>_'}
                 </span>
                 <div className="min-w-0">
                   <div className="font-medium">{ACTORS[agent]}</div>
-                  <div className={`flex items-center gap-1 text-[11px] ${active ? 'text-accent' : 'text-muted'}`}>
-                    {active && <span className="size-1.5 shrink-0 rounded-full bg-accent motion-safe:animate-pulse" aria-hidden="true" />}
-                    {active ? 'Active' : connection === 'live' ? 'Idle' : 'Status unavailable'}
+                  <div className={`flex items-center gap-1 text-[11px] ${latest ? 'text-accent' : 'text-muted'}`}>
+                    {latest && <span className="size-1.5 shrink-0 rounded-full bg-accent" aria-hidden="true" />}
+                    {latest ? 'Last recorded' : connection === 'live' ? '—' : 'Status unavailable'}
                   </div>
                 </div>
               </div>

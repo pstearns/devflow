@@ -207,11 +207,15 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
     activityStreams.add(stream);
     let previous = '';
     let heartbeatAt = Date.now();
-    const update = () => {
-      if (stream.destroyed || stream.writableEnded) return;
+    let reading = false;
+    const update = async () => {
+      if (reading || stream.destroyed || stream.writableEnded) return;
+      reading = true;
       try {
         if (!auth.validate(token, false).ok) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
-        const activity = read();
+        const activity = await read();
+        if (stream.destroyed || stream.writableEnded) return;
+        if (!auth.validate(token, false).ok) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
         if (!activity) { stream.end('event: unavailable\ndata: {}\n\n'); return; }
         const next = JSON.stringify(activity);
         if (next !== previous) {
@@ -223,6 +227,7 @@ export async function buildApp(service: SnapshotService, opts: AppOptions): Prom
           if (!stream.write(': heartbeat\n\n')) stream.destroy();
         }
       } catch { stream.end('event: unavailable\ndata: {}\n\n'); }
+      finally { reading = false; }
     };
     const timer = setInterval(update, 2_000);
     timer.unref();
