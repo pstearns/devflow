@@ -79,6 +79,34 @@ export function stateType(v: unknown): StateType {
 export const isTriageState = (state: { type: StateType; name: string }) =>
   state.type === 'triage' || (!['completed', 'canceled'].includes(state.type) && /^triage$/i.test(state.name));
 
+export const Q_AUTHORIZER = 'query Authorizer($id: String!, $after: String) { issue(id: $id) { history(first: 50, after: $after) { nodes { createdAt actor { name } addedLabels { name } fromState { name type } toState { name type } } pageInfo { hasNextPage endCursor } } } }';
+
+export async function readReadyHistory(client: Pick<LinearClient, 'query'>, ticket: string, readyLabel: string) {
+  const warnings: string[] = [];
+  const history = await paginate(client, Q_AUTHORIZER, { id: ticket }, (data) => isObj(data.issue) ? data.issue.history : undefined, warnings, 'approval history');
+  if (warnings.length) throw new SourceError('invalid', 'Linear approval history is incomplete');
+  const triage = (state: unknown) => isObj(state) && isTriageState({ name: str(state.name, 100) ?? '', type: stateType(state.type) });
+  let lastTriage = -Infinity;
+  let approvedAt = -Infinity;
+  let approval: { who?: string; at?: string } = {};
+  for (const entry of history) {
+    if (!isObj(entry)) throw new SourceError('invalid', 'Linear approval history contains an invalid entry');
+    const triageTransition = triage(entry.fromState) || triage(entry.toState);
+    const addedReady = nodes({ nodes: entry.addedLabels }, 100).some((label) =>
+      isObj(label) && str(label.name, 100)?.toLowerCase() === readyLabel.toLowerCase());
+    if (!triageTransition && !addedReady) continue;
+    const at = str(entry.createdAt, 40);
+    const time = at ? Date.parse(at) : NaN;
+    if (!Number.isFinite(time)) throw new SourceError('invalid', 'Linear approval history contains an invalid timestamp');
+    if (triageTransition) lastTriage = Math.max(lastTriage, time);
+    if (addedReady && time > approvedAt) {
+      approvedAt = time;
+      approval = { who: isObj(entry.actor) ? str(entry.actor.name, 100) : undefined, at };
+    }
+  }
+  return { approval, lastTriage, stale: Number.isFinite(lastTriage) && approvedAt <= lastTriage };
+}
+
 export const isResolved = (t: StateType) => t === 'completed' || t === 'canceled';
 
 export function normalizeRef(raw: unknown): IssueRef | undefined {

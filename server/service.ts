@@ -1,12 +1,10 @@
-import { readdirSync } from 'node:fs';
 import type { RunActivityFeedEntry, Snapshot, SourceHealth } from '../shared/types.ts';
 import type { Config } from './config.ts';
 import { GithubClient, applyRunFallback, fetchPrDetail, fetchRepo, isFreshPrFor, normalizePr, type Denied, type RepoData } from './github.ts';
 import { LinearClient, discoverTeams, fetchLinearIssue, fetchTeamData, type TeamData, type TeamRef } from './linear.ts';
 import { configuredTeamKeys, repoOwners } from './scope.ts';
 import { buildSnapshot } from './snapshot.ts';
-import { runActivity } from './orchestrator/activity.ts';
-import { TERMINAL } from './orchestrator/types.ts';
+import { runActivity, runActivityFeed } from './orchestrator/activity.ts';
 import { SourceError, clampResume, requestScope } from './util.ts';
 
 const REFRESH_DEADLINE_MS = 90_000;
@@ -105,28 +103,13 @@ export class SnapshotService {
   activityFeed(): RunActivityFeedEntry[] {
     const snapshot = this.peek();
     if (this.mode !== 'live' || !snapshot) return [];
-    const candidates = new Set<string>();
-    for (const project of this.cfg.projects) {
-      if (!project.orchestration) continue;
-      const issues = new Set(snapshot.issues.filter((issue) => issue.configProjectId === project.id && issue.state.type !== 'completed' && issue.state.type !== 'canceled').map((issue) => issue.identifier));
-      if (!issues.size) continue;
-      try {
-        for (const entry of readdirSync(project.orchestration.runsDir, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue;
-          const match = /^([A-Z][A-Z0-9]{0,9}-\d{1,7})-([a-z0-9]{6,24})$/.exec(entry.name);
-          if (!match) continue;
-          const identifier = match[1]!;
-          if (issues.has(identifier)) candidates.add(identifier);
-        }
-      } catch { /* This project's local evidence is currently unavailable. */ }
-    }
-    const runs = [...candidates].flatMap((identifier) => {
-      try {
-        const run = this.activity(identifier);
-        return run?.runId && run.state ? [{ identifier, ...run, runId: run.runId, state: run.state, events: run.events.slice(-4) }] : [];
-      } catch { return []; }
-    });
-    return runs.sort((a, b) => Number(TERMINAL.some((state) => state === a.state)) - Number(TERMINAL.some((state) => state === b.state)) || b.runId.localeCompare(a.runId)).slice(0, 12);
+    return runActivityFeed(this.cfg.projects.flatMap((project) => {
+      const orchestration = project.orchestration;
+      if (!orchestration) return [];
+      const issues = new Map(snapshot.issues.filter((issue) => issue.configProjectId === project.id
+        && issue.state.type !== 'completed' && issue.state.type !== 'canceled').map((issue) => [issue.identifier, issue.id]));
+      return issues.size ? [{ runsDir: orchestration.runsDir, project: project.id, repo: orchestration.repo, issues }] : [];
+    }));
   }
 
   async getIssue(identifier: string, force = false): Promise<Snapshot | undefined> {

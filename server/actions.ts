@@ -5,7 +5,7 @@
 import type { ActionCheck, ActionOptions, Issue, StateType } from '../shared/types.ts';
 import type { Config, WorkflowCfg } from './config.ts';
 import { resolveScope, type Scope } from './scope.ts';
-import { Q_LABELS, normalizeLabel, paginate, stateType, isTriageState, type LinearClient, type RawLabel } from './linear.ts';
+import { Q_LABELS, normalizeLabel, paginate, stateType, isTriageState, readReadyHistory, type LinearClient, type RawLabel } from './linear.ts';
 import type { LinearWriteClient } from './linear-write.ts';
 import type { SnapshotService } from './service.ts';
 import { SourceError, arr, isObj, nodes, str } from './util.ts';
@@ -307,18 +307,19 @@ export class LinearActions {
       if (!ev.eligible) throw new ActionError(422, 'ineligible', `Cannot approve ${ctx.identifier}: ${ev.checks.filter((c) => !c.ok).map((c) => c.label).join('; ')}`, ev.checks);
       const todo = findTodo(ctx, wf)!;
       const readyLabel = ctx.teamLabels.find((l) => low(l.name) === low(wf.readyLabel) && !l.isGroup)!;
+      const ready = hasReady(ctx, wf);
+      const renew = ready && (isTriageState(ctx.state) || (await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel)).stale);
       let failure: unknown;
       try {
-        const renew = isTriageState(ctx.state) && hasReady(ctx, wf);
         if (renew) {
           await w.removeLabel(ctx.id, readyLabel.id);
           if (hasReady(await this.load(identifier, false), wf)) throw new Error('Linear did not clear the previous Ready label');
         }
         if (ctx.state.id !== todo.id) await w.setState(ctx.id, todo.id);
-        if (renew || !hasReady(ctx, wf)) await w.addLabel(ctx.id, readyLabel.id);
+        if (renew || !ready) await w.addLabel(ctx.id, readyLabel.id);
       } catch (e) { failure = e; }
       const after = await this.tryLoad(identifier);
-      if ((!isTriageState(ctx.state) || !failure) && after && after.state.id === todo.id && hasReady(after, wf)) return this.finish(identifier, `${ctx.identifier} approved for execution: ${todo.name} + ${readyLabel.name}, verified in Linear`);
+      if ((!renew || !failure) && after && after.state.id === todo.id && hasReady(after, wf)) return this.finish(identifier, `${ctx.identifier} approved for execution: ${todo.name} + ${readyLabel.name}, verified in Linear`);
       throw this.notConfirmed('Approval', failure, after);
     });
   }

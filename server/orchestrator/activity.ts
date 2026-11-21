@@ -1,8 +1,8 @@
-import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, readdirSync, readSync } from 'node:fs';
 import { join } from 'node:path';
-import type { RunActivityEvent, RunActivitySnapshot } from '../../shared/types.ts';
+import type { RunActivityEvent, RunActivityFeedEntry, RunActivitySnapshot } from '../../shared/types.ts';
 import { RunStore } from './manifest.ts';
-import type { Manifest } from './types.ts';
+import { TERMINAL, type Manifest } from './types.ts';
 
 const MAX_LOG_BYTES = 64 * 1024;
 const MAX_EVENTS = 50;
@@ -77,11 +77,53 @@ function readEvents(path: string, run: Manifest): RunActivityEvent[] {
   finally { if (fd !== undefined) closeSync(fd); }
 }
 
+function activitySnapshot(runsDir: string, run: Manifest, eventLimit = MAX_EVENTS): RunActivitySnapshot {
+  const activeAgent = run.state === 'reviewing' ? 'codex' : run.state === 'implementing' || run.state === 'repairing' ? 'claude' : null;
+  const events = readEvents(join(runsDir, `${run.ticket}-${run.runId}`, 'events.jsonl'), run);
+  return { runId: run.runId, state: run.state, activeAgent, events: events.slice(-eventLimit) };
+}
+
 export function runActivity(runsDir: string, issue: { identifier: string; id: string }, project: string, repo: string): RunActivitySnapshot {
   const store = new RunStore(runsDir);
   const run = store.runsFor(issue.identifier).find((item) => item.issueId === issue.id && item.ticket === issue.identifier &&
     item.project === project && item.repo === repo && ID.test(item.runId) && PHASES.has(item.state));
-  if (!run) return EMPTY;
-  const activeAgent = run.state === 'reviewing' ? 'codex' : run.state === 'implementing' || run.state === 'repairing' ? 'claude' : null;
-  return { runId: run.runId, state: run.state, activeAgent, events: readEvents(join(store.runDir(run), 'events.jsonl'), run) };
+  return run ? activitySnapshot(runsDir, run) : EMPTY;
+}
+
+interface FeedScope { runsDir: string; project: string; repo: string; issues: ReadonlyMap<string, string> }
+
+function feedManifest(path: string): Manifest | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const file = fstatSync(fd);
+    if (!file.isFile() || file.size > 1024 * 1024) return undefined;
+    return JSON.parse(readFileSync(fd, 'utf8')) as Manifest;
+  } catch { return undefined; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+
+export function runActivityFeed(scopes: FeedScope[]): RunActivityFeedEntry[] {
+  const latest = new Map<string, { runsDir: string; run: Manifest }>();
+  for (const scope of scopes) {
+    let entries;
+    try { entries = readdirSync(scope.runsDir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const parts = /^([A-Z][A-Z0-9]{0,9}-\d{1,7})-([a-z0-9]{6,24})$/.exec(entry.name);
+      if (!parts || !scope.issues.has(parts[1]!)) continue;
+      const run = feedManifest(join(scope.runsDir, entry.name, 'manifest.json'));
+      if (!run || run.ticket !== parts[1] || run.runId !== parts[2] || run.issueId !== scope.issues.get(run.ticket)
+        || run.project !== scope.project || run.repo !== scope.repo || !PHASES.has(run.state)
+        || typeof run.createdAt !== 'string' || !TIME.test(run.createdAt)) continue;
+      const previous = latest.get(run.ticket)?.run;
+      if (!previous || run.createdAt > previous.createdAt || (run.createdAt === previous.createdAt && run.runId > previous.runId)) {
+        latest.set(run.ticket, { runsDir: scope.runsDir, run });
+      }
+    }
+  }
+  return [...latest.values()].sort((a, b) => Number(TERMINAL.includes(a.run.state)) - Number(TERMINAL.includes(b.run.state))
+    || b.run.createdAt.localeCompare(a.run.createdAt) || b.run.runId.localeCompare(a.run.runId)).slice(0, 12)
+    .map(({ runsDir, run }) => ({ identifier: run.ticket, ...activitySnapshot(runsDir, run, 4) }));
 }

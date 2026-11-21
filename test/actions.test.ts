@@ -214,6 +214,17 @@ describe('workflow status changes', () => {
     expect(spec('ATL-7').labels).toContain('Ready');
     expect(f.store.mutations.slice(-3).map(({ op }) => op)).toEqual(['IssueRemoveLabel', 'IssueUpdate', 'IssueAddLabel']);
   });
+  it('renews stale Ready on explicit approval after the issue left Triage', async () => {
+    const { actions, spec, f } = await setup({
+      authorizerHistory: [
+        { createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] },
+        { createdAt: '2026-06-01T09:00:00Z', fromState: { name: 'Triage', type: 'triage' } },
+      ],
+    });
+    spec('ATL-7').state = 'Backlog';
+    await actions.approve('ATL-7', 'ATL-7');
+    expect(f.store.mutations.map(({ op }) => op)).toEqual(['IssueRemoveLabel', 'IssueUpdate', 'IssueAddLabel']);
+  });
   it('Done works with or without a merged PR (non-code tickets have none)', async () => {
     const { actions, spec } = await setup();
     expect((await actions.status('ATL-16', 'st-ATL-done')).ok).toBe(true); // a documentation ticket: no PR at all

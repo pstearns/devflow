@@ -30,6 +30,23 @@ describe('Triage authorization', () => {
     await expect(w.orch.run('ATL-22')).rejects.toThrow('fresh Ready approval');
     expect(w.f.store.mutations).toEqual([]);
   });
+  it('stops a prior run after a transient Triage hold even if the live status was restored', async () => {
+    const history: unknown[] = [{ createdAt: '2026-06-01T08:00:00Z', addedLabels: [{ name: 'Ready' }] }];
+    const w = world({
+      scenario: 'correct-first', linearOpts: { authorizerHistory: history },
+      wrapAgents: (inner) => ({
+        preflight: () => inner.preflight(), review: (o) => inner.review(o),
+        implement: async (o) => {
+          const result = await inner.implement(o);
+          history.push({ createdAt: new Date(Date.now() + 1000).toISOString(), toState: { name: 'Triage', type: 'triage' } });
+          return result;
+        },
+      }),
+    });
+    const result = await w.orch.run('ATL-22');
+    expect(result.reasonClass).toBe('ticket-changed');
+    expect(w.prs.created).toHaveLength(0);
+  });
   it('uses the approval recorded after Triage', async () => {
     const w = world({ scenario: 'correct-first', linearOpts: { authorizerHistory: [
       triage, { createdAt: '2026-06-01T10:00:00Z', actor: { name: 'Fresh Owner' }, addedLabels: [{ name: 'Ready' }] },
