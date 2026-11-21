@@ -5,12 +5,15 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, loadEnvFile, type Config } from '../config.ts';
+import { parseCtx, Q_ACTION_ISSUE } from '../actions.ts';
+import { resolveScope } from '../scope.ts';
 import { LinearClient } from '../linear.ts';
 import { LinearWriteClient } from '../linear-write.ts';
 import { GithubClient } from '../github.ts';
 import { CliAgents } from './agents.ts';
 import { GithubCi } from './ci.ts';
 import { GithubPrs } from './pr.ts';
+import { inspectTriage, loadAuthority } from './authority.ts';
 import { Orchestrator, Rejected } from './controller.ts';
 import { PolicyError, PolicyGuard } from './policy.ts';
 import { DuplicateRun, RunStore } from './manifest.ts';
@@ -22,7 +25,7 @@ const die = (msg: string, code = 1): never => { console.error(`DevFlow orchestra
 
 const [cmd, ticketRaw, ...rest] = process.argv.slice(2);
 const maintenance = cmd === 'prune' || cmd === 'verify';
-if (!maintenance && ((cmd !== 'run' && cmd !== 'release') || !ticketRaw)) die('usage: orchestrate run <ISSUE> | release <ISSUE> | prune [--apply] | verify', 2);
+if (!maintenance && ((cmd !== 'run' && cmd !== 'release' && cmd !== 'inspect') || !ticketRaw)) die('usage: orchestrate run <ISSUE> | inspect <ISSUE> | release <ISSUE> | prune [--apply] | verify', 2);
 const ticket = (maintenance ? '' : ticketRaw!).toUpperCase();
 
 // Trusted inputs (.env, devflow.config.json) come from DevFlow's OWN directory, never from the current directory: running this command from
@@ -30,7 +33,10 @@ const ticket = (maintenance ? '' : ticketRaw!).toUpperCase();
 const here = dirname(fileURLToPath(import.meta.url));
 const root = [resolve(here, '../..'), resolve(here, '../../..')].find((d) => existsSync(resolve(d, 'package.json')) && existsSync(resolve(d, 'server'))) ?? die('cannot locate the DevFlow directory');
 process.chdir(root);
-const swept = sweepStaleStaging(); if (swept.length) console.warn(`DevFlow: removed ${swept.length} stale agent staging director${swept.length === 1 ? 'y' : 'ies'} left by an interrupted run`);
+if (cmd !== 'inspect') {
+  const swept = sweepStaleStaging();
+  if (swept.length) console.warn(`DevFlow: removed ${swept.length} stale agent staging director${swept.length === 1 ? 'y' : 'ies'} left by an interrupted run`);
+}
 const warn = loadEnvFile(resolve(root, '.env'));
 if (warn) console.warn(`DevFlow warning: ${warn}`);
 const loaded = loadConfig(process.env, root);
@@ -71,6 +77,37 @@ if (cmd === 'release') {
   process.exit(0);
 }
 
+if (cmd === 'inspect') {
+  try {
+    if (!/^[A-Z][A-Z0-9]{0,9}-\d{1,7}$/.test(ticket)) throw new Error('Invalid issue identifier');
+    const key = process.env.LINEAR_API_KEY?.trim();
+    if (!key) throw new Error('LINEAR_API_KEY must be set');
+    const read = new LinearClient(key);
+    const ctx = parseCtx(await read.query(Q_ACTION_ISSUE, { id: ticket }), []);
+    if (!ctx) throw new Error('Issue unavailable');
+    const scope = resolveScope(cfg, ctx.teamKey, ctx.project);
+    const orchestration = scope.configProject?.orchestration;
+    if (!scope.writeAllowed || !orchestration) throw new Error('Issue has no enabled DevFlow scope');
+    const store = new RunStore(orchestration.runsDir);
+    const runs = store.runsFor(ctx.identifier);
+    const triage = ctx.state.type === 'triage' || ctx.state.name.toLowerCase() === 'triage'
+      ? await inspectTriage(read, loadAuthority(), ctx, runs)
+      : undefined;
+    console.log(JSON.stringify({
+      ticket: ctx.identifier, issueId: ctx.id, state: ctx.state, triage,
+      dependenciesVerifiable: ctx.depsVerifiable, blockers: ctx.openBlockers,
+      runs: runs.map(m => ({
+        run: m.runId, state: m.state, started: m.startConfirmed, outcome: m.outcome, reasonClass: m.reasonClass,
+        branch: m.branch, pr: m.pr, approvedSha: m.approvedSha,
+        attempts: m.attempts.map(a => ({ n: a.n, sha: a.headSha, ci: a.ci?.state, review: a.review?.verdict })),
+      })),
+    }, null, 2));
+    process.exit(0);
+  } catch (error) {
+    die(error instanceof Error ? error.message : 'Could not inspect issue', 4);
+  }
+}
+
 const readKey = process.env.LINEAR_API_KEY?.trim(), writeKey = process.env.LINEAR_WRITE_API_KEY?.trim(), ghToken = process.env.GITHUB_TOKEN?.trim(), ghWrite = process.env.GITHUB_WRITE_TOKEN?.trim();
 if (!readKey || !writeKey || !ghToken || !ghWrite) die('LINEAR_API_KEY, LINEAR_WRITE_API_KEY, GITHUB_TOKEN and GITHUB_WRITE_TOKEN must all be set');
 if (writeKey === readKey) die('LINEAR_WRITE_API_KEY must differ from LINEAR_API_KEY');
@@ -81,6 +118,7 @@ const gh = new GithubClient(ghToken!);
 // The policy re-reads the config from disk and re-resolves that same project id, so any change to it changes the digest and stops the run.
 const orch = new Orchestrator({
   cfg,
+  authority: loadAuthority,
   read: new LinearClient(readKey!),
   write: new LinearWriteClient(writeKey!),
   ci: new GithubCi(gh),

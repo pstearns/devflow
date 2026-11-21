@@ -35,6 +35,7 @@ export interface Manifest {
   pr?: { number: number; url: string; draft: true }; linearStates: { startedId: string; approvalId: string; blockedId: string; blockedName: string }; blockedConfirmed?: boolean;
   infra: InfraEvent[]; escalationEvidence?: string;
   gate?: { name: string; ok: boolean; detail: string }[];
+  readyRecord?: string; scope?: string; remediationApproval?: string;
   originalStateId: string; startConfirmed?: boolean;
   policyDigest: string; agents: { claude?: string; codex?: string }; authorizedBy?: string;
   maxRepairs?: number; // repair attempts allowed for this run (absent in older manifests => MAX_REPAIRS)

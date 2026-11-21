@@ -18,6 +18,7 @@ import type { PrState } from './pr.ts';
 import * as A from './audit.ts';
 import type { CiProvider, CiResult } from './ci.ts';
 import * as G from './git.ts';
+import { AuthorityError, verifyAuthority, type AuthorityPolicy } from './authority.ts';
 import { RunStore } from './manifest.ts';
 import { PolicyError, type Pinned } from './policy.ts';
 import type { PullRequests } from './pr.ts';
@@ -35,6 +36,7 @@ export class InfraError extends Error { constructor(public step: string, message
 
 export interface Deps {
   cfg: Config;
+  authority: () => AuthorityPolicy;
   read: Pick<LinearClient, 'query'>;
   write: Pick<LinearWriteClient, 'createComment' | 'setState'>;
   ci: CiProvider;
@@ -97,6 +99,7 @@ export class Orchestrator {
     if (!sc.writeAllowed) throw new Rejected(`${ctx.identifier} is not authorized: ${sc.writeReason ?? 'its team/project is not enabled for writes'}`);
     const oc = sc.configProject?.orchestration;
     if (!sc.configProject || !oc) throw new Rejected(`${ctx.identifier}: its project has no "orchestration" configuration, so DevFlow will not execute it`);
+    if (ctx.state.type === 'triage' || low(ctx.state.name) === 'triage') throw new Rejected(`${ctx.identifier} is in Triage`);
     if (!hasReady(ctx, sc.workflow)) throw new Rejected(`${ctx.identifier} is not explicitly approved: it does not carry the "${sc.workflow.readyLabel}" label`);
     if (ctx.state.type !== 'unstarted') throw new Rejected(`${ctx.identifier} is in "${ctx.state.name}", not an unstarted state: it is already started, finished, or being executed`);
     if (!ctx.depsVerifiable) throw new Rejected(`${ctx.identifier}: blockers could not be fully read, so readiness cannot be confirmed`);
@@ -120,6 +123,16 @@ export class Orchestrator {
     } catch { return {}; }
   }
 
+  private async dispatchAuthority(ctx: Ctx, auth: Auth, store: RunStore, currentRunId?: string) {
+    const labels = ctx.labels.filter(label => low(label.name) === low(auth.readyLabel));
+    if (labels.length !== 1) throw new Rejected('Cannot verify the unique Ready label');
+    try {
+      return await verifyAuthority(this.d.read, this.d.authority(), ctx, labels[0]!.id, store.runsFor(ctx.identifier).filter(run => !currentRunId || run.runId !== currentRunId));
+    } catch (error) {
+      throw new Rejected(error instanceof AuthorityError ? error.message : 'Could not verify Linear dispatch authority');
+    }
+  }
+
   async run(identifierRaw: string): Promise<Manifest> {
     if (!IDENT.test(identifierRaw)) throw new Rejected('Invalid issue identifier');
     const ticket = identifierRaw.toUpperCase();
@@ -136,6 +149,7 @@ export class Orchestrator {
       const ctx = await this.load(ticket); // authoritative read AFTER the lock
       const auth = this.authorize(ctx);
       if (auth.projectId !== preAuth.projectId) throw new Rejected('the ticket moved to a different project while the run was being accepted');
+      const evidence = await this.dispatchAuthority(ctx, auth, store);
       const oc = auth.oc;
       // Fail closed: if the owner's policy cannot be verified (wrong owner/mode, inside an agent-reachable tree, binary swapped...), nothing starts.
       const agents = this.d.agents(oc, auth.projectId);
@@ -151,7 +165,7 @@ export class Orchestrator {
         branch: `devflow/${ticket.toLowerCase()}-${runId}`, clone: '', state: 'accepted', attempts: [], linearCommentIds: [], infra: [],
         linearStates: { startedId: auth.started.id, approvalId: auth.approval.id, blockedId: auth.blocked.id, blockedName: auth.blocked.name },
         policyDigest: pinned.digest, maxRepairs: oc.maxRepairs, agents: { claude: pf.versions?.claude, codex: pf.versions?.codex }, authorizedBy: who.who,
-        originalStateId: ctx.state.id, createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
+        originalStateId: ctx.state.id, ...evidence, createdAt: this.at(), updatedAt: this.at(), cleanup: { clone: 'pending' },
       };
       m.clone = join(store.runDir(m), 'clone');
       this.runs.set(runId, { agents, pinned });
@@ -159,8 +173,11 @@ export class Orchestrator {
       this.save(store, m, 'accepted', { baseSha, preflight: pf.detail, baseBranchProtected: protectedBase ?? 'unknown', policyDigest: pinned.digest, authorizedBy: who.who ?? 'unknown' });
       // Leaving the unstarted state is what makes a second dispatch (by any controller) fail acceptance.
       await this.infra(store, m, 'linear-start', async () => {
-        const fresh = this.authorize(await this.load(ticket)); // the owner may have revoked or moved the ticket while preflight and git were running
+        const live = await this.load(ticket); // the owner may have changed the ticket during preflight
+        const fresh = this.authorize(live);
         if (fresh.projectId !== auth.projectId) throw new Rejected('the ticket moved to a different project before the run started');
+        const reconfirmed = await this.dispatchAuthority(live, fresh, store, runId);
+        if (JSON.stringify(reconfirmed) !== JSON.stringify(evidence)) throw new Rejected('Dispatch authority or approved scope changed before start');
         this.verifyPin(m!);
         await this.d.write.setState(ctx.id, auth.started.id);
       });

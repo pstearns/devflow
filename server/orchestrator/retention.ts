@@ -12,6 +12,7 @@
 import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import * as G from './git.ts';
+import { exhaustedRepairAuthority } from './authority.ts';
 import { RunStore } from './manifest.ts';
 import { TERMINAL, type Manifest } from './types.ts';
 
@@ -64,6 +65,7 @@ export function plan(s: ScanResult, pol: RetentionPolicy = DEFAULT_RETENTION): {
   const del = (r: RunInfo, reason: string) => { if (!doomed.has(r.name)) { doomed.add(r.name); actions.push({ kind: 'delete-run', name: r.name, reason, bytes: r.bytes }); } };
   for (const r of s.runs) {
     if (!TERMINAL.includes(r.manifest.state) || r.locked) continue; // rule 1
+    if (exhaustedRepairAuthority(r.manifest) || r.manifest.remediationApproval) continue;
     if (r.passed && r.ageDays >= pol.passDays && r.ageDays >= pol.minAgeDays) del(r, `passed run older than ${pol.passDays} days`);
     else if (!r.passed && r.ageDays >= pol.failureDays && r.ageDays >= pol.minAgeDays) del(r, `failed/escalated run older than ${pol.failureDays} days`);
   }
@@ -105,6 +107,9 @@ export async function prune(runsDir: string, pol: RetentionPolicy = DEFAULT_RETE
       let st; try { st = lstatSync(r.dir); } catch { report.warnings.push(`skipped ${a.name}: already gone`); continue; }
       if (st.isSymbolicLink() || !st.isDirectory() || st.ino !== r.ino || st.dev !== r.dev || (r.born > 0 && st.birthtimeMs !== r.born)) { report.warnings.push(`skipped ${a.name}: directory identity changed since the scan`); continue; }
       let fresh: Manifest; try { fresh = JSON.parse(readFileSync(join(r.dir, 'manifest.json'), 'utf8')) as Manifest; } catch { report.warnings.push(`skipped ${a.name}: manifest unreadable now`); continue; }
+      if (a.kind === 'delete-run' && (exhaustedRepairAuthority(fresh) || fresh.remediationApproval)) {
+        report.warnings.push(`skipped ${a.name}: contains durable remediation authority evidence`); continue;
+      }
       const age = (now - Date.parse(fresh.updatedAt)) / DAY;
       const need = a.kind === 'drop-clone' ? pol.cloneDays : (fresh.outcome === 'PASS' ? pol.passDays : pol.failureDays);
       const storagePressure = a.kind === 'drop-clone' && a.reason.startsWith('storage limit');
