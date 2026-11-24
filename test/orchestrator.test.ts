@@ -106,6 +106,22 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
     expect(second!.startSha).toBe(first!.headSha);
     expect(second!.ci!.state).toBe('success');
     expect(second!.review!.verdict).toBe('PASS');
+    // The fresh reviewer receives evidence of the actual prior FAIL and the exact repair,
+    // while the unchanged cumulative diff still accounts for all files on PASS.
+    const initialContext = join(runDir(w, 'ATL-22'), 'attempt-0', 'review', 'context');
+    const repairContext = join(runDir(w, 'ATL-22'), 'attempt-1', 'review', 'context');
+    expect(JSON.parse(readFileSync(join(initialContext, 'review-history.json'), 'utf8'))).toEqual({
+      kind: 'initial', previousCommit: null, currentCommit: first!.headSha, findings: [],
+    });
+    expect(readFileSync(join(initialContext, 'repair.patch'), 'utf8')).toBe('');
+    const history = JSON.parse(readFileSync(join(repairContext, 'review-history.json'), 'utf8'));
+    expect(history).toMatchObject({ kind: 're-review', previousCommit: first!.headSha, currentCommit: second!.headSha });
+    expect(history.findings).toHaveLength(1);
+    expect(history.findings[0]).toMatchObject({ severity: 'blocker', file: 'src/slugify.mjs', title: 'slugify leaves a trailing dash' });
+    const expectedRepair = execFileSync('git', ['diff', '--no-color', '--no-ext-diff', '--no-renames', first!.headSha!, second!.headSha!], { cwd: w.repo, encoding: 'utf8' });
+    expect(readFileSync(join(repairContext, 'repair.patch'), 'utf8')).toBe(expectedRepair);
+    expect(readFileSync(join(repairContext, 'changes.patch'), 'utf8')).toContain('slugify');
+
     expect(m.approvedSha).toBe(second!.headSha);
     expect(w.remoteHead(m.branch)).toBe(m.approvedSha); // the approved commit is exactly what is on the remote
     expect(w.ci.calls).toEqual([first!.headSha, second!.headSha]); // CI asked about each exact SHA
@@ -215,6 +231,7 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
       'Missing mandatory evidence fails closed', 'Never hide or defer a known material security defect',
       'advisory alone must not cause FAIL', 'milestone assessment (M2 first)',
       'fixes and the affected regression surface', 'Newly discovered real blockers remain valid',
+      'context/review-history.json', 'context/repair.patch', 'untrusted reviewer claims',
       'human merge authority remain unchanged',
     ]) expect(prompt).toContain(rule);
   });
