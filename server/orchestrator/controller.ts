@@ -5,7 +5,8 @@
 // controller's own gate (SHA, CI, remote and PR heads, policy, ticket state) agrees. Two budgets stay apart: REPAIR attempts (the code was
 // wrong; max 3) and INFRASTRUCTURE retries (the environment failed; never consumes a repair). It never merges and never marks a PR ready.
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { basename, join, resolve, sep } from 'node:path';
 import type { Config, OrchestrationCfg } from '../config.ts';
 import { resolveScope } from '../scope.ts';
@@ -365,7 +366,6 @@ export class Orchestrator {
     const files = await G.changedFiles(oc.repoPath, m.baseSha, sha);
     const diff = await G.patch(oc.repoPath, m.baseSha, sha);
     const patchRef = store.evidence(m, `attempt-${a.n}/changes.patch`, diff);
-    const repairDiff = previousReview ? await G.patch(oc.repoPath, previousReview.commit, sha) : '';
     const reviewHistory = {
       kind: previousReview ? 're-review' : 'initial', previousCommit: previousReview?.commit ?? null, currentCommit: sha,
       findings: previousReview?.findings.filter((f) => f.severity === 'blocker' || f.severity === 'major') ?? [],
@@ -383,7 +383,21 @@ export class Orchestrator {
       store.evidence(m, `attempt-${a.n}/review${suffix}/context/ticket.md`, `# ${ctx.identifier}: ${ctx.title}\n\n${ctx.description}\n`);
       store.evidence(m, `attempt-${a.n}/review${suffix}/context/changes.patch`, diff);
       store.evidence(m, `attempt-${a.n}/review${suffix}/context/review-history.json`, JSON.stringify(reviewHistory, null, 2));
-      store.evidence(m, `attempt-${a.n}/review${suffix}/context/repair.patch`, repairDiff);
+      store.evidence(m, `attempt-${a.n}/review${suffix}/context/repair.patch`, '');
+      const repairPath = join(rdir, 'context', 'repair.patch');
+      if (previousReview) {
+        // Stream evidence: two individually reviewable cumulative patches may have a repair diff larger than Git's output buffer.
+        const fd = openSync(repairPath, 'w', 0o600);
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const child = spawn('git', ['diff', '--no-color', '--no-ext-diff', '--no-renames', `${previousReview.commit}..${sha}`], {
+              cwd: oc.repoPath, env: G.cleanEnv(), stdio: ['ignore', fd, 'ignore'],
+            });
+            child.once('error', () => reject(new Error('Could not generate repair evidence')));
+            child.once('close', (code) => code === 0 ? resolve() : reject(new Error('Git failed to generate repair evidence')));
+          });
+        } finally { closeSync(fd); }
+      }
       mkdirSync(out, { recursive: true, mode: 0o700 });
       G.makeReadOnly(rdir);
       const before = G.hashDir(rdir);

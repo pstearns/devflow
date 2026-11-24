@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { makeWorld, gitHttpRemote, WRITE, DEMO_WRITE_KEY } from './orchestrator-harness.ts';
@@ -173,6 +173,32 @@ describe('M1 acceptance: defect -> findings -> repair -> verified -> owner appro
     expect(m.cleanup.clone).toBe('removed');
     expect(existsSync(m.clone)).toBe(false);
   });
+
+  it('CRA-86 streams a repair patch larger than the cumulative-diff buffer', async () => {
+    let attempt = 0;
+    const w = world({ wrapAgents: (inner) => ({
+      ...inner,
+      implement: async (o) => {
+        const first = attempt++ === 0;
+        if (!first) unlinkSync(join(o.clone, 'old-generated.txt'));
+        const name = first ? 'old-generated.txt' : 'new-generated.txt';
+        writeFileSync(join(o.clone, name), ((first ? 'a' : 'b').repeat(1023) + '\n').repeat(34 * 1024));
+        const git = (...args: string[]) => execFileSync('git', args, {
+          cwd: o.clone, env: { ...process.env, GIT_AUTHOR_NAME: 'fixture', GIT_AUTHOR_EMAIL: 'fixture@localhost.invalid', GIT_COMMITTER_NAME: 'fixture', GIT_COMMITTER_EMAIL: 'fixture@localhost.invalid' },
+        });
+        git('add', '-A');
+        git('commit', '-qm', 'synthetic generated artifact');
+        return inner.implement(o);
+      },
+    }) });
+    const m = await w.orch.run('ATL-22');
+    expect(m.state).toBe('awaiting-owner');
+    expect(m.attempts).toHaveLength(2);
+    const context = join(runDir(w, 'ATL-22'), 'attempt-1', 'review', 'context');
+    expect(statSync(join(context, 'changes.patch')).size).toBeLessThan(64 * 1024 * 1024);
+    expect(statSync(join(context, 'repair.patch')).size).toBeGreaterThan(64 * 1024 * 1024);
+    expect(m.attempts[1]!.review!.verdict).toBe('PASS');
+  }, 30_000);
 
   it('preserves evidence and a durable manifest on disk', async () => {
     const w = world();
