@@ -87,6 +87,7 @@ export async function readReadyHistory(client: Pick<LinearClient, 'query'>, tick
   let newestRelevant: number | undefined;
   let previous = Infinity;
   let stale = false;
+  let groupedRelease = false;
   let approval: { who?: string; at?: string } = {};
   await paginate(client, Q_AUTHORIZER, { id: ticket }, (data) => isObj(data.issue) ? data.issue.history : undefined, warnings, 'approval history', (page) => {
     for (const entry of page) {
@@ -97,18 +98,22 @@ export async function readReadyHistory(client: Pick<LinearClient, 'query'>, tick
       previous = time;
       // Account for events at the same timestamp before deciding which happened last.
       if (newestRelevant !== undefined && time < newestRelevant) return true;
-      const triageTransition = triage(entry.fromState) || triage(entry.toState);
+      const fromTriage = triage(entry.fromState);
+      const toTriage = triage(entry.toState);
+      const triageTransition = fromTriage || toTriage;
       const addedReady = nodes({ nodes: entry.addedLabels }, 100).some((label) =>
         isObj(label) && str(label.name, 100)?.toLowerCase() === readyLabel.toLowerCase());
       if (!triageTransition && !addedReady) continue;
       newestRelevant = time;
       if (triageTransition) stale = true;
-      if (addedReady) approval = { who: isObj(entry.actor) ? str(entry.actor.name, 100) : undefined, at };
+      if (fromTriage && !toTriage && addedReady) groupedRelease = true;
+      // A grouped transition cannot establish that Ready was added after Triage.
+      if (addedReady && !triageTransition) approval = { who: isObj(entry.actor) ? str(entry.actor.name, 100) : undefined, at };
     }
     return false;
   });
   if (warnings.length) throw new SourceError('invalid', 'Linear approval history is incomplete');
-  return { approval, stale };
+  return { approval, stale, groupedRelease };
 }
 
 export const isResolved = (t: StateType) => t === 'completed' || t === 'canceled';

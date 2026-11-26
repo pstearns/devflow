@@ -115,6 +115,7 @@ export class Orchestrator {
     let history: Awaited<ReturnType<typeof readReadyHistory>>;
     try { history = await readReadyHistory(this.d.read, ticket, readyLabel); }
     catch { throw new Rejected(`${ticket}: Linear approval history could not be verified`); }
+    if (history.groupedRelease) throw new Rejected(`${ticket}: Linear grouped the Triage exit and Ready addition; a separate Ready addition after Triage is required`);
     if (history.stale) throw new Rejected(`${ticket}: fresh Ready approval is required after Triage`);
     return history;
   }
@@ -462,7 +463,8 @@ export class Orchestrator {
         if (held) throw new TicketChanged(held);
         const ci = await this.d.ci.snapshot(m.repo, sha, { required: auth.oc.ciChecks, actionsWorkflow: auth.oc.ciActionsWorkflow, branch: m.branch }); // check results are not immutable: re-read them on every approval attempt
         if (ci.state !== 'success') throw new GateChanged(`CI is no longer green on ${sha.slice(0, 12)}: ${ci.detail}`);
-        const live = await this.load(m.ticket);
+        // CI can take long enough for a hold to start and end. Recheck history even if the live state looks unchanged.
+        const live = await this.checkTriage(m);
         const bad = this.liveProblem(live, m);
         if (bad) throw new TicketChanged(bad);
         this.verifyPin(m); // after ALL the awaited reads, immediately before the privileged write

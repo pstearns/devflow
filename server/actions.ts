@@ -321,6 +321,9 @@ export class LinearActions {
           cleared = true;
         }
         if (ctx.state.id !== todo.id) await w.setState(ctx.id, todo.id);
+        if (fromTriage && (await this.load(identifier, false)).state.id !== todo.id) {
+          throw new Error('Linear did not confirm the exit from Triage');
+        }
         if (renew || !ready) await w.addLabel(ctx.id, readyLabel.id);
       } catch (e) { failure = e; }
       const after = await this.tryLoad(identifier);
@@ -328,7 +331,10 @@ export class LinearActions {
         if (fromTriage || history.stale) {
           const confirmed = await readReadyHistory(this.deps.read, ctx.identifier, wf.readyLabel);
           if (confirmed.stale || !confirmed.approval.at || confirmed.approval.at === history.approval.at) {
-            throw new ActionError(502, 'approval-history-unconfirmed', 'Linear shows Todo and Ready, but the new approval is not yet confirmed in its history.');
+            const message = confirmed.groupedRelease
+              ? 'Linear grouped the Triage exit and Ready addition. A separate Ready addition after Triage is required.'
+              : 'Linear shows Todo and Ready, but the new approval is not yet confirmed in its history.';
+            throw new ActionError(502, 'approval-history-unconfirmed', message);
           }
         }
         return this.finish(identifier, `${ctx.identifier} approved for execution: ${todo.name} + ${readyLabel.name}, verified in Linear`);
