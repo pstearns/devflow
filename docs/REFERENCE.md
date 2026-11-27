@@ -208,6 +208,10 @@ For a project whose required CI is a GitHub Actions job, set `ciActionsWorkflow`
 
 **Cleanup.** Review snapshots and scratch `out*` dirs are deleted after validation (the SHA reproduces them). Staged credential homes are deleted after every invocation. After PASS the clone and the private `refs/devflow/<run>/*` refs are removed, but only when the approved SHA is on the remote branch. Evidence is never deleted. `runsDir` is outside the repository; prune old run directories yourself.
 
+**Development execution posture (PS-10).** The owner can permit standard development tools in the isolated clone, including npm and npx, and accepts shared host networking and loopback access for development. The clone, controller credential separation, protected-path controls, CI, independent review, configured repair limit and human merge approval still apply. This posture does not change the target product's security requirements.
+
+The trusted `orchestration.claude.pluginDir` setting optionally identifies one installed, owner-approved plugin version directory in the user's Claude plugin cache. DevFlow mounts it read-only and loads it using Claude's session-local `--plugin-dir`. The run records the plugin name and version in preflight evidence. The session disables hooks, cloud skill and plugin sync, and inherited MCP configuration. Native skill tool grants from the approved plugin may permit development commands within the sandbox. Review the plugin before approving its directory and keep that installed version in place throughout the run. Host Claude settings and the rest of the cache are not mounted. Codex receives no plugin mount.
+
 **Known limits (M1).**
 - Network egress is not filtered: both agents must reach their model API, so the sandbox cannot be network-isolated. A prompt-injected agent could send what it can read (its own clone/snapshot and its own login copy) elsewhere. It cannot read anything else of yours.
 - The agent logins are copies, and the reviewer/implementer each hold *their own* login for the duration of a call. Treat a compromised agent as having its own subscription token.

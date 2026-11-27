@@ -77,6 +77,20 @@ export function verifyPolicy(oc: OrchestrationCfg, configPath: string, now = new
     if (unsafeMode(statSync(dir).mode)) throw new PolicyError(`${what} executable's directory is group- or world-writable`);
     sigs.push(f.sig);
   }
+  if (oc.claude.pluginDir) {
+    const plugin = canon(oc.claude.pluginDir);
+    const cache = join(home, '.claude', 'plugins', 'cache');
+    if (canon(cache) !== cache || plugin === cache || !within(plugin, cache) || protectedDirs.some((d) => within(d, plugin))) {
+      throw new PolicyError('Claude plugin must be a specific installed plugin directory in the Claude cache, outside controller-sensitive paths');
+    }
+    const dir = statSync(plugin);
+    if (!dir.isDirectory() || unsafeMode(dir.mode) || (dir.uid !== process.getuid!() && dir.uid !== 0)) {
+      throw new PolicyError('Claude plugin directory must be owned by the controller user or root and must not be group- or world-writable');
+    }
+    const manifest = fileFacts(join(plugin, '.claude-plugin', 'plugin.json'), 'Claude plugin manifest');
+    if (!within(manifest.real, plugin)) throw new PolicyError('Claude plugin manifest escapes its directory');
+    sigs.push(`${plugin}|${dir.ino}`, manifest.sig);
+  }
   for (const t of oc.claude.allowedTools) if (!TOOL_RE.test(t)) throw new PolicyError(`claude.allowedTools entry "${t.slice(0, 60)}" is not a plain tool pattern`);
   const body = JSON.stringify({ repo: oc.repo, repoPath: repo, runsDir: runs, base: oc.baseBranch, started: oc.startedState, approval: oc.approvalState, blocked: oc.blockedState,
     maxRepairs: oc.maxRepairs, ci: oc.ciChecks, tools: oc.claude.allowedTools, claude: oc.claude.bin, codex: oc.codex.bin, cfgBytes: createHash('sha256').update(readFileSync(cfgReal.real)).digest('hex'), sigs });
