@@ -3,7 +3,7 @@
 //  - the implementer sees only its own clone (own .git, no remote, no credentials); the reviewer sees only a read-only snapshot;
 //  - neither receives any Linear/GitHub/DevFlow credential, and the reviewer has no git metadata at all.
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { OrchestrationCfg } from '../config.ts';
@@ -58,6 +58,9 @@ export interface AgentRunner {
   review(o: { snapshot: string; outDir: string; prompt: string; schemaPath: string; timeoutMs: number }): Promise<ProcResult>;
 }
 
+const PLUGIN_MOUNT = '/opt/approved-plugin';
+const PLUGIN_FLAGS = ['--plugin-dir', '--strict-mcp-config', '--settings'];
+
 export interface RoleSandbox { job: Omit<SandboxJob, 'cmd' | 'args'>; staged: Staged; cmdPath: string }
 
 /** The exact mounts each role gets. Tests run arbitrary commands through these same builders to prove the negative cases. */
@@ -67,6 +70,7 @@ export function implementerSandbox(cfg: Pick<OrchestrationCfg, 'claude'>, clone:
   const pass: Record<string, string> = {};
   for (const k of ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']) if (env[k]) pass[k] = env[k]!;
   const mounts: Mount[] = [...nodeMounts(), { src: bin.dir, dst: '/opt/agent' }, { src: clone, dst: '/work', rw: true }, ...staged.mounts];
+  if (cfg.claude.pluginDir) mounts.push({ src: cfg.claude.pluginDir, dst: PLUGIN_MOUNT });
   return {
     staged, cmdPath: `/opt/agent/${bin.file}`,
     job: { mounts, tmpfs: staged.tmpfs, cwd: '/work', env: baseEnv({
@@ -141,12 +145,23 @@ export class CliAgents implements AgentRunner {
     };
     try {
       const claude = () => implementerSandbox(this.cfg, tmp, this.home, this.env);
-      await check('claude', claude, ['--version'], /^(\d+\.\d+\.\d+)/m, ['--help'], CLAUDE_FLAGS, async () => {
+      await check('claude', claude, ['--version'], /^(\d+\.\d+\.\d+)/m, ['--help'], this.cfg.claude.pluginDir ? [...CLAUDE_FLAGS, ...PLUGIN_FLAGS] : CLAUDE_FLAGS, async () => {
         const a = await probe('claude auth status', claude, ['auth', 'status']);
         let loggedIn = false;
         try { loggedIn = (JSON.parse(a.stdout) as { loggedIn?: unknown }).loggedIn === true; } catch { /* not JSON */ }
         return !loggedIn && !this.env.ANTHROPIC_API_KEY && !this.env.CLAUDE_CODE_OAUTH_TOKEN ? 'Claude Code is not authenticated (run `claude auth login`, or set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)' : undefined;
       });
+      if (this.cfg.claude.pluginDir) {
+        try {
+          const { name, version } = JSON.parse(readFileSync(join(this.cfg.claude.pluginDir, '.claude-plugin', 'plugin.json'), 'utf8'));
+          if (typeof name !== 'string' || typeof version !== 'string' || !/^[\w.-]+$/.test(name) || !/^[\w.+-]+$/.test(version)) {
+            throw new Error('invalid plugin identity');
+          }
+          detail.push(`approved Claude plugin: ${name}@${version}`);
+        } catch {
+          problems.push('Claude plugin manifest must declare a valid name and version');
+        }
+      }
       const codex = () => reviewerSandbox(this.cfg, tmp, out, undefined, this.home, this.env);
       await check('codex', codex, ['--version'], /codex-cli\s+(\d+\.\d+\.\d+\S*)/, ['exec', '--help'], CODEX_FLAGS, async () => {
         const cl = await probe('codex login status', codex, ['login', 'status']);
@@ -159,6 +174,10 @@ export class CliAgents implements AgentRunner {
   async implement(o: { clone: string; prompt: string; timeoutMs: number; bundle: { branch: string; exclude: string } }) {
     const rs = implementerSandbox(this.cfg, o.clone, this.home, this.env);
     const args = ['-p', '--output-format', 'json', '--permission-mode', 'acceptEdits', '--no-session-persistence', '--allowedTools', this.cfg.claude.allowedTools.join(',')];
+    if (this.cfg.claude.pluginDir) args.push(
+      '--plugin-dir', PLUGIN_MOUNT, '--strict-mcp-config', '--settings',
+      JSON.stringify({ disableAllHooks: true, syncClaudeAiSkills: false, syncClaudeAiPlugins: false }),
+    );
     const r = await runInSandbox(rs, rs.cmdPath, args, { stdin: o.prompt, timeoutMs: o.timeoutMs });
     // Package the result INSIDE a fresh sandbox: the controller must never run git against a directory the agent controls.
     return { ...r, bundle: await makeBundle(this.cfg, o.clone, this.home, this.env, o.bundle.branch, o.bundle.exclude) };

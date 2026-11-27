@@ -59,6 +59,24 @@ describe('trusted policy: what counts as verifiable (fail closed)', () => {
     const f = join(w.root, 'agent'); copyFileSync(join(FIX, 'fake-claude.mjs'), f); chmodSync(f, 0o755);
     expect(() => verifyPolicy(withBin(f), w.configPath)).toThrow(/controller-sensitive paths/);
   });
+  it('only accepts an owner-selected plugin below the Claude cache and pins its manifest', () => {
+    const w = world();
+    const home = join(w.root, 'home');
+    const cache = join(home, '.claude', 'plugins', 'cache');
+    const plugin = join(cache, 'test-plugin', '1.0.0');
+    mkdirSync(join(plugin, '.claude-plugin'), { recursive: true });
+    const manifest = join(plugin, '.claude-plugin', 'plugin.json');
+    writeFileSync(manifest, '{"name":"test-plugin","version":"1.0.0"}');
+    const withPlugin = (pluginDir: string) => ({ ...oc(w), claude: { ...oc(w).claude, pluginDir } });
+    const verify = (dir: string) => verifyPolicy(withPlugin(dir), w.configPath, undefined, undefined, { home });
+    const original = verify(plugin).digest;
+    expect(() => verify(cache)).toThrow(/specific installed plugin/);
+    expect(() => verify(w.repo)).toThrow(/specific installed plugin/);
+    writeFileSync(manifest, '{"name":"test-plugin","version":"1.0.1","description":"changed"}');
+    expect(verify(plugin).digest).not.toBe(original);
+    chmodSync(plugin, 0o777);
+    expect(() => verify(plugin)).toThrow(/group- or world-writable/);
+  });
   it('rejects overlapping repo/run dirs and hostile allowedTools entries', () => {
     const w = world();
     expect(() => verifyPolicy({ ...oc(w), runsDir: join(w.repo, 'runs') }, w.configPath)).toThrow(/does not exist|must not contain/);

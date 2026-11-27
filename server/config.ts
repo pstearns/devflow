@@ -47,7 +47,7 @@ export interface OrchestrationCfg {
   ciChecks: string[]; // check/job names that must be green on the SHA (empty = at least one check, all green)
   ciTimeoutMinutes: number;
   agentTimeoutMinutes: number;
-  claude: { bin: string; allowedTools: string[] };
+  claude: { bin: string; allowedTools: string[]; pluginDir?: string };
   codex: { bin: string };
   retention: RetentionPolicy; // evidence retention and pruning limits (see orchestrator/retention.ts)
 }
@@ -166,6 +166,10 @@ function parseOrchestration(raw: unknown, id: string, repos: string[]): Orchestr
   if (typeof maxRepairs !== 'number' || !Number.isInteger(maxRepairs) || maxRepairs < 0 || maxRepairs > MAX_REPAIRS) throw new Error(`${at}.maxRepairs must be an integer from 0 to ${MAX_REPAIRS}`);
   const claude = isObj(raw.claude) ? raw.claude : {};
   const codex = isObj(raw.codex) ? raw.codex : {};
+  const pluginDir = claude.pluginDir;
+  if (pluginDir !== undefined && (typeof pluginDir !== 'string' || !pluginDir.startsWith('/') || /[\0\r\n]/.test(pluginDir))) {
+    throw new Error(`${at}.claude.pluginDir must be an absolute plugin directory`);
+  }
   const bin = (v: unknown, what: string) => { const b = str(v, 500) ?? ''; if (!b.startsWith('/') || /\s/.test(b)) throw new Error(`${at}.${what}.bin must be an explicit absolute path to the executable (no PATH lookup, no arguments)`); return b; };
   let ciChecks = strList(raw.ciChecks, []);
   const ciActionsWorkflow = raw.ciActionsWorkflow;
@@ -186,7 +190,7 @@ function parseOrchestration(raw: unknown, id: string, repos: string[]): Orchestr
     startedState: str(raw.startedState, 100) ?? 'In Progress', approvalState: str(raw.approvalState, 100) ?? 'In Review',
     blockedState: str(raw.blockedState, 100) ?? 'Blocked', maxRepairs, infraRetries: typeof raw.infraRetries === 'number' ? Math.min(5, Math.max(0, Math.floor(raw.infraRetries))) : 2,
     ciChecks, ciActionsWorkflow, ciTimeoutMinutes: mins('ciTimeoutMinutes', 20, 120), agentTimeoutMinutes: mins('agentTimeoutMinutes', 30, 240),
-    claude: { bin: bin(claude.bin, 'claude'), allowedTools: tools(claude.allowedTools) },
+    claude: { bin: bin(claude.bin, 'claude'), allowedTools: tools(claude.allowedTools), ...(pluginDir === undefined ? {} : { pluginDir }) },
     codex: { bin: bin(codex.bin, 'codex') },
     retention: retention(raw.retention),
   };

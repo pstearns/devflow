@@ -54,6 +54,18 @@ function implementer(extraEnv: NodeJS.ProcessEnv = {}) {
   return G.initClone(src, 'refs/remotes/origin/main', clone, 'devflow/x').then(() => ({ src, clone, rs: () => implementerSandbox(cfg, clone, home, { PATH: process.env.PATH, ...extraEnv }) }));
 }
 
+it.skipIf(!usable)('mounts only the selected plugin read-only for Claude', async () => {
+  const w = await implementer(SECRETS);
+  const home = fakeHome();
+  const plugin = uniq('plugin');
+  mkdirSync(plugin);
+  writeFileSync(join(plugin, 'approved'), 'approved');
+  const rs = () => implementerSandbox({ claude: { ...cfg.claude, pluginDir: plugin } }, w.clone, home, SECRETS);
+  const result = await run(rs, 'test -r /opt/approved-plugin/approved && test ! -w /opt/approved-plugin/approved && test ! -e /home/agent/.claude/settings.json && test ! -e /home/agent/.codex/auth.json && test -z "$GITHUB_WRITE_TOKEN"');
+  expect(result.exitCode).toBe(0);
+  expect((await run(reviewer(), 'test ! -e /opt/approved-plugin')).exitCode).toBe(0);
+});
+
 describe.skipIf(!usable)('reviewer sandbox: cannot write, cannot act on Git or Linear', () => {
   it('the snapshot, the system, the agent binary and the root are read-only; only /out (and ephemeral /tmp, tmpfs home) accept writes', async () => {
     const rs = reviewer();
